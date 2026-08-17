@@ -17,8 +17,9 @@ records only participant-visible interaction events; agent internals, hidden
 reasoning, model requests, tool internals, secrets, and debug logs are outside
 its scope.
 
-The protocol defines exactly three event kinds:
+The protocol defines exactly four event kinds:
 
+- `turn.start`
 - `turn.append`
 - `turn.end`
 - `turn.cancel`
@@ -48,9 +49,10 @@ or publish each event.
 
 OpenEvent top-level fields keep their native meaning:
 
-- `EventMessage.seq` is the authoritative global event order.
-- `EventMessage.principal` is the publisher. For turn content it also
-  establishes the content owner.
+- `EventMessage.seq` is the authoritative global event order and the event
+  position referenced by `pre_seq`; it is not a turn ID.
+- `EventMessage.principal` is the publisher. A `turn.start` publisher is the
+  turn owner, and append/end publishers MUST equal that owner.
 - `EventMessage.ts_ms` is the server receive time.
 - `EventMessage.recipients` is freely usable for application-defined semantics.
   Its values still have to satisfy the OpenEvent server's publish validation;
@@ -63,7 +65,7 @@ OpenEvent recipients are a filtering field, not an ACL. A reader that needs to
 reconstruct the complete conversation SHOULD read the channel with
 `only_my_recipient=false`.
 
-## 3. JSON And Common Fields
+## 3. JSON, TurnRef, And Common Fields
 
 Every `chat.v1` payload MUST be a UTF-8 JSON object.
 
@@ -71,22 +73,43 @@ Common fields:
 
 | Field | Rule |
 | --- | --- |
-| `kind` | Required string; exactly `turn.append`, `turn.end`, or `turn.cancel` |
-| `turn_id` | Required non-empty string, at most 128 UTF-8 bytes |
+| `kind` | Required string; exactly `turn.start`, `turn.append`, `turn.end`, or `turn.cancel` |
+| `turn_id` | Required for `turn.start`, `turn.append`, and `turn.end`; MUST be absent from `turn.cancel` |
 | `extensions` | Optional JSON object interpreted only by the application |
 
-`turn_id` equality is exact string equality. Producers and consumers MUST NOT
-trim, case-fold, or Unicode-normalize it. A `turn_id` identifies at most one
-turn within a channel; its uniqueness scope is `(channel_id, turn_id)`. The
-protocol does not prescribe how applications generate it.
+`turn_id` MUST be a non-empty string of at most 128 UTF-8 bytes. Producers and
+consumers use exact string equality and MUST NOT trim, case-fold, or Unicode-
+normalize it.
 
-Fields referencing an OpenEvent sequence use JSON integers in
-`1..18446744073709551615` (`uint64` excluding zero).
+A turn is uniquely identified within its channel by this TurnRef:
+
+```json
+{
+  "principal": 9001,
+  "turn_id": "turn-01JABC"
+}
+```
+
+A TurnRef MUST be a JSON object containing exactly:
+
+- `principal`: the top-level OpenEvent principal of the `turn.start`, using the
+  OpenEvent principal's `uint64` JSON integer rules;
+- `turn_id`: a string satisfying the rules above.
+
+TurnRef equality is exact `(principal, turn_id)` equality. The containing
+channel is already known from the event location, so protocol text uses TurnRef
+while a complete storage key is `(channel_id, principal, turn_id)`. A writer
+MUST NOT create two turns with the same `turn_id` under its own principal in the
+same channel. Different principals MAY use the same `turn_id`; those are
+different turns.
+
+The only payload field referencing an OpenEvent sequence is `pre_seq`. It uses
+a non-zero `uint64` JSON integer in `1..18446744073709551615`.
 
 Unknown top-level payload fields are not part of `chat.v1`. Application data
 MUST be placed under `extensions`. Extension values may be any JSON value, but
 must remain participant-visible interaction metadata and must not redefine
-`kind`, `turn_id`, `pre_seq`, reply, content, or terminal semantics.
+`kind`, `turn_id`, `pre_seq`, TurnRef, reply, content, or terminal semantics.
 
 The OpenEvent deployment controls the payload size limit. `chat.v1` does not
 define a second byte limit.
@@ -109,25 +132,28 @@ containing exactly:
 - `text`: a non-empty string.
 
 Part order is significant. An application reconstructs visible turn text by
-walking valid append events in chain order and, within each event, preserving
-the listed part order. Chunk boundaries have no semantic meaning: applications
-may append characters, words, sentences, or larger text fragments.
+walking valid turn-chain events in chain order and, within each event,
+preserving the listed part order. Chunk boundaries have no semantic meaning:
+applications may append characters, words, sentences, or larger text
+fragments.
 
 Binary, image, audio, tool-call, and other content part types are not defined.
 An application may attach ObjectKeys to the containing OpenEvent message, but
 that does not introduce another `chat.v1` content type.
 
-## 5. `turn.append`
+## 5. `turn.start`
 
-`turn.append` creates a turn or appends content to an existing turn.
-
-### 5.1 First Append
+`turn.start` is the only event that creates a turn and is the turn's first
+message. The writer generates `turn_id` before publication. The top-level
+OpenEvent principal and payload `turn_id` together form the turn's TurnRef.
 
 ```json
 {
-  "kind": "turn.append",
-  "turn_id": "turn_01JABC",
-  "reply_to_turn_ids": ["turn_01JAAA", "turn_01JAAB"],
+  "kind": "turn.start",
+  "turn_id": "turn-user-1",
+  "reply_to_turns": [
+    {"principal": 9002, "turn_id": "turn-agent-1"}
+  ],
   "content": [
     {"type": "text", "text": "Hello"}
   ]
@@ -136,26 +162,34 @@ that does not introduce another `chat.v1` content type.
 
 Rules:
 
-- `pre_seq` MUST be absent.
-- `reply_to_turn_ids` MUST be present as a JSON array and MAY be empty.
-- Every reply ID MUST satisfy the `turn_id` string rules.
-- Reply IDs MUST be unique within the array and MUST NOT equal this event's
-  `turn_id`.
-- Every referenced turn MUST already have a first append in the same channel.
-  It may still be open or may already be terminal.
+- `turn_id` MUST be present and satisfy Section 3.
+- Other than optional `extensions`, the payload MUST contain exactly `kind`,
+  `turn_id`, `reply_to_turns`, and `content`. Therefore `pre_seq`,
+  `target_turn`, and `status` MUST be absent.
+- `reply_to_turns` MUST be present as a JSON array and MAY be empty.
+- Every item MUST be a valid TurnRef. TurnRefs MUST be unique within the array
+  and MUST NOT equal the current turn's TurnRef.
+- Every referenced turn MUST already have an earlier `turn.start` in the same
+  channel. It may still be open or may already be terminal.
 - `content` MUST satisfy Section 4.
-- The OpenEvent top-level `principal` becomes the content owner of this turn.
+- The OpenEvent top-level `principal` becomes the turn owner.
+- A second `turn.start` with the same owner principal and `turn_id` in one
+  channel is a protocol conflict.
 
-The first append fixes the turn's owner and `reply_to_turn_ids` for its entire
-lifetime.
+`turn.start` fixes the turn's TurnRef, owner, and `reply_to_turns` for its entire
+lifetime. It has no `pre_seq`; its OpenEvent `seq` is the starting point of the
+subsequent append/end chain.
 
-### 5.2 Later Append
+## 6. `turn.append`
+
+`turn.append` appends content to an existing turn owned by the publishing
+principal.
 
 ```json
 {
   "kind": "turn.append",
-  "turn_id": "turn_01JABC",
-  "pre_seq": 123456,
+  "turn_id": "turn-user-1",
+  "pre_seq": 123402,
   "content": [
     {"type": "text", "text": " world"}
   ]
@@ -164,125 +198,151 @@ lifetime.
 
 Rules:
 
+- The target TurnRef MUST already have a `turn.start` in the same channel.
 - `pre_seq` MUST be present and equal the OpenEvent `seq` of the immediately
-  preceding valid `turn.append` for this turn.
-- `reply_to_turn_ids` MUST be absent.
-- The OpenEvent top-level `principal` MUST equal the owner established by the
-  first append.
+  preceding valid `turn.start` or `turn.append`.
+- Other than optional `extensions`, the payload MUST contain exactly `kind`,
+  `turn_id`, `pre_seq`, and `content`. Therefore `reply_to_turns`,
+  `target_turn`, and `status` MUST be absent.
+- The top-level principal MUST equal the owner established by `turn.start`.
 - `content` MUST satisfy Section 4.
-- The event MUST precede the turn's earliest terminal event.
 
-## 6. `turn.end`
+## 7. `turn.end`
 
-`turn.end` normally completes a turn.
+`turn.end` normally completes a turn owned by the publishing principal.
 
 ```json
 {
   "kind": "turn.end",
-  "turn_id": "turn_01JABC",
-  "pre_seq": 123457,
+  "turn_id": "turn-user-1",
+  "pre_seq": 123403,
   "status": "completed"
 }
 ```
 
 Rules:
 
-- The turn MUST already have a first append.
+- The target TurnRef MUST already have a `turn.start` in the same channel.
 - `pre_seq` MUST be present and equal the OpenEvent `seq` of the immediately
-  preceding valid `turn.append` for this turn.
-- The OpenEvent top-level `principal` MUST equal the turn owner.
-- `status` MUST be exactly `completed`. `chat.v1` has no `failed` status.
-- `content` and `reply_to_turn_ids` MUST be absent.
-- The event stores only completion state; it does not repeat a final content
+  preceding valid `turn.start` or `turn.append`.
+- `status` MUST be exactly `completed`.
+- Other than optional `extensions`, the payload MUST contain exactly `kind`,
+  `turn_id`, `pre_seq`, and `status`. Therefore `content`, `reply_to_turns`, and
+  `target_turn` MUST be absent.
+- The event stores only completion state without repeating a final content
   snapshot.
 
-## 7. `turn.cancel`
+## 8. `turn.cancel`
 
-`turn.cancel` independently cancels an existing turn.
+`turn.cancel` independently cancels an existing turn. Because the cancelling
+principal need not be the turn owner, the payload uses a complete
+`target_turn` TurnRef.
 
 ```json
 {
   "kind": "turn.cancel",
-  "turn_id": "turn_01JABC"
+  "target_turn": {
+    "principal": 9002,
+    "turn_id": "turn-agent-1"
+  }
 }
 ```
 
 Rules:
 
-- The target turn MUST already have a first append in the same channel.
-- `pre_seq`, `status`, `content`, and `reply_to_turn_ids` MUST be absent.
+- `target_turn` MUST be a valid TurnRef whose turn already has a `turn.start` in
+  the same channel.
+- Other than optional `extensions`, the payload MUST contain exactly `kind` and
+  `target_turn`. Therefore top-level `turn_id`, `pre_seq`, `status`, `content`,
+  and `reply_to_turns` MUST be absent.
 - Any principal allowed by OpenEvent to publish to the channel MAY publish the
-  event. It need not be the turn owner or have a user/agent role known to the
+  event.
+- Cancellation itself is terminal, so no later `turn.end` acknowledgement is
+  required.
+
+## 9. Chain And Terminal Semantics
+
+For one TurnRef, the `turn.start`, valid `turn.append` events before the earliest
+terminal event, and a valid `turn.end` when it is that earliest terminal event
+form a single chain through `pre_seq`:
+
+- `turn.start` is the head and has no predecessor. Its OpenEvent `seq` is the
+  first chain tail, but is not the turn ID.
+- A later append or normal end names the current append-chain tail.
+- Before the earliest terminal event, at most one append or end may name a given
+  `pre_seq` as its predecessor. Multiple successors are a fork and violate the
   protocol.
-- Cancellation itself is a terminal event; no later `turn.end` acknowledgement
-  is required.
-
-## 8. Chain And Terminal Semantics
-
-For one turn, valid `turn.append` events and a valid `turn.end` form a single
-chain through `pre_seq`.
-
-- A first append has no predecessor.
-- A later append or normal end names the current append tail.
-- At most one append or end may name a given `pre_seq` as its predecessor.
-  Multiple successors are a fork and violate the protocol.
-- `turn.cancel` is not a chain successor and never has `pre_seq`.
+- `turn.cancel` associates through `target_turn`; it is not a chain successor
+  and never has `pre_seq`.
 
 A turn's terminal event is the event with the smallest OpenEvent global `seq`
-among its well-formed `turn.end` and `turn.cancel` events. Therefore concurrent
-completion and cancellation have one deterministic outcome shared by all
-readers.
+among its well-formed `turn.end` and `turn.cancel` events targeting that
+TurnRef. Therefore concurrent completion and cancellation have one
+deterministic outcome shared by all readers.
 
-Only valid append events preceding that terminal `seq` contribute to the
-resolved content. Later append, end, or cancel records remain in immutable
-OpenEvent history but do not change the resolved turn. This protocol does not
-mandate how an application reports or handles those records.
+Events are processed in ascending OpenEvent `seq` order. Once a TurnRef is
+terminal, later append, end, or cancel events targeting it cannot change the
+resolved terminal state, final content, or pre-terminal chain tail. Even when
+committed, those events have no turn-state effect. The protocol does not require
+special parsing, field extraction, or validation precedence for events after a
+terminal state, and applications do not need to classify whether they are
+"valid" relative to that terminal state. Only valid start/append events before
+the earliest terminal `seq` contribute to resolved content.
 
-Different turns may be open and append concurrently. Their events may interleave
-in global OpenEvent order; each turn's `pre_seq` chain determines its local
-content order.
+Different TurnRefs may be open and append concurrently. Their events may
+interleave in global OpenEvent order; each turn's `pre_seq` chain determines its
+local content order.
 
-## 9. Replies
+## 10. Replies
 
-`reply_to_turn_ids` records causal context, not routing or authorization.
+`reply_to_turns` is an array of TurnRefs recording causal context, not routing
+or authorization.
 
-- It is fixed by the first append and cannot be modified later.
+- It is fixed by the `turn.start` and cannot be modified later.
 - An empty array represents a turn with no protocol-level parent.
-- Multiple IDs allow one turn to respond to several earlier turns.
+- Multiple TurnRefs allow one turn to respond to several earlier turns.
 - A referenced turn does not need to be terminal, allowing input and output to
   overlap.
 - Replies do not imply any value for OpenEvent `recipients`.
 
-Because every reply target must already exist, reply edges always point to an
-earlier first append in the same channel and cannot form cycles.
+Because every reply target must already exist, reply edges always point to a
+`turn.start` with an earlier global seq in the same channel and cannot form
+cycles.
 
-## 10. Application Responsibilities
+## 11. Application Responsibilities
 
 The application, not `chat.v1`, is responsible for:
 
+- generating `turn_id` for its own `turn.start` events and keeping it unique
+  under the same principal in the same channel;
 - mapping principals to user or agent roles;
 - channel visibility, membership changes, and authorization policy;
 - recipients and event routing;
 - interpreting `extensions` and ObjectKeys;
 - publish reconciliation, retries, deduplication, and idempotency;
 - choosing behavior for malformed JSON, unknown kinds, missing references,
-  broken chains, forks, and events after termination;
-- rendering concurrent turns and cancellation state.
+  duplicate starts, broken chains, and forks;
+- rendering concurrent turns and cancellation state; observing effective
+  `turn.cancel` events through their own Fetch/Subscribe and stopping the
+  corresponding model, tool, or other application work. The Chat protocol and
+  SDK record cancellation facts but do not directly interrupt application
+  tasks.
 
-There is no protocol `event_id`. Applications that retry after an uncertain
-publish result must reconcile against OpenEvent history or accept the risk of a
-duplicate record or an invalid fork.
+A TurnRef identifies one logical turn, but the protocol has no operation ID for
+an individual append/end/cancel publication. Applications that retry after an
+uncertain publish result must reconcile against OpenEvent history or accept the
+risk of duplicate records or an invalid fork.
 
-## 11. Security And Persistence
+## 12. Security And Persistence
 
 - Channel ACL, not recipients, is the confidentiality boundary.
 - A newly added channel member may be able to read the entire retained history.
 - Removing a member cannot revoke data or ObjectKeys already obtained.
 - ObjectKeys are bearer capabilities and may be permanently transferable.
-- Any principal with channel write permission can cancel any existing turn.
+- Any principal with channel write permission can cancel any existing TurnRef.
 - Chat events are append-only. The protocol defines no edit, delete, redaction,
   or retention operation.
 
-Applications must not place hidden reasoning, credentials, private Agent state,
+Applications must not place hidden reasoning, credentials, private agent state,
 or other data that participants must not read into payloads, extensions, or
 attached objects.
