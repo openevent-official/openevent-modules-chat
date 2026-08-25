@@ -1,116 +1,66 @@
-# Chat Python SDK 使用指南
+# Chat Python SDK
 
 [English version](SDK_USAGE.md)
 
-## 1. 安装与依赖
+## 1. 实现状态
 
-`openevent-modules-chat` 要求 Python 3.10 或更高版本，并依赖当前 Python 环境中已经安装的
-`openevent-sdk>=0.4.4`。
+当前公开仓库包含可安装的 Python SDK、构建入口和 SDK 单元测试，以及
+`chat.v1` 公开协议。
 
-```bash
-make build
-make install
-```
+目标实现要求 Python 3.10 或更高版本，并使用已安装的
+`openevent-sdk>=0.6.0`。实现必须使用 OpenEvent 公开 client，不得从源码子模块安装 SDK 或生成 protobuf 模块。
 
-构建和测试不会从仓库中的 `openevent-sdk` 子模块安装 SDK，也不会在运行时生成 proto。
+## 2. 协议解析
 
-## 2. 无状态解析
+直接实现协议的应用必须按照 [CHAT_PROTOCOL_cn.md](CHAT_PROTOCOL_cn.md) 校验每条 payload，按 OpenEvent `seq`
+顺序处理，并将 `EventMessage.uuid` 视为 OpenEvent 消息去重标识。OpenEvent 不解析或校验 `chat.v1` JSON。
 
-```python
-from openevent.chat_sdk import TurnStart, parse_message, parse_payload
+## 3. SDK 边界
 
-event = parse_payload(payload_bytes)
-parsed = parse_message(event_message)
+SDK 是 `chat.v1` 的有状态写入辅助，不提供 worker、Agent runtime、模型集成、UI 或应用层授权。公开 API 不暴露
+消息 UUID 的分配；注入的 OpenEvent client 维护本地 UUID 池，SDK 每次真正发布时在内部取得一个 UUID。
 
-if isinstance(parsed.payload, TurnStart):
-    print(parsed.turn_ref, parsed.payload.content)
-```
-
-`parse_payload` 严格要求 UTF-8 JSON、唯一对象字段名、有限 JSON number 和协议规定的精确字段集合。
-`parse_message` 另外保留 `seq`、`ts_ms`、Channel ID、发布 principal、recipients 和 ObjectKeys。
-ObjectKey token 的 `repr` 始终脱敏。
-
-## 3. 创建有状态写入客户端
-
-调用方先创建一个支持并发 RPC 的 `openevent.sdk.OpenEventClient`，再绑定固定身份和非空 Channel 集合：
+SDK 同时提供订阅回调注册接口。应用通过 Chat SDK 接收按 seq 排序的 `ParsedMessage`；SDK 内部使用 Fetch 轮询，不调用
+OpenEvent `Subscribe`。订阅 Fetch 到达尾部时按退避继续轮询，RPC 失败按统一规则重试。
 
 ```python
-from openevent.chat_sdk import create_client
 from openevent.sdk import OpenEventClient
+from openevent.chat_sdk import create_client
 
-openevent_client = OpenEventClient("127.0.0.1:9527")
+events = OpenEventClient("127.0.0.1:50051", timeout=1.0)
 chat = create_client(
-    openevent_client,
+    events,
     principal=9001,
     token="...",
-    channel_ids=[10001, 10002],
+    channel_id=10001,
+    on_failure=lambda error: print(error),
 )
 ```
 
-初始化会校验所有 Channel 的 `protocol="chat.v1"`，并阻塞恢复到固定水位。Chat client 不取得注入的
-OpenEvent client 或 gRPC channel 的所有权；两者必须在 Chat client 关闭后再关闭。
-
-## 4. 发布 turn
+目标调用方式：
 
 ```python
-from openevent.chat_sdk import ObjectKey, TextPart, TurnRef
-
-start_seq = chat.start_turn(
-    channel_id=10001,
-    turn_id="turn-user-1",
-    reply_to_turns=[],
-    content=[TextPart("你好")],
-    recipients=[],
-    object_keys=[ObjectKey(7001, "object-token")],
-    extensions={"ui": {"language": "zh-CN"}},
+subscription = chat.register_subscription_callback(
+    on_message,
+    from_seq=1,
+    on_error=on_subscription_error,
 )
 
-append_seq = chat.append_turn(
-    channel_id=10001,
-    turn_id="turn-user-1",
-    content=[TextPart("，世界")],
-)
-
-end_seq = chat.complete_turn(channel_id=10001, turn_id="turn-user-1")
-cancel_seq = chat.cancel_turn(
-    channel_id=10001,
-    target_turn=TurnRef(principal=9002, turn_id="turn-agent-1"),
-)
+subscription.close()
 ```
 
-SDK 在每次发布前由调用方线程通过 GetStatus 取得固定水位 `W`，用 `max(sync_target_seq, W)` 增大 client 共享的单调同步
-目标，并等待唯一的内部同步线程使用 Fetch 追平自己的 `W`。之后 SDK 自动选择 append/end 的 `pre_seq` 并发布，在同步线程
-处理到已提交 seq 后才返回。同步线程只执行 Fetch 和状态更新，不执行 GetStatus 或 PublishAutoSeq。同一 client 中同一
-TurnRef 同时只能有一个发布调用；不同 TurnRef 可以并发发布。
+`from_seq=0`（默认值）以首次 Fetch 线性化时返回的水位为起点，只接收其后产生的新消息；它不承诺覆盖注册调用开始前的全部历史。
+需要无缝覆盖既有历史时传入明确的起点（通常为 `1`）。传入大于 0 的 seq 会通过 Fetch 从该位置接收历史和后续消息。
+订阅句柄的 `wait_until_scanned(seq)` 等待 Fetch 返回的 `next_seq` 越过指定水位。
 
-应用仍应直接使用 OpenEvent Fetch/Subscribe 读取、展示和处理 Chat 事件，再通过 `parse_message` 解析。
+创建 Chat SDK client 时必须传入 `on_failure`。当 client 在 READY 状态下因内部 Fetch、订阅 Fetch 或协议状态故障永久进入 FAILED
+时，SDK 调用一次该回调；初始化失败、单次写入错误和 `close()` 不触发它。回调只用于通知，不能恢复 client；即使调用方不需要处理
+通知，也必须显式传入空操作回调。回调同步执行且没有 SDK 超时，必须在有限时间内返回。
 
-## 5. 错误与关闭
+完整的同步、恢复、生命周期和错误规则属于本 SDK 发布的实现契约。
 
-- `ChatProtocolError` 表示调用输入或单条 payload 不符合 `chat.v1`。
-- `TurnNotFoundError`、`TurnAlreadyExistsError` 和 `TurnBusyError` 是发布前可确定的 turn 状态错误。
-- `SyncReadError.publish_sent` 固定为 `False`，表示发布前同步失败且本次没有发送 PublishAutoSeq。
-- `PublishFailedError.code` 保留 PublishAutoSeq 的 gRPC status。
-- `PublishCommittedSyncError.seq` 表示消息已经提交，但内部顺序确认没有完成；不得把它当成未提交重试。
-- `ClientFailedError` 表示 client 已永久 fail-stop，后续有状态调用不会再发起网络请求。
+## 4. 运行前提
 
-应使用 context manager 或显式调用 `close()`。关闭不会关闭注入的 OpenEvent client；并发、重复 `close()` 是幂等的。
-
-## 6. 验证
-
-```bash
-make test
-make build
-```
-
-真实端到端测试只使用当前环境已安装的 `openevent-sdk`。运行前配置：
-
-```bash
-export OPENEVENT_E2E_ADDR=127.0.0.1:9527
-export OPENEVENT_E2E_PRINCIPAL=9001
-export OPENEVENT_E2E_TOKEN=...
-export OPENEVENT_E2E_CHAT_CHANNEL_ID=10001
-make e2e
-```
-
-指定 Channel 必须预先存在、可由该身份完整读取，并设置 `protocol="chat.v1"`。
+- 支持 `chat.v1` Channel、事件历史和消息 UUID 的 OpenEvent server。
+- 已提前创建 `protocol="chat.v1"` 的非系统 Channel。
+- 使用未来 Python SDK 时，当前环境已安装 `openevent-sdk>=0.6.0`。

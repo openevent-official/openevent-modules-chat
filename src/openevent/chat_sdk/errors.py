@@ -20,11 +20,11 @@ class FailureCause:
 
 
 class ChatSdkError(Exception):
-    """Base class for public Chat SDK failures."""
+    pass
 
 
 class ChatProtocolError(ChatSdkError, ValueError):
-    """A value does not satisfy the chat.v1 single-event contract."""
+    pass
 
 
 class MalformedPayloadError(ChatProtocolError):
@@ -35,14 +35,8 @@ class InvalidKindError(ChatProtocolError):
     pass
 
 
-class ChannelNotManagedError(ChatSdkError):
-    def __init__(self, channel_id: int):
-        self.channel_id = channel_id
-        super().__init__(f"channel {channel_id} is not managed by this client")
-
-
 class ChannelInitializationError(ChatSdkError):
-    def __init__(self, channel_id: int | None, cause: FailureCause | ChatSdkError):
+    def __init__(self, cause: FailureCause | ChatSdkError, channel_id: int | None = None):
         self.channel_id = channel_id
         self.cause = cause
         subject = "channel initialization" if channel_id is None else f"channel {channel_id} initialization"
@@ -57,33 +51,26 @@ class HistoryConflictError(ConversationStateError):
     pass
 
 
+class OpenEventContractError(ConversationStateError):
+    pass
+
+
 class TurnNotFoundError(ConversationStateError):
-    def __init__(self, channel_id: int, turn_ref: Any):
-        self.channel_id = channel_id
+    def __init__(self, turn_ref: Any):
         self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} does not exist in channel {channel_id}")
+        super().__init__(f"turn {turn_ref!r} does not exist")
 
 
 class TurnAlreadyExistsError(ConversationStateError):
-    def __init__(self, channel_id: int, turn_ref: Any):
-        self.channel_id = channel_id
+    def __init__(self, turn_ref: Any):
         self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} already exists in channel {channel_id}")
+        super().__init__(f"turn {turn_ref!r} already exists")
 
 
 class TurnBusyError(ChatSdkError):
-    def __init__(self, channel_id: int, turn_ref: Any):
-        self.channel_id = channel_id
+    def __init__(self, turn_ref: Any):
         self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} already has a local publish in progress in channel {channel_id}")
-
-
-class PublishFailedError(ChatSdkError):
-    def __init__(self, code: Any, channel_id: int, turn_ref: Any):
-        self.code = code
-        self.channel_id = channel_id
-        self.turn_ref = turn_ref
-        super().__init__(f"publish failed with status {_code_name(code)} for channel {channel_id}, turn {turn_ref!r}")
+        super().__init__(f"turn {turn_ref!r} already has a local publish in progress")
 
 
 class SyncReadError(ChatSdkError):
@@ -93,11 +80,18 @@ class SyncReadError(ChatSdkError):
         super().__init__(f"pre-publish synchronization failed: {cause}")
 
 
-class PublishCommittedSyncError(ChatSdkError):
-    def __init__(self, seq: int, cause: FailureCause | ChatSdkError):
-        self.seq = seq
+class UuidAllocationError(ChatSdkError):
+    def __init__(self, cause: FailureCause | ChatSdkError):
+        self.publish_sent = False
         self.cause = cause
-        super().__init__(f"message {seq} committed but synchronization failed: {cause}")
+        super().__init__(f"UUID allocation failed: {cause}")
+
+
+class PublishFailedError(ChatSdkError):
+    def __init__(self, code: Any, stage: str = "PublishAutoSeq"):
+        self.code = code
+        self.stage = stage
+        super().__init__(f"{stage} failed with status {_code_name(code)}")
 
 
 class ClientFailedError(ChatSdkError):
@@ -110,3 +104,22 @@ class ClientClosedError(ChatSdkError):
     def __init__(self):
         super().__init__("Chat client is closing or closed")
 
+
+class SubscriptionAlreadyRegisteredError(ChatSdkError):
+    pass
+
+
+class SubscriptionClosedError(ChatSdkError):
+    pass
+
+
+class SubscriptionError(ChatSdkError):
+    pass
+
+
+class SubscriptionCallbackError(SubscriptionError):
+    pass
+
+
+class SubscriptionProtocolError(SubscriptionError):
+    pass

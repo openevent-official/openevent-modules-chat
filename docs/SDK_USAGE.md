@@ -1,130 +1,85 @@
-# Chat Python SDK Usage
+# Chat Python SDK
 
 [中文版](SDK_USAGE_cn.md)
 
-## 1. Installation And Dependencies
+## 1. Implementation Status
 
-`openevent-modules-chat` requires Python 3.10 or later and
-`openevent-sdk>=0.4.4` already installed in the current Python environment.
+This repository contains the installable Python SDK, its build entry point, and
+unit tests together with the public `chat.v1` protocol.
 
-```bash
-make build
-make install
-```
+The target implementation uses Python 3.10 or later and an installed
+`openevent-sdk>=0.6.0`. It must use the public OpenEvent client and must not
+generate protobuf modules or install an SDK from a source submodule.
 
-Builds and tests do not install the SDK from the repository's
-`openevent-sdk` submodule and do not generate proto modules at runtime.
+## 2. Protocol Parsing
 
-## 2. Stateless Parsing
+Applications that implement the protocol directly must validate each payload
+according to [CHAT_PROTOCOL.md](CHAT_PROTOCOL.md), preserve the OpenEvent
+`seq` order, and treat `EventMessage.uuid` as the OpenEvent message
+deduplication identifier. OpenEvent does not parse or validate `chat.v1` JSON.
 
-```python
-from openevent.chat_sdk import TurnStart, parse_message, parse_payload
+## 3. SDK Boundary
 
-event = parse_payload(payload_bytes)
-parsed = parse_message(event_message)
+The SDK is a stateful writer for `chat.v1`; it does not provide a worker,
+agent runtime, model integration, UI, or application-level authorization. Its
+public API will not expose message UUID allocation. The injected OpenEvent
+client owns the local UUID pool, and the SDK will obtain one UUID internally
+for each actual publish.
 
-if isinstance(parsed.payload, TurnStart):
-    print(parsed.turn_ref, parsed.payload.content)
-```
-
-`parse_payload` strictly requires UTF-8 JSON, unique object member names,
-finite JSON numbers, and each event kind's exact field set. `parse_message`
-also preserves `seq`, `ts_ms`, channel ID, publisher principal, recipients,
-and ObjectKeys. ObjectKey tokens are always redacted from `repr` output.
-
-## 3. Creating A Stateful Writer
-
-Create a concurrency-safe `openevent.sdk.OpenEventClient`, then bind a fixed
-identity and a non-empty channel set:
+The SDK also provides a subscription callback registration API. Applications
+receive seq-ordered `ParsedMessage` values through Chat SDK. The SDK polls
+with Fetch and never calls OpenEvent `Subscribe`; at the observed tail it
+continues polling with backoff, and unary RPC failures use the common retry
+rules.
 
 ```python
-from openevent.chat_sdk import create_client
 from openevent.sdk import OpenEventClient
+from openevent.chat_sdk import create_client
 
-openevent_client = OpenEventClient("127.0.0.1:9527")
+events = OpenEventClient("127.0.0.1:50051", timeout=1.0)
 chat = create_client(
-    openevent_client,
+    events,
     principal=9001,
     token="...",
-    channel_ids=[10001, 10002],
+    channel_id=10001,
+    on_failure=lambda error: print(error),
 )
 ```
 
-Initialization validates `protocol="chat.v1"` on every channel and blocks
-while recovering to a fixed watermark. The Chat client does not own the
-injected OpenEvent client or gRPC channel. Keep them open until after closing
-the Chat client.
-
-## 4. Publishing Turns
+Target usage:
 
 ```python
-from openevent.chat_sdk import ObjectKey, TextPart, TurnRef
-
-start_seq = chat.start_turn(
-    channel_id=10001,
-    turn_id="turn-user-1",
-    reply_to_turns=[],
-    content=[TextPart("hello")],
-    recipients=[],
-    object_keys=[ObjectKey(7001, "object-token")],
-    extensions={"ui": {"language": "en"}},
+subscription = chat.register_subscription_callback(
+    on_message,
+    from_seq=1,
+    on_error=on_subscription_error,
 )
 
-append_seq = chat.append_turn(
-    channel_id=10001,
-    turn_id="turn-user-1",
-    content=[TextPart(" world")],
-)
-
-end_seq = chat.complete_turn(channel_id=10001, turn_id="turn-user-1")
-cancel_seq = chat.cancel_turn(
-    channel_id=10001,
-    target_turn=TurnRef(principal=9002, turn_id="turn-agent-1"),
-)
+subscription.close()
 ```
 
-Before every publish, the calling thread obtains a fixed watermark `W` with
-GetStatus, raises the client's shared monotonic `sync_target_seq` with
-`max(sync_target_seq, W)`, and waits for the single internal sync thread to
-reach its own `W` using Fetch. The SDK then selects the append/end `pre_seq`,
-publishes, and returns only after the sync thread has processed the committed
-seq. The sync thread performs Fetch and state updates only; it does not execute
-GetStatus or PublishAutoSeq. One client permits at most one concurrent publish
-for the same TurnRef; different TurnRefs may publish concurrently.
+`from_seq=0` (the default) uses the watermark returned by the first Fetch
+linearization and receives only messages created after it; it does not promise
+to cover all history that existed when registration was called. Use an explicit
+starting point (normally `1`) when existing history must be covered. A value
+greater than zero receives history and subsequent messages from that sequence through Fetch.
+`SubscriptionHandle.wait_until_scanned(seq)` waits until Fetch has advanced
+the returned `next_seq` beyond the requested watermark.
 
-Applications continue to read, display, and process Chat events directly via
-OpenEvent Fetch/Subscribe, then parse each message with `parse_message`.
+The Chat SDK client must be created with an `on_failure` callback. The SDK
+invokes it once when a client that reached READY permanently enters FAILED
+because of an internal Fetch failure, subscription Fetch failure, or protocol
+state failure. Initialization errors, one-off publish errors, and `close()` do
+not invoke it. The callback is notification only and cannot recover the client;
+callers that do not need the notification must still pass an explicit no-op
+callback. Callbacks run synchronously without an SDK timeout and must return
+within a bounded time.
 
-## 5. Errors And Closing
+The complete synchronization, recovery, lifecycle, and error rules are part of
+the package's published implementation contract.
 
-- `ChatProtocolError` reports invalid call input or a malformed `chat.v1` payload.
-- `TurnNotFoundError`, `TurnAlreadyExistsError`, and `TurnBusyError` report turn state known before publication.
-- `SyncReadError.publish_sent` is always `False`: pre-publish synchronization failed before PublishAutoSeq was sent.
-- `PublishFailedError.code` preserves the PublishAutoSeq gRPC status.
-- `PublishCommittedSyncError.seq` means the message committed but ordered confirmation did not finish; do not treat it as uncommitted.
-- `ClientFailedError` means the client has permanently fail-stopped and later stateful calls issue no network request.
+## 4. Requirements
 
-Use the context manager or call `close()` explicitly. Closing does not close
-the injected OpenEvent client. Concurrent and repeated `close()` calls are
-idempotent.
-
-## 6. Verification
-
-```bash
-make test
-make build
-```
-
-Real end-to-end tests use only the `openevent-sdk` installed in the current
-environment. Configure them before running:
-
-```bash
-export OPENEVENT_E2E_ADDR=127.0.0.1:9527
-export OPENEVENT_E2E_PRINCIPAL=9001
-export OPENEVENT_E2E_TOKEN=...
-export OPENEVENT_E2E_CHAT_CHANNEL_ID=10001
-make e2e
-```
-
-The channel must already exist, be fully readable by the identity, and use
-`protocol="chat.v1"`.
+- An OpenEvent server with `chat.v1` channels, event history, and message UUID support.
+- A pre-created non-system channel with `protocol="chat.v1"`.
+- An installed `openevent-sdk>=0.6.0` when using the future Python SDK.

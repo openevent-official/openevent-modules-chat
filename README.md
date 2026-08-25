@@ -7,10 +7,9 @@ conversations between users and agents. A channel stores append-only turn
 events. Text can be appended incrementally so model output is visible while it
 is being generated, and independent turns can be interleaved safely.
 
-The project also provides the `openevent.chat_sdk` Python SDK for strict
-`chat.v1` parsing, turn write-state recovery, and safe construction of
-start/append/end/cancel events. It does not provide a worker, agent runtime,
-model integration, or user interface.
+The repository includes a Python SDK for the stateful `chat.v1` writer and
+Fetch-based subscription callback API. The project does not provide a worker,
+agent runtime, model integration, or user interface.
 
 ## Protocol
 
@@ -20,16 +19,19 @@ Every channel using this protocol sets:
 ChannelInfo.protocol = "chat.v1"
 ```
 
-The protocol defines four event kinds:
+The protocol defines five event kinds:
 
+- `turn.single`: creates and normally completes a turn in one event, carrying
+  its complete text content and reply references.
 - `turn.start`: creates a turn with a writer-supplied `turn_id` and carries its
   first text content. A turn is identified by owner principal plus `turn_id`.
 - `turn.append`: appends text content to an existing turn.
 - `turn.end`: normally completes a turn.
 - `turn.cancel`: independently cancels an existing turn.
 
-`turn.cancel` records a cancellation fact only. Applications should observe
-effective cancellation events through their own Fetch/Subscribe path and stop
+`turn.cancel` records a cancellation fact only. When using the Chat SDK,
+applications observe effective cancellation events through its subscription
+callback and stop
 the corresponding model, tool, or other application work; the Chat protocol
 does not directly interrupt application tasks.
 
@@ -43,28 +45,9 @@ specification.
 
 ## Python SDK
 
-The SDK requires Python 3.10 or later and `openevent-sdk>=0.4.4` installed in
-the current environment. A minimal writer looks like this:
-
-```python
-from openevent.chat_sdk import TextPart, create_client
-
-with create_client(
-    openevent_client,
-    principal=9001,
-    token="...",
-    channel_ids=[10001],
-) as chat:
-    seq = chat.start_turn(
-        channel_id=10001,
-        turn_id="turn-01JABC",
-        reply_to_turns=[],
-        content=[TextPart("hello")],
-    )
-```
-
-See [docs/SDK_USAGE.md](docs/SDK_USAGE.md) for installation, parsing,
-publishing, failure-state, and concurrency details.
+The installable Python SDK is under `src/openevent/chat_sdk`. Its complete
+state, retry, lifecycle, and subscription contract is defined by the internal
+`CHAT_SDK_DESIGN.md` document.
 
 ## Boundary
 
@@ -74,18 +57,18 @@ publishing, failure-state, and concurrency details.
 - channel visibility or membership policy;
 - application semantics for OpenEvent `recipients`;
 - agent internals, model requests, tools, hidden reasoning, or orchestration;
-- idempotency, retry, or invalid-history handling policy.
+- business-level idempotency, retry, or invalid-history handling policy.
 
 Applications may attach OpenEvent ObjectKeys and may store application-visible
 metadata in the protocol's `extensions` object. The base protocol supports text
-content parts only and does not permit additional event kinds.
+content parts only and does not permit event kinds beyond the five listed
+above.
 
 ## Requirements
 
-- An OpenEvent server supporting channels, event history, and subscriptions.
-- The Python SDK requires `openevent-sdk>=0.4.4` installed in the current
-  environment. Direct protocol implementations also require OpenEvent `0.4.4`
-  or later when ObjectKey attachments are used.
+- An OpenEvent server supporting channels, event history, and Fetch.
+- Direct protocol implementations require an OpenEvent server that supports
+  message UUIDs, as documented by the OpenEvent API.
 - A pre-created non-system channel with `protocol="chat.v1"`.
 
 OpenEvent stores the events and enforces its own channel ACL. It does not parse

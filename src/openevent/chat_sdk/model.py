@@ -5,8 +5,8 @@ from typing import Any
 
 from .errors import ChatProtocolError
 
-
 UINT64_MAX = (1 << 64) - 1
+KIND_TURN_SINGLE = "turn.single"
 KIND_TURN_START = "turn.start"
 KIND_TURN_APPEND = "turn.append"
 KIND_TURN_END = "turn.end"
@@ -14,8 +14,8 @@ KIND_TURN_CANCEL = "turn.cancel"
 
 
 def require_uint64(value: Any, name: str, *, nonzero: bool = False) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < int(nonzero) or value > UINT64_MAX:
-        lower = 1 if nonzero else 0
+    lower = 1 if nonzero else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < lower or value > UINT64_MAX:
         raise ChatProtocolError(f"{name} must be an integer in {lower}..{UINT64_MAX}")
     return value
 
@@ -24,11 +24,10 @@ def require_turn_id(value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise ChatProtocolError("turn_id must be a non-empty string")
     try:
-        encoded = value.encode("utf-8")
+        if len(value.encode("utf-8")) > 128:
+            raise ChatProtocolError("turn_id must be at most 128 UTF-8 bytes")
     except UnicodeEncodeError as exc:
         raise ChatProtocolError("turn_id must contain valid Unicode scalar values") from exc
-    if len(encoded) > 128:
-        raise ChatProtocolError("turn_id must be at most 128 UTF-8 bytes")
     return value
 
 
@@ -71,6 +70,15 @@ class ObjectKey:
 
 
 @dataclass(frozen=True)
+class TurnSingle:
+    turn_id: str
+    reply_to_turns: tuple[TurnRef, ...]
+    content: tuple[TextPart, ...]
+    extensions: dict[str, Any] | None = None
+    kind: str = field(default=KIND_TURN_SINGLE, init=False)
+
+
+@dataclass(frozen=True)
 class TurnStart:
     turn_id: str
     reply_to_turns: tuple[TurnRef, ...]
@@ -104,7 +112,7 @@ class TurnCancel:
     kind: str = field(default=KIND_TURN_CANCEL, init=False)
 
 
-ChatEvent = TurnStart | TurnAppend | TurnEnd | TurnCancel
+ChatEvent = TurnSingle | TurnStart | TurnAppend | TurnEnd | TurnCancel
 
 
 @dataclass(frozen=True)
@@ -121,4 +129,3 @@ class ParsedMessage:
     @property
     def event(self) -> ChatEvent:
         return self.payload
-
