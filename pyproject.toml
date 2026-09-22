@@ -5,11 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openevent-modules-chat"
 version = "0.1.0"
-description = "OpenEvent chat.v1 protocol SDK"
+description = "OpenEvent chat.v1 SDK and browser chat server"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "openevent-sdk>=0.6.0",
+    "openevent-sdk>=0.8.1",
+    "multipart>=2.0,<3",
+    "filelock>=3.16,<4",
 ]
+
+[project.scripts]
+openevent-chat = "openevent.chat_app.__main__:main"
+
+[tool.setuptools.package-data]
+"openevent.chat_app" = ["static/*"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

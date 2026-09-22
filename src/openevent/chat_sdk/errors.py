@@ -1,125 +1,94 @@
-from __future__ import annotations
-
+"""Public errors. Remote error bodies never enter diagnostic messages."""
 from dataclasses import dataclass
-from typing import Any
+from typing import Literal
 
-
-def _code_name(code: Any) -> str:
-    return str(getattr(code, "name", code if code is not None else "UNKNOWN"))
+import grpc
 
 
 @dataclass(frozen=True)
-class FailureCause:
+class FailureInfo:
     stage: str
-    code: Any = None
-    detail: str = "operation failed"
+    category: Literal["external_unavailable", "authentication", "permission",
+                      "not_found", "protocol", "contract", "lifecycle"]
+    grpc_code: grpc.StatusCode | None
+    retryable: bool
+    detail: str
 
-    def __str__(self) -> str:
-        suffix = f" ({_code_name(self.code)})" if self.code is not None else ""
-        return f"{self.stage}: {self.detail}{suffix}"
 
-
-class ChatSdkError(Exception):
+class ChatProtocolError(ValueError):
     pass
 
 
-class ChatProtocolError(ChatSdkError, ValueError):
+class _FailureError(Exception):
+    def __init__(self, failure: FailureInfo):
+        super().__init__(failure.detail)
+        self._failure = failure
+
+    @property
+    def failure(self) -> FailureInfo:
+        return self._failure
+
+
+class ChannelInitializationError(_FailureError):
     pass
 
 
-class MalformedPayloadError(ChatProtocolError):
+class FetchPageError(_FailureError):
     pass
 
 
-class InvalidKindError(ChatProtocolError):
+class SyncReadError(_FailureError):
     pass
 
 
-class ChannelInitializationError(ChatSdkError):
-    def __init__(self, cause: FailureCause | ChatSdkError, channel_id: int | None = None):
-        self.channel_id = channel_id
-        self.cause = cause
-        subject = "channel initialization" if channel_id is None else f"channel {channel_id} initialization"
-        super().__init__(f"{subject} failed: {cause}")
-
-
-class ConversationStateError(ChatSdkError):
+class UuidAllocationError(_FailureError):
     pass
 
 
-class HistoryConflictError(ConversationStateError):
+class PublishFailedError(_FailureError):
+    def __init__(self, failure: FailureInfo, uuid: int, *, uncertain: bool = True):
+        super().__init__(failure)
+        self.uuid = uuid
+        self.uncertain = uncertain
+
+
+class ClientFailedError(_FailureError):
     pass
 
 
-class OpenEventContractError(ConversationStateError):
+class ClientClosedError(Exception):
     pass
 
 
-class TurnNotFoundError(ConversationStateError):
-    def __init__(self, turn_ref: Any):
-        self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} does not exist")
-
-
-class TurnAlreadyExistsError(ConversationStateError):
-    def __init__(self, turn_ref: Any):
-        self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} already exists")
-
-
-class TurnBusyError(ChatSdkError):
-    def __init__(self, turn_ref: Any):
-        self.turn_ref = turn_ref
-        super().__init__(f"turn {turn_ref!r} already has a local publish in progress")
-
-
-class SyncReadError(ChatSdkError):
-    def __init__(self, cause: FailureCause | ChatSdkError):
-        self.publish_sent = False
-        self.cause = cause
-        super().__init__(f"pre-publish synchronization failed: {cause}")
-
-
-class UuidAllocationError(ChatSdkError):
-    def __init__(self, cause: FailureCause | ChatSdkError):
-        self.publish_sent = False
-        self.cause = cause
-        super().__init__(f"UUID allocation failed: {cause}")
-
-
-class PublishFailedError(ChatSdkError):
-    def __init__(self, code: Any, stage: str = "PublishAutoSeq"):
-        self.code = code
-        self.stage = stage
-        super().__init__(f"{stage} failed with status {_code_name(code)}")
-
-
-class ClientFailedError(ChatSdkError):
-    def __init__(self, cause: FailureCause | ChatSdkError):
-        self.cause = cause
-        super().__init__(f"Chat client has permanently failed: {cause}")
-
-
-class ClientClosedError(ChatSdkError):
-    def __init__(self):
-        super().__init__("Chat client is closing or closed")
-
-
-class SubscriptionAlreadyRegisteredError(ChatSdkError):
+class TurnNotFoundError(Exception):
     pass
 
 
-class SubscriptionClosedError(ChatSdkError):
+class TurnWriterStateError(Exception):
     pass
 
 
-class SubscriptionError(ChatSdkError):
-    pass
-
-
-class SubscriptionCallbackError(SubscriptionError):
-    pass
-
-
-class SubscriptionProtocolError(SubscriptionError):
-    pass
+def make_failure(stage, exc=None, *, attempts=1, category=None, detail=None):
+    """Classify a failure without copying untrusted exception text."""
+    if isinstance(exc, _FailureError):
+        return exc.failure
+    code = exc.code() if isinstance(exc, grpc.RpcError) else None
+    if category is None:
+        if code in {grpc.StatusCode.CANCELLED, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNKNOWN,
+                    grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL,
+                    grpc.StatusCode.RESOURCE_EXHAUSTED}:
+            category = "external_unavailable"
+        elif code == grpc.StatusCode.UNAUTHENTICATED:
+            category = "authentication"
+        elif code == grpc.StatusCode.PERMISSION_DENIED:
+            category = "permission"
+        elif code == grpc.StatusCode.NOT_FOUND:
+            category = "not_found"
+        elif isinstance(exc, ChatProtocolError):
+            category = "protocol"
+        elif isinstance(exc, ClientClosedError):
+            category = "lifecycle"
+        else:
+            category = "contract"
+    return FailureInfo(stage, category, code, category == "external_unavailable",
+                       detail or f"{stage} failed after {attempts} attempts")

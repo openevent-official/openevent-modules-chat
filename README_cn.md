@@ -3,10 +3,12 @@
 [English version](README.md)
 
 OpenEvent Chat 定义面向用户与 Agent 永久会话的精简事件协议 `chat.v1`。一个 Channel 以 append-only
-方式保存 turn 事件。文本可以在模型生成过程中持续追加，不同 turn 也可以安全交错。
+方式保存 turn 事件和发送编号预留控制事件。文本可以在模型生成过程中持续追加，不同 turn 也可以安全交错。
 
-项目包含用于有状态 `chat.v1` 写入和基于 Fetch 的订阅回调 Python SDK。
-项目不提供 worker、Agent runtime、模型集成或用户界面。
+项目包含用于 `chat.v1` 写入、一次一页的 Fetch 读取和无状态消息解析的 Python SDK。
+流式消息通过调用方持有的写入对象追加和结束；续写旧消息时显式恢复写入对象。SDK 创建时不自动恢复历史；
+需要持续读取时，调用方自行循环 Fetch 并保存读取位置。
+项目还提供一个聊天后端和浏览器页面，支持会话、文件和主动消息拉取；不包含 Agent runtime 或模型集成。
 
 ## 协议
 
@@ -16,7 +18,7 @@ OpenEvent Chat 定义面向用户与 Agent 永久会话的精简事件协议 `ch
 ChannelInfo.protocol = "chat.v1"
 ```
 
-协议定义五种事件：
+协议定义五种 turn 事件和一种发送编号预留控制事件：
 
 - `turn.single`：用一条事件创建并正常完成 turn，携带完整文本内容和回复引用。
 - `turn.start`：使用写入方生成的 `turn_id` 创建 turn 并携带第一段文本内容；turn 由 owner principal 与
@@ -24,8 +26,13 @@ ChannelInfo.protocol = "chat.v1"
 - `turn.append`：向已有 turn 追加文本内容。
 - `turn.end`：正常完成 turn。
 - `turn.cancel`：独立中止已有 turn。
+- `submission.reserve`：记录当前 Channel 的发送编号预留上限，不创建 turn；完整规则见
+  [协议第 14 节](docs/CHAT_PROTOCOL_cn.md#14-submissionreserve)。
 
-`turn.cancel` 只记录取消事实。使用 Chat SDK 时，应用通过 SDK 订阅回调观察生效的取消事件，并自行停止对应的模型、工具或
+回复通过 `reply_to_seqs` 引用目标 turn 的创建事件 seq，具体语义见
+[协议第 11 节](docs/CHAT_PROTOCOL_cn.md#11-回复关系)。
+
+`turn.cancel` 只记录取消事实。使用 Chat SDK 时，应用通过 `fetch_page()` 读取生效的取消事件，并自行停止对应的模型、工具或
 其它业务处理；Chat 协议不直接中止应用任务。
 
 一个 turn 进入终态后，针对它的后续 append、end 和 cancel 即使已经提交，也不改变已决终态、最终内容或终态前链尾。
@@ -35,8 +42,14 @@ ChannelInfo.protocol = "chat.v1"
 
 ## Python SDK
 
-可安装的 Python SDK 位于 `src/openevent/chat_sdk`。完整的状态、重试、生命周期和订阅契约以内部
-`CHAT_SDK_DESIGN.md` 为准。
+可安装的 Python SDK 位于 `src/openevent/chat_sdk`。公开读取与写入 API、状态、重试和生命周期契约以
+[docs/CHAT_SDK_cn.md](docs/CHAT_SDK_cn.md) 为准；入门调用见
+[docs/SDK_USAGE_cn.md](docs/SDK_USAGE_cn.md)。
+
+## 浏览器应用
+
+后端与静态页面随同一个安装包提供。执行 `make install` 后，用 `openevent-chat --config ./chat.json` 启动。
+配置、使用和重启说明见 [应用使用指南](docs/APP_USAGE_cn.md)。
 
 ## 边界
 
@@ -48,13 +61,18 @@ ChannelInfo.protocol = "chat.v1"
 - Agent 内部状态、模型请求、工具、隐藏推理或调度过程；
 - 业务级幂等、重试或非法历史处理策略。
 
-应用可以附加 OpenEvent ObjectKey，也可以在协议的 `extensions` 对象中保存用户可见的应用元数据。
-基础协议只支持文本 content part，不允许增加上述五种之外的事件 kind。
+应用可以在 turn 事件上附加 OpenEvent ObjectKey，也可以在协议的 `extensions` 对象中保存用户可见的应用元数据。
+基础协议只支持文本 content part，不允许增加上述六种之外的事件 kind。
 
 ## 运行前提
 
 - 支持 Channel、事件历史和 Fetch 的 OpenEvent server。
-- 直接实现协议的应用需要使用支持消息 UUID 的 OpenEvent server，具体以 OpenEvent API 文档为准。
-- 已提前创建 `protocol="chat.v1"` 的非系统 Channel。
+- Python SDK 需要当前环境已安装 `openevent-sdk>=0.8.1`；当前参考 SDK 为 `0.8.1`。
+- 支持消息 UUID 的 OpenEvent server，具体以 OpenEvent API 文档为准。
+- 直接使用 SDK 时，需提前创建 `protocol="chat.v1"` 的非系统 Channel；浏览器应用会自动创建。
+
+构建或测试前运行 `make check-sdk`，确认当前环境已安装的 SDK 可用。`make e2e`
+还要求 `OPENEVENT_SERVER_BIN` 指向可执行的 OpenEvent server；它只使用已安装的
+SDK，不会从源码安装 SDK。
 
 OpenEvent 负责保存事件并执行自身的 Channel ACL，不解析或校验 `chat.v1` JSON。

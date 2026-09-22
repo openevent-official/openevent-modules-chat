@@ -1,672 +1,443 @@
-from __future__ import annotations
-
-import copy
+"""Synchronous Chat calls and caller-owned streaming writers."""
+from contextlib import contextmanager
 import math
 import threading
-import time
-from numbers import Real
-from typing import Any, Callable, Iterable
 
 import grpc
-from openevent.sdk import openevent_pb2
+from openevent.sdk.proto import openevent_pb2
 
-from .codec import encode_append, encode_cancel, encode_end, encode_single, encode_start, parse_message
+from .codec import encode_payload, make_content, parse_message, validate_turn_id, validate_uint64
 from .errors import (
-    ChannelInitializationError,
-    ChatProtocolError,
-    ChatSdkError,
-    ClientClosedError,
-    ClientFailedError,
-    ConversationStateError,
-    FailureCause,
-    HistoryConflictError,
-    OpenEventContractError,
-    PublishFailedError,
-    SubscriptionAlreadyRegisteredError,
-    SubscriptionCallbackError,
-    SubscriptionClosedError,
-    SubscriptionError,
-    SubscriptionProtocolError,
-    SyncReadError,
-    TurnBusyError,
-    UuidAllocationError,
+    ChannelInitializationError, ChatProtocolError, ClientClosedError,
+    ClientFailedError, FetchPageError, PublishFailedError, SyncReadError,
+    TurnNotFoundError, TurnWriterStateError, UuidAllocationError, make_failure,
 )
-from .model import KIND_TURN_START, ObjectKey, ParsedMessage, TextPart, TurnRef, require_turn_id, require_uint64
-from .state import ConversationState
+from .model import FetchPage, ObjectKey, TurnRef
 
 
-_FETCH_LIMIT = 1000
-_INITIAL_POLL_SECONDS = 0.01
-_MAX_POLL_SECONDS = 1.0
-_RETRY_INITIAL_SECONDS = 0.05
-_RETRY_MAX_SECONDS = 1.0
-_RETRYABLE = frozenset(
-    {
-        grpc.StatusCode.DEADLINE_EXCEEDED,
-        grpc.StatusCode.UNKNOWN,
-        grpc.StatusCode.UNAVAILABLE,
-        grpc.StatusCode.INTERNAL,
-    }
-)
-_NON_RETRYABLE = frozenset(
-    {
-        grpc.StatusCode.UNAUTHENTICATED,
-        grpc.StatusCode.PERMISSION_DENIED,
-        grpc.StatusCode.NOT_FOUND,
-        grpc.StatusCode.INVALID_ARGUMENT,
-        grpc.StatusCode.RESOURCE_EXHAUSTED,
-        grpc.StatusCode.CANCELLED,
-        grpc.StatusCode.ALREADY_EXISTS,
-    }
-)
+_RETRY_CODES = frozenset({
+    grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNKNOWN,
+    grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL,
+})
+_NOT_COMMITTED = frozenset({
+    grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED,
+    grpc.StatusCode.NOT_FOUND, grpc.StatusCode.INVALID_ARGUMENT,
+    grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.ABORTED,
+})
+_RETRY_SECONDS = 0.1
 
 
-class _Lifecycle:
-    INITIALIZING = "INITIALIZING"
-    READY = "READY"
-    FAILED = "FAILED"
-    CLOSING = "CLOSING"
-    CLOSED = "CLOSED"
+class _RpcFailure(Exception):
+    def __init__(self, failure, attempts):
+        self.failure = failure
+        self.attempts = attempts
 
 
-def _grpc_code(exc: Exception) -> grpc.StatusCode:
-    method = getattr(exc, "code", None)
-    if callable(method):
-        try:
-            value = method()
-            if isinstance(value, grpc.StatusCode):
-                return value
-        except Exception:
-            pass
-    return grpc.StatusCode.UNKNOWN
-
-
-def _cause(stage: str, exc: Exception) -> FailureCause:
-    return FailureCause(stage=stage, code=_grpc_code(exc), detail="RPC failed")
-
-
-def _validate_timeout(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ChatProtocolError("openevent_client.timeout must be a positive finite number")
-    value = float(value)
-    if not math.isfinite(value) or value <= 0:
-        raise ChatProtocolError("openevent_client.timeout must be a positive finite number")
-    return value
-
-
-def _tuple_uint64(values: Iterable[int], name: str) -> tuple[int, ...]:
+def _items(values, field):
     try:
-        result = tuple(values)
-    except TypeError as exc:
-        raise ChatProtocolError(f"{name} must be iterable") from exc
-    for value in result:
-        require_uint64(value, name)
-    return result
+        return tuple(values)
+    except TypeError:
+        raise ChatProtocolError(f"{field} must be iterable") from None
 
 
-def _tuple_object_keys(values: Iterable[ObjectKey], *, allowed: bool = True) -> tuple[ObjectKey, ...]:
-    try:
-        result = tuple(values)
-    except TypeError as exc:
-        raise ChatProtocolError("object_keys must be iterable") from exc
-    if not allowed and result:
-        raise ChatProtocolError("this event does not accept object_keys")
-    if len(result) > 1024:
-        raise ChatProtocolError("a message may contain at most 1024 ObjectKeys")
-    if any(not isinstance(value, ObjectKey) for value in result):
-        raise ChatProtocolError("object_keys must contain only ObjectKey values")
-    return result
-
-
-def _protobuf_keys(keys: tuple[ObjectKey, ...]) -> tuple[Any, ...]:
-    return tuple(openevent_pb2.ObjectKey(object_id=k.object_id, object_token=k.object_token) for k in keys)
-
-
-def _freeze_extensions(extensions: dict[str, Any] | None) -> dict[str, Any] | None:
-    if extensions is None:
-        return None
-    if not isinstance(extensions, dict):
-        raise ChatProtocolError("extensions must be a JSON object")
-    try:
-        return copy.deepcopy(extensions)
-    except Exception as exc:
-        raise ChatProtocolError("extensions must be copyable JSON data") from exc
-
-
-class SubscriptionHandle:
-    def __init__(self, client: "ChatProtocolClient", on_message: Callable[[ParsedMessage], None], from_seq: int, on_error: Callable[[SubscriptionError], None] | None):
-        self._client = client
-        self._on_message = on_message
-        self._on_error = on_error
-        self._cursor = from_seq
-        self._next_seq: int | None = None
-        self._last_last_seq = 0
-        self._terminal: SubscriptionError | ClientFailedError | SubscriptionClosedError | None = None
-        self._closed = False
-        self._condition = threading.Condition(threading.RLock())
-        self._thread = threading.Thread(target=self._run, name="openevent-chat-subscription", daemon=True)
-
-    @property
-    def next_seq(self) -> int | None:
-        with self._condition:
-            return self._next_seq
-
-    def wait_until_scanned(self, seq: int) -> None:
-        require_uint64(seq, "seq")
-        with self._condition:
-            while True:
-                if self._next_seq is not None and self._next_seq > seq:
-                    return
-                if self._terminal is not None:
-                    raise self._terminal
-                with self._client._condition:
-                    lifecycle = self._client._lifecycle
-                    failure = self._client._failure
-                if lifecycle == _Lifecycle.FAILED:
-                    raise ClientFailedError(failure or FailureCause("client", detail="unknown failure"))
-                if lifecycle in {_Lifecycle.CLOSING, _Lifecycle.CLOSED}:
-                    raise ClientClosedError()
-                self._condition.wait()
-
-    def close(self) -> None:
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            if self._terminal is None:
-                self._terminal = SubscriptionClosedError("subscription is closed")
-            self._condition.notify_all()
-        if threading.current_thread() is not self._thread:
-            self._thread.join()
-        self._client._subscription_stopped(self)
-
-    def _set_terminal(self, error: SubscriptionError | ClientFailedError | SubscriptionClosedError) -> None:
-        with self._condition:
-            if self._terminal is None:
-                self._terminal = error
-            self._condition.notify_all()
-
-    def _notify_error(self, error: SubscriptionError | ClientFailedError) -> None:
-        if self._on_error is None:
-            return
+def _freeze(payload, recipients, object_keys, extensions):
+    if extensions is not None:
+        payload["extensions"] = extensions
+    encoded = encode_payload(payload)
+    recipients = tuple(validate_uint64(value, "recipient", positive=False)
+                       for value in _items(recipients, "recipients"))
+    keys = _items(object_keys, "object_keys")
+    if len(keys) > 1024:
+        raise ChatProtocolError("object_keys exceeds 1024 entries")
+    frozen_keys = []
+    for key in keys:
+        if not isinstance(key, ObjectKey):
+            raise ChatProtocolError("object_keys entries must be ObjectKey")
+        validate_uint64(key.object_id, "object_id")
+        if not isinstance(key.object_token, str) or not key.object_token:
+            raise ChatProtocolError("object_token must be nonempty string")
         try:
-            self._on_error(error)  # type: ignore[arg-type]
-        except Exception:
-            pass
-
-    def _run(self) -> None:
-        delay = _INITIAL_POLL_SECONDS
-        try:
-            while True:
-                with self._condition:
-                    if self._closed:
-                        return
-                    cursor = self._cursor
-                with self._client._condition:
-                    if self._client._lifecycle != _Lifecycle.READY:
-                        if self._client._lifecycle == _Lifecycle.FAILED:
-                            error = ClientFailedError(self._client._failure or FailureCause("client", detail="unknown failure"))
-                            self._set_terminal(error)
-                            self._notify_error(error)
-                        return
-                try:
-                    response = self._client._retry_rpc(
-                        lambda: self._client._openevent.fetch(
-                            principal=self._client._principal,
-                            token=self._client._token,
-                            from_seq=cursor,
-                            limit=_FETCH_LIMIT,
-                            only_my_recipient=False,
-                            channels=(self._client._channel_id,),
-                        ),
-                        "subscription Fetch",
-                    )
-                    next_seq, messages = self._client._validate_fetch_response(response, cursor, self._last_last_seq)
-                    self._last_last_seq = max(self._last_last_seq, int(response.last_seq))
-                except (ClientClosedError, ClientFailedError) as exc:
-                    self._set_terminal(exc)
-                    self._notify_error(exc)
-                    return
-                except Exception as exc:
-                    protocol = isinstance(exc, (ConversationStateError, ChatProtocolError))
-                    error: SubscriptionError = SubscriptionProtocolError(str(exc)) if protocol else SubscriptionError(str(exc))
-                    self._set_terminal(error)
-                    self._client._transition_failed(_cause("subscription Fetch", exc) if not protocol else error)
-                    self._notify_error(error)
-                    return
-
-                try:
-                    for raw in messages:
-                        parsed = parse_message(raw)
-                        if parsed.channel_id != self._client._channel_id:
-                            raise OpenEventContractError("Fetch returned a message outside the bound Channel")
-                        try:
-                            self._on_message(parsed)
-                        except Exception as exc:
-                            error = SubscriptionCallbackError(f"on_message failed: {type(exc).__name__}")
-                            self._set_terminal(error)
-                            self._notify_error(error)
-                            return
-                except Exception as exc:
-                    error = SubscriptionProtocolError(str(exc))
-                    self._set_terminal(error)
-                    self._client._transition_failed(error)
-                    self._notify_error(error)
-                    return
-
-                with self._condition:
-                    if self._closed:
-                        return
-                    self._cursor = next_seq
-                    self._next_seq = next_seq
-                    self._condition.notify_all()
-                if next_seq > int(response.last_seq):
-                    with self._condition:
-                        self._condition.wait(timeout=delay)
-                    delay = min(delay * 2, _MAX_POLL_SECONDS)
-                else:
-                    delay = _INITIAL_POLL_SECONDS
-        finally:
-            self._client._subscription_stopped(self)
+            frozen_keys.append(openevent_pb2.ObjectKey(
+                object_id=key.object_id, object_token=key.object_token))
+        except (TypeError, ValueError, UnicodeError):
+            raise ChatProtocolError("object_token must be valid UTF-8 string") from None
+    return encoded, recipients, tuple(frozen_keys)
 
 
 class ChatProtocolClient:
-    def __init__(self, openevent_client: Any, *, principal: int, token: str, channel_id: int, max_retries: int = 3, on_failure: Callable[[ChatSdkError], None]):
-        self._openevent = openevent_client
-        self._principal = require_uint64(principal, "principal", nonzero=True)
-        if not isinstance(token, str):
-            raise ChatProtocolError("token must be a string")
-        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
-            raise ChatProtocolError("max_retries must be a non-negative integer")
-        if not callable(on_failure):
-            raise ChatProtocolError("on_failure must be callable")
+    """A bound transport and lifecycle; no turn or writer registry."""
+
+    def __init__(self, events, *, principal, token, channel_id, max_retries=3,
+                 channel_validator=None):
+        self._principal = validate_uint64(principal, "principal")
+        self._channel_id = validate_uint64(channel_id, "channel_id")
+        if not isinstance(token, str) or not token:
+            raise ChatProtocolError("token must be nonempty string")
+        if type(max_retries) is not int or max_retries < 0:
+            raise ChatProtocolError("max_retries must be nonnegative integer")
+        if channel_validator is not None and not callable(channel_validator):
+            raise ChatProtocolError("channel_validator must be callable")
+        timeout_ms = getattr(events, "timeout_ms", None)
+        if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (float, int))
+                or not math.isfinite(timeout_ms) or timeout_ms <= 0):
+            raise ChatProtocolError("injected client timeout_ms must be positive and finite")
+        for method in ("get_channel", "get_status", "fetch", "get_uuid",
+                       "get_seq_by_uuid", "publish_auto_seq"):
+            if not callable(getattr(events, method, None)):
+                raise ChatProtocolError(f"injected client must provide {method}")
+        self._events = events
         self._token = token
-        self._channel_id = require_uint64(channel_id, "channel_id", nonzero=True)
-        _validate_timeout(getattr(openevent_client, "timeout", None))
-        for name in ("get_channel", "get_status", "fetch", "get_uuid", "publish_auto_seq"):
-            if not callable(getattr(openevent_client, name, None)):
-                raise ChatProtocolError(f"openevent_client must provide {name}()")
         self._max_retries = max_retries
-        self._on_failure = on_failure
-        self._condition = threading.Condition(threading.RLock())
-        self._lifecycle = _Lifecycle.INITIALIZING
-        self._failure: FailureCause | ChatSdkError | None = None
-        self._state = ConversationState(self._channel_id)
-        self._next_fetch_seq = 1
-        self._processed_through_seq = 0
-        self._sync_target_seq = 0
-        self._last_status_max = 0
-        self._last_published_seq = 0
-        self._last_fetch_last_seq = 0
-        self._busy: set[TurnRef] = set()
+        self._condition = threading.Condition()
+        self._state = "READY"
+        self._failure = None
         self._active_calls = 0
-        self._active_rpcs = 0
-        self._sync_thread: threading.Thread | None = None
-        self._subscription: SubscriptionHandle | None = None
-        self._initialize()
+        try:
+            response = self._rpc("GetChannel", lambda: events.get_channel(
+                principal=self._principal, token=token, channel_id=self._channel_id))
+        except _RpcFailure as error:
+            raise ChannelInitializationError(error.failure) from None
+        try:
+            channel = response.channel
+            returned_id = validate_uint64(channel.channel_id, "channel_id")
+            if returned_id != self._channel_id:
+                raise ChatProtocolError("GetChannel returned a different Channel")
+            protocol = channel.protocol
+        except (AttributeError, ChatProtocolError):
+            raise ChannelInitializationError(make_failure(
+                "GetChannel", category="contract",
+                detail="GetChannel returned an invalid or mismatched Channel")) from None
+        if protocol != "chat.v1":
+            raise ChannelInitializationError(make_failure(
+                "GetChannel", category="protocol",
+                detail="Channel protocol is not chat.v1"))
+        if channel_validator is not None:
+            try:
+                channel_validator(channel)
+            except Exception:
+                raise ChannelInitializationError(make_failure(
+                    "GetChannel", category="contract",
+                    detail="Channel does not meet application requirements")) from None
 
     @property
-    def channel_id(self) -> int:
-        return self._channel_id
-
-    @property
-    def principal(self) -> int:
+    def principal(self):
         return self._principal
 
-    def __enter__(self) -> "ChatProtocolClient":
+    @property
+    def channel_id(self):
+        return self._channel_id
+
+    def _check_locked(self):
+        if self._state in {"CLOSING", "CLOSED"}:
+            raise ClientClosedError("Chat client is closed")
+        if self._failure is not None:
+            raise ClientFailedError(self._failure)
+
+    @contextmanager
+    def _operation(self):
+        with self._condition:
+            self._check_locked()
+            self._active_calls += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_calls -= 1
+                self._condition.notify_all()
+
+    def _fail(self, failure):
+        with self._condition:
+            if self._failure is None and failure.category != "lifecycle":
+                self._failure = failure
+                if self._state == "READY":
+                    self._state = "FAILED"
+            self._condition.notify_all()
+
+    def _stopped_failure(self, stage):
+        return self._failure or make_failure(
+            stage, category="lifecycle", detail=f"{stage} stopped because the client was closed")
+
+    def _rpc(self, stage, call, *, on_error=None):
+        """Retry one logical RPC, retaining its last concrete failure on close."""
+        for attempt in range(1, self._max_retries + 2):
+            with self._condition:
+                if self._state != "READY":
+                    raise _RpcFailure(self._stopped_failure(stage), attempt - 1)
+            try:
+                return call()
+            except Exception as exc:
+                failure = make_failure(stage, exc, attempts=attempt)
+                if on_error is not None:
+                    on_error(failure.grpc_code)
+                if failure.grpc_code not in _RETRY_CODES or attempt > self._max_retries:
+                    raise _RpcFailure(failure, attempt) from None
+            with self._condition:
+                self._condition.wait_for(lambda: self._state != "READY", _RETRY_SECONDS)
+                if self._state != "READY":
+                    raise _RpcFailure(failure, attempt) from None
+        raise AssertionError("unreachable retry state")
+
+    def close(self):
+        with self._condition:
+            if self._state == "CLOSED":
+                return
+            self._state = "CLOSING"
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: self._active_calls == 0)
+            self._state = "CLOSED"
+            self._condition.notify_all()
+
+    def __enter__(self):
+        with self._condition:
+            self._check_locked()
         return self
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+    def __exit__(self, exc_type, exc, traceback):
         self.close()
-        return False
 
-    def _retry_rpc(self, operation: Callable[[], Any], stage: str) -> Any:
-        delay = _RETRY_INITIAL_SECONDS
-        last: Exception | None = None
-        for attempt in range(self._max_retries + 1):
-            with self._condition:
-                self._ensure_ready_locked()
-                self._active_rpcs += 1
-            try:
-                return operation()
-            except Exception as exc:
-                last = exc
-                code = _grpc_code(exc)
-                if code not in _RETRYABLE or attempt >= self._max_retries:
-                    raise
-            finally:
-                with self._condition:
-                    self._active_rpcs -= 1
-                    self._condition.notify_all()
-            with self._condition:
-                if self._lifecycle != _Lifecycle.READY:
-                    self._ensure_ready_locked()
-                self._condition.wait(timeout=delay)
-            delay = min(delay * 2, _RETRY_MAX_SECONDS)
-        raise last or RuntimeError(f"{stage} failed")
-
-    def _retry_initialization(self, operation: Callable[[], Any], stage: str) -> Any:
-        delay = _RETRY_INITIAL_SECONDS
-        for attempt in range(self._max_retries + 1):
-            try:
-                return operation()
-            except Exception as exc:
-                if _grpc_code(exc) not in _RETRYABLE or attempt >= self._max_retries:
-                    raise
-                time.sleep(delay)
-                delay = min(delay * 2, _RETRY_MAX_SECONDS)
-        raise RuntimeError(stage)
-
-    def _initialize(self) -> None:
+    def _publish(self, frozen):
+        payload, recipients, object_keys = frozen
         try:
-            response = self._retry_initialization(lambda: self._openevent.get_channel(principal=self._principal, token=self._token, channel_id=self._channel_id), "GetChannel")
-            channel = response.channel
-            if require_uint64(channel.channel_id, "ChannelInfo.channel_id", nonzero=True) != self._channel_id or channel.protocol != "chat.v1":
-                raise ConversationStateError("Channel is not a chat.v1 Channel")
-            status = self._retry_initialization(lambda: self._openevent.get_status(principal=self._principal, token=self._token), "GetStatus")
-            target = require_uint64(status.max_seq, "GetStatus.max_seq")
-            self._last_status_max = target
-            cursor = 1
-            while cursor <= target:
-                response = self._retry_initialization(lambda cursor=cursor: self._openevent.fetch(principal=self._principal, token=self._token, from_seq=cursor, limit=_FETCH_LIMIT, only_my_recipient=False, channels=(self._channel_id,)), "Fetch")
-                next_seq, messages = self._validate_fetch_response(response, cursor)
-                self._last_fetch_last_seq = max(self._last_fetch_last_seq, int(response.last_seq))
-                for raw in messages:
-                    with self._condition:
-                        self._state.apply(parse_message(raw))
-                cursor = next_seq
-            with self._condition:
-                self._next_fetch_seq = cursor
-                self._processed_through_seq = cursor - 1
-                self._sync_target_seq = target
-                self._lifecycle = _Lifecycle.READY
-                self._sync_thread = threading.Thread(target=self._sync_loop, name="openevent-chat-sync", daemon=True)
-                self._sync_thread.start()
-        except Exception as exc:
-            cause = exc if isinstance(exc, ChatSdkError) else _cause("initialization", exc)
-            raise ChannelInitializationError(cause, self._channel_id) from None
+            uuid = self._rpc("get_uuid", self._events.get_uuid)
+        except _RpcFailure as error:
+            raise UuidAllocationError(error.failure) from None
+        try:
+            validate_uint64(uuid, "uuid")
+        except ChatProtocolError:
+            failure = make_failure("get_uuid", category="contract",
+                                   detail="get_uuid returned an invalid UUID")
+            self._fail(failure)
+            raise UuidAllocationError(failure) from None
+
+        uncertain = False
+
+        def observe_error(code):
+            nonlocal uncertain
+            # A later definitive rejection cannot settle an earlier timeout.
+            if code not in _NOT_COMMITTED:
+                uncertain = True
+
+        try:
+            response = self._rpc("PublishAutoSeq", lambda: self._events.publish_auto_seq(
+                principal=self._principal, token=self._token, channel_id=self._channel_id,
+                payload=payload, uuid=uuid, recipients=recipients, object_keys=object_keys),
+                on_error=observe_error)
+        except _RpcFailure as error:
+            if error.failure.grpc_code == grpc.StatusCode.ALREADY_EXISTS and error.attempts > 1:
+                try:
+                    seq = self._rpc("GetSeqByUuid", lambda: self._events.get_seq_by_uuid(uuid))
+                except _RpcFailure as lookup_error:
+                    raise PublishFailedError(lookup_error.failure, uuid, uncertain=True) from None
+                return self._committed_seq(seq, "GetSeqByUuid", uuid)
+            raise PublishFailedError(error.failure, uuid, uncertain=uncertain) from None
+        return self._committed_seq(getattr(response, "seq", None), "PublishAutoSeq", uuid)
+
+    def _committed_seq(self, seq, stage, uuid):
+        try:
+            return validate_uint64(seq, "seq")
+        except ChatProtocolError:
+            failure = make_failure(stage, category="contract", detail=f"{stage} returned an invalid committed seq")
+            self._fail(failure)
+            raise PublishFailedError(failure, uuid, uncertain=True) from None
+
+    def single_turn(self, *, turn_id, content=(), reply_to_seqs=(), recipients=(),
+                    object_keys=(), extensions=None):
+        with self._operation():
+            frozen = _freeze({"kind": "turn.single", "turn_id": validate_turn_id(turn_id),
+                              "content": make_content(content),
+                              "reply_to_seqs": list(_items(reply_to_seqs, "reply_to_seqs"))},
+                             recipients, object_keys, extensions)
+            return self._publish(frozen)
+
+    def start_turn(self, *, turn_id, content, reply_to_seqs=(), recipients=(),
+                   object_keys=(), extensions=None):
+        with self._operation():
+            frozen = _freeze({"kind": "turn.start", "turn_id": validate_turn_id(turn_id),
+                              "content": make_content(content),
+                              "reply_to_seqs": list(_items(reply_to_seqs, "reply_to_seqs"))},
+                             recipients, object_keys, extensions)
+            seq = self._publish(frozen)
+            return TurnWriter(self, turn_id, seq, seq)
+
+    def cancel_turn(self, *, target_turn, recipients=(), extensions=None):
+        with self._operation():
+            if not isinstance(target_turn, TurnRef):
+                raise ChatProtocolError("target_turn must be TurnRef")
+            frozen = _freeze({"kind": "turn.cancel", "target_turn": {
+                "principal": target_turn.principal, "turn_id": target_turn.turn_id}},
+                recipients, (), extensions)
+            return self._publish(frozen)
+
+    def reserve_submissions(self, reserved_through, *, recipients=(), extensions=None):
+        with self._operation():
+            frozen = _freeze({"kind": "submission.reserve", "reserved_through": reserved_through},
+                             recipients, (), extensions)
+            return self._publish(frozen)
+
+    def fetch_page(self, from_seq, limit=100):
+        with self._operation():
+            self._validate_fetch(from_seq, limit)
+            return self._fetch_page(from_seq, limit, recovery=False)
 
     @staticmethod
-    def _validate_fetch_response(response: Any, from_seq: int, previous_last_seq: int = 0) -> tuple[int, tuple[Any, ...]]:
-        try:
-            last_seq = require_uint64(response.last_seq, "FetchResponse.last_seq")
-            next_seq = require_uint64(response.next_seq, "FetchResponse.next_seq")
-            messages = tuple(response.messages)
-        except (AttributeError, TypeError) as exc:
-            raise OpenEventContractError("Fetch response is malformed") from exc
-        if messages:
-            max_message = max(int(m.seq) for m in messages)
-            if last_seq < max_message:
-                raise OpenEventContractError("Fetch last_seq is below a returned message")
-        if last_seq < previous_last_seq:
-            raise OpenEventContractError("Fetch last_seq moved backwards")
-        if next_seq > last_seq + 1:
-            raise OpenEventContractError("Fetch next_seq is beyond last_seq + 1")
-        if from_seq > last_seq:
-            if messages or next_seq != last_seq + 1:
-                raise OpenEventContractError("Fetch tail cursor is inconsistent with last_seq")
-            # OpenEvent returns max_seq + 1 for a future from_seq. Keep the
-            # caller's future cursor so polling does not move backwards.
-            return max(from_seq, next_seq), messages
-        if next_seq <= last_seq and next_seq <= from_seq:
-            raise OpenEventContractError("Fetch cursor did not advance")
-        previous = from_seq - 1
-        for message in messages:
-            seq = require_uint64(message.seq, "EventMessage.seq", nonzero=True)
-            if seq <= previous or seq < from_seq or seq >= next_seq or seq > last_seq:
-                raise OpenEventContractError("Fetch messages are not strictly ordered")
-            previous = seq
-        return next_seq, messages
+    def _validate_fetch(from_seq, limit):
+        validate_uint64(from_seq, "from_seq", positive=False)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ChatProtocolError("limit must be an integer in 1..1000")
 
-    def _sync_loop(self) -> None:
-        delay = _INITIAL_POLL_SECONDS
-        while True:
-            with self._condition:
-                if self._lifecycle != _Lifecycle.READY:
-                    return
-                cursor = self._next_fetch_seq
+    def _fetch_page(self, from_seq, limit, *, recovery):
+        error_type = SyncReadError if recovery else FetchPageError
+        try:
+            response = self._rpc("Fetch", lambda: self._events.fetch(
+                principal=self._principal, token=self._token, from_seq=from_seq, limit=limit,
+                channels=(self._channel_id,), only_my_recipient=False))
+        except _RpcFailure as error:
+            if recovery or error.failure.category in {"protocol", "contract"}:
+                self._fail(error.failure)
+            raise error_type(error.failure) from None
+        try:
+            last_seq = validate_uint64(response.last_seq, "last_seq", positive=False)
+            next_seq = validate_uint64(response.next_seq, "next_seq", positive=False)
+            raw_messages = tuple(response.messages)
+            if len(raw_messages) > limit:
+                raise ValueError("Fetch returned more messages than requested")
+            if from_seq > last_seq:
+                if raw_messages or next_seq != last_seq + 1:
+                    raise ValueError("Fetch returned an invalid page beyond the tail")
+            elif not from_seq <= next_seq <= last_seq + 1:
+                raise ValueError("Fetch returned next_seq outside this page's scan range")
+            previous = from_seq - 1
+            for raw in raw_messages:
+                seq = validate_uint64(raw.seq, "seq")
+                if not previous < seq < next_seq or seq > last_seq:
+                    raise ValueError("Fetch returned messages outside ascending scan order")
+                if raw.channel_id != self._channel_id:
+                    raise ValueError("Fetch returned a message from another Channel")
+                previous = seq
+        except (AttributeError, TypeError, ChatProtocolError, ValueError) as exc:
+            # Only locally generated explanations are copied, never RPC bodies.
+            detail = str(exc) if type(exc) is ValueError else "Fetch returned invalid envelope or cursor fields"
+            failure = make_failure("Fetch", category="contract", detail=detail)
+            self._fail(failure)
+            raise error_type(failure) from None
+        messages = []
+        for raw in raw_messages:
             try:
-                response = self._retry_rpc(lambda: self._openevent.fetch(principal=self._principal, token=self._token, from_seq=cursor, limit=_FETCH_LIMIT, only_my_recipient=False, channels=(self._channel_id,)), "Fetch")
-                next_seq, messages = self._validate_fetch_response(response, cursor, self._last_fetch_last_seq)
-                self._last_fetch_last_seq = max(self._last_fetch_last_seq, int(response.last_seq))
-                with self._condition:
-                    for raw in messages:
-                        parsed = parse_message(raw)
-                        if parsed.channel_id != self._channel_id:
-                            raise OpenEventContractError("Fetch returned a message outside the bound Channel")
-                        self._state.apply(parsed)
-                    self._next_fetch_seq = next_seq
-                    self._processed_through_seq = next_seq - 1
-                    self._condition.notify_all()
-                if next_seq > int(response.last_seq):
+                messages.append(parse_message(raw))
+            except ChatProtocolError:
+                failure = make_failure("Fetch", category="protocol",
+                                       detail=f"Fetch returned invalid chat.v1 data at seq {raw.seq}")
+                self._fail(failure)
+                raise error_type(failure) from None
+        return FetchPage(tuple(messages), next_seq, last_seq)
+
+    def resume_turn(self, turn_id, *, state_start_seq=1):
+        with self._operation():
+            validate_turn_id(turn_id)
+            validate_uint64(state_start_seq, "state_start_seq")
+            try:
+                status = self._rpc("GetStatus", lambda: self._events.get_status(
+                    principal=self._principal, token=self._token))
+            except _RpcFailure as error:
+                self._fail(error.failure)
+                raise SyncReadError(error.failure) from None
+            try:
+                watermark = validate_uint64(status.max_seq, "max_seq", positive=False)
+                if validate_uint64(status.min_seq, "min_seq", positive=False) != 0:
+                    raise ChatProtocolError("invalid minimum seq")
+            except (AttributeError, ChatProtocolError):
+                failure = make_failure("GetStatus", category="contract",
+                                       detail="GetStatus returned an invalid message range")
+                self._fail(failure)
+                raise SyncReadError(failure) from None
+            cursor = state_start_seq
+            creation_seq = None
+            last_seq = None
+            terminal = False
+            while cursor <= watermark:
+                page = self._fetch_page(cursor, 100, recovery=True)
+                for message in page.messages:
+                    if message.seq > watermark:
+                        break
+                    payload = message.payload
+                    kind = payload["kind"]
+                    if kind == "submission.reserve" or terminal:
+                        continue
+                    if kind == "turn.cancel":
+                        target = payload["target_turn"]
+                        if (creation_seq is not None and target["principal"] == self._principal
+                                and target["turn_id"] == turn_id):
+                            terminal = True
+                        continue
+                    if message.principal != self._principal or payload["turn_id"] != turn_id:
+                        continue
+                    if kind in {"turn.start", "turn.single"}:
+                        creation_seq = message.seq
+                        last_seq = message.seq
+                        terminal = kind == "turn.single"
+                    elif creation_seq is not None:
+                        if kind == "turn.append":
+                            last_seq = message.seq
+                        elif kind == "turn.end":
+                            terminal = True
+                if page.next_seq == cursor:
                     with self._condition:
-                        if self._lifecycle != _Lifecycle.READY:
-                            return
-                        target_pending = self._processed_through_seq < self._sync_target_seq
-                        self._condition.wait(timeout=_INITIAL_POLL_SECONDS if target_pending else delay)
-                    delay = _INITIAL_POLL_SECONDS if target_pending else min(delay * 2, _MAX_POLL_SECONDS)
-                else:
-                    delay = _INITIAL_POLL_SECONDS
-            except (ClientClosedError, ClientFailedError):
-                return
-            except Exception as exc:
-                self._transition_failed(exc if isinstance(exc, ChatSdkError) else _cause("Fetch", exc))
-                return
+                        self._condition.wait_for(lambda: self._state != "READY", _RETRY_SECONDS)
+                cursor = page.next_seq
+            if creation_seq is None:
+                raise TurnNotFoundError("Target turn does not exist in the recovery range")
+            if terminal:
+                raise TurnWriterStateError("Target turn has already ended")
+            return TurnWriter(self, turn_id, creation_seq, last_seq)
 
-    def _ensure_ready_locked(self) -> None:
-        if self._lifecycle == _Lifecycle.FAILED:
-            raise ClientFailedError(self._failure or FailureCause("client", detail="unknown failure"))
-        if self._lifecycle in {_Lifecycle.CLOSING, _Lifecycle.CLOSED}:
-            raise ClientClosedError()
-        if self._lifecycle != _Lifecycle.READY:
-            raise ClientClosedError()
 
-    def _transition_failed(self, cause: FailureCause | ChatSdkError) -> None:
-        with self._condition:
-            if self._lifecycle != _Lifecycle.READY:
-                return
-            self._failure = cause
-            self._lifecycle = _Lifecycle.FAILED
-            subscription = self._subscription
-            self._condition.notify_all()
-        if subscription is not None:
-            with subscription._condition:
-                subscription._condition.notify_all()
-        try:
-            self._on_failure(cause if isinstance(cause, ChatSdkError) else ClientFailedError(cause))
-        except Exception:
-            pass
+class TurnWriter:
+    """State for one streaming turn, held only by its caller."""
 
-    def _begin_call(self) -> None:
-        with self._condition:
-            self._ensure_ready_locked()
-            self._active_calls += 1
+    def __init__(self, client, turn_id, creation_seq, last_seq):
+        self._client = client
+        self._turn_id = turn_id
+        self._creation_seq = creation_seq
+        self._last_seq = last_seq
+        self._state = "open"
+        self._lock = threading.Lock()
 
-    def _end_call(self) -> None:
-        with self._condition:
-            self._active_calls -= 1
-            self._condition.notify_all()
+    @property
+    def turn_id(self):
+        return self._turn_id
 
-    def _sync_before_publish(self) -> None:
-        try:
-            status = self._retry_rpc(lambda: self._openevent.get_status(principal=self._principal, token=self._token), "GetStatus")
-        except (ClientClosedError, ClientFailedError) as exc:
-            raise SyncReadError(exc) from None
-        except Exception as exc:
-            raise SyncReadError(_cause("GetStatus", exc)) from None
-        try:
-            watermark = require_uint64(status.max_seq, "GetStatus.max_seq")
-        except Exception as exc:
-            error = OpenEventContractError("GetStatus.max_seq is invalid")
-            self._transition_failed(error)
-            raise SyncReadError(error) from None
-        with self._condition:
-            if watermark < self._last_status_max or watermark < self._last_published_seq:
-                error = OpenEventContractError("GetStatus.max_seq moved backwards")
-                callback = True
-            else:
-                self._last_status_max = watermark
-                self._sync_target_seq = max(self._sync_target_seq, watermark)
-                self._condition.notify_all()
-                callback = False
-        if callback:
-            self._transition_failed(error)
-            raise SyncReadError(error) from None
-        with self._condition:
-            while self._processed_through_seq < watermark and self._lifecycle == _Lifecycle.READY:
-                self._condition.wait()
-            if self._processed_through_seq >= watermark:
-                return
-            if self._lifecycle == _Lifecycle.FAILED:
-                raise SyncReadError(ClientFailedError(self._failure or FailureCause("client", detail="unknown failure")))
-            raise ClientClosedError()
+    @property
+    def creation_seq(self):
+        return self._creation_seq
 
-    def _publish(self, ref: TurnRef, payload_builder: Callable[[], bytes], recipients: Iterable[int], object_keys: Iterable[ObjectKey]) -> int:
-        recipients = _tuple_uint64(recipients, "recipient")
-        keys = _tuple_object_keys(object_keys)
-        self._begin_call()
-        try:
-            with self._condition:
-                if ref in self._busy:
-                    raise TurnBusyError(ref)
-                self._busy.add(ref)
+    def append(self, *, content, recipients=(), object_keys=(), extensions=None):
+        return self._write("turn.append", content, recipients, object_keys, extensions)
+
+    def complete(self, *, recipients=(), extensions=None):
+        return self._write("turn.end", None, recipients, (), extensions)
+
+    def _write(self, kind, content, recipients, object_keys, extensions):
+        with self._lock, self._client._operation():
+            if self._state != "open":
+                raise TurnWriterStateError(f"Writing object is {self._state}")
+            payload = {"kind": kind, "turn_id": self._turn_id, "pre_seq": self._last_seq}
+            if kind == "turn.append":
+                payload["content"] = make_content(content)
+            frozen = _freeze(payload, recipients, object_keys, extensions)
             try:
-                self._sync_before_publish()
-                with self._condition:
-                    self._ensure_ready_locked()
-                    payload = payload_builder()
-                try:
-                    uuid = self._retry_rpc(lambda: self._openevent.get_uuid(), "get_uuid")
-                    uuid = require_uint64(uuid, "uuid", nonzero=True)
-                except (ClientClosedError, ClientFailedError):
-                    raise
-                except Exception as exc:
-                    raise UuidAllocationError(_cause("get_uuid", exc)) from None
-                try:
-                    response = self._retry_rpc(lambda: self._openevent.publish_auto_seq(principal=self._principal, token=self._token, channel_id=self._channel_id, payload=payload, uuid=uuid, recipients=recipients, object_keys=_protobuf_keys(keys)), "PublishAutoSeq")
-                except (ClientClosedError, ClientFailedError):
-                    raise
-                except Exception as exc:
-                    raise PublishFailedError(_grpc_code(exc)) from None
-                try:
-                    seq = require_uint64(response.seq, "PublishAutoSeqResponse.seq", nonzero=True)
-                except Exception as exc:
-                    error = OpenEventContractError("PublishAutoSeq returned an invalid seq")
-                    self._transition_failed(error)
-                    raise error from exc
-                with self._condition:
-                    self._last_published_seq = max(self._last_published_seq, seq)
-                return seq
-            finally:
-                with self._condition:
-                    self._busy.discard(ref)
-                    self._condition.notify_all()
-        finally:
-            self._end_call()
-
-    def single_turn(self, *, turn_id: str, reply_to_turns: Iterable[TurnRef], content: Iterable[TextPart], recipients: Iterable[int] = (), object_keys: Iterable[ObjectKey] = (), extensions: dict[str, Any] | None = None) -> int:
-        ref = TurnRef(self._principal, require_turn_id(turn_id))
-        replies = tuple(reply_to_turns)
-        parts = tuple(content)
-        extensions = _freeze_extensions(extensions)
-        if any(not isinstance(r, TurnRef) for r in replies) or len(set(replies)) != len(replies):
-            raise ChatProtocolError("reply_to_turns must contain unique TurnRef values")
-        if any(not isinstance(p, TextPart) for p in parts):
-            raise ChatProtocolError("content must contain TextPart values")
-        return self._publish(ref, lambda: self._build_create(ref, replies, parts, extensions, single=True), recipients, object_keys)
-
-    def start_turn(self, *, turn_id: str, reply_to_turns: Iterable[TurnRef], content: Iterable[TextPart], recipients: Iterable[int] = (), object_keys: Iterable[ObjectKey] = (), extensions: dict[str, Any] | None = None) -> int:
-        ref = TurnRef(self._principal, require_turn_id(turn_id))
-        replies = tuple(reply_to_turns)
-        parts = tuple(content)
-        extensions = _freeze_extensions(extensions)
-        if any(not isinstance(r, TurnRef) for r in replies) or len(set(replies)) != len(replies):
-            raise ChatProtocolError("reply_to_turns must contain unique TurnRef values")
-        if not parts or any(not isinstance(p, TextPart) for p in parts):
-            raise ChatProtocolError("content must contain one or more TextPart values")
-        return self._publish(ref, lambda: self._build_create(ref, replies, parts, extensions, single=False), recipients, object_keys)
-
-    def _build_create(self, ref: TurnRef, replies: tuple[TurnRef, ...], parts: tuple[TextPart, ...], extensions: dict[str, Any] | None, *, single: bool) -> bytes:
-        self._state.require_new_turn(ref)
-        self._state.validate_replies(ref, replies)
-        return encode_single(ref, replies, parts, extensions) if single else encode_start(ref, replies, parts, extensions)
-
-    def append_turn(self, *, turn_id: str, content: Iterable[TextPart], recipients: Iterable[int] = (), extensions: dict[str, Any] | None = None) -> int:
-        ref = TurnRef(self._principal, require_turn_id(turn_id))
-        parts = tuple(content)
-        extensions = _freeze_extensions(extensions)
-        if not parts or any(not isinstance(p, TextPart) for p in parts):
-            raise ChatProtocolError("content must contain one or more TextPart values")
-        return self._publish(ref, lambda: self._build_append(ref, parts, extensions), recipients, ())
-
-    def _build_append(self, ref: TurnRef, parts: tuple[TextPart, ...], extensions: dict[str, Any] | None) -> bytes:
-        state = self._state.require_turn(ref)
-        if state.creation_kind != KIND_TURN_START:
-            raise ConversationStateError("turn.append requires a turn.start turn")
-        return encode_append(ref.turn_id, state.tail_seq, parts, extensions)
-
-    def complete_turn(self, *, turn_id: str, recipients: Iterable[int] = (), extensions: dict[str, Any] | None = None) -> int:
-        ref = TurnRef(self._principal, require_turn_id(turn_id))
-        extensions = _freeze_extensions(extensions)
-        return self._publish(ref, lambda: self._build_end(ref, extensions), recipients, ())
-
-    def _build_end(self, ref: TurnRef, extensions: dict[str, Any] | None) -> bytes:
-        state = self._state.require_turn(ref)
-        if state.creation_kind != KIND_TURN_START:
-            raise ConversationStateError("turn.end requires a turn.start turn")
-        return encode_end(ref.turn_id, state.tail_seq, extensions)
-
-    def cancel_turn(self, *, target_turn: TurnRef, recipients: Iterable[int] = (), extensions: dict[str, Any] | None = None) -> int:
-        if not isinstance(target_turn, TurnRef):
-            raise ChatProtocolError("target_turn must be a TurnRef")
-        extensions = _freeze_extensions(extensions)
-        return self._publish(target_turn, lambda: self._build_cancel(target_turn, extensions), recipients, ())
-
-    def _build_cancel(self, target: TurnRef, extensions: dict[str, Any] | None) -> bytes:
-        self._state.require_turn(target)
-        return encode_cancel(target, extensions)
-
-    def register_subscription_callback(self, on_message: Callable[[ParsedMessage], None], *, from_seq: int = 0, on_error: Callable[[SubscriptionError], None] | None = None) -> SubscriptionHandle:
-        if not callable(on_message):
-            raise ChatProtocolError("on_message must be callable")
-        require_uint64(from_seq, "from_seq")
-        if on_error is not None and not callable(on_error):
-            raise ChatProtocolError("on_error must be callable")
-        with self._condition:
-            self._ensure_ready_locked()
-            if self._subscription is not None:
-                raise SubscriptionAlreadyRegisteredError("a subscription is already registered")
-            handle = SubscriptionHandle(self, on_message, from_seq, on_error)
-            self._subscription = handle
-            handle._thread.start()
-            return handle
-
-    def _subscription_stopped(self, handle: SubscriptionHandle) -> None:
-        with self._condition:
-            if self._subscription is handle and handle._closed:
-                self._subscription = None
-            self._condition.notify_all()
-
-    def close(self) -> None:
-        current = threading.current_thread()
-        with self._condition:
-            if self._lifecycle == _Lifecycle.CLOSED:
-                return
-            if self._lifecycle != _Lifecycle.FAILED:
-                self._lifecycle = _Lifecycle.CLOSING
-            self._condition.notify_all()
-            while self._active_calls or self._active_rpcs:
-                self._condition.wait()
-            sync_thread = self._sync_thread
-            subscription = self._subscription
-        if subscription is not None:
-            subscription.close()
-        if sync_thread is not None and sync_thread is not current:
-            sync_thread.join()
-        with self._condition:
-            self._lifecycle = _Lifecycle.CLOSED
-            self._condition.notify_all()
+                seq = self._client._publish(frozen)
+            except PublishFailedError as error:
+                if error.uncertain:
+                    self._state = "unresolved"
+                raise
+            self._last_seq = seq
+            if kind == "turn.end":
+                self._state = "completed"
+            return seq
 
 
-def create_client(openevent_client: Any, *, principal: int, token: str, channel_id: int, max_retries: int = 3, on_failure: Callable[[ChatSdkError], None]) -> ChatProtocolClient:
-    return ChatProtocolClient(openevent_client, principal=principal, token=token, channel_id=channel_id, max_retries=max_retries, on_failure=on_failure)
+def create_client(events, *, principal, token, channel_id, max_retries=3,
+                  channel_validator=None):
+    return ChatProtocolClient(events, principal=principal, token=token,
+                              channel_id=channel_id, max_retries=max_retries,
+                              channel_validator=channel_validator)

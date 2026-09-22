@@ -1,236 +1,172 @@
-from __future__ import annotations
-
+"""Strict, single-event chat.v1 encoding and parsing; no history state."""
 import json
 import math
-from typing import Any, Iterable
 
-from .errors import ChatProtocolError, InvalidKindError, MalformedPayloadError
-from .model import (
-    KIND_TURN_APPEND,
-    KIND_TURN_CANCEL,
-    KIND_TURN_END,
-    KIND_TURN_SINGLE,
-    KIND_TURN_START,
-    ChatEvent,
-    ObjectKey,
-    ParsedMessage,
-    TextPart,
-    TurnAppend,
-    TurnCancel,
-    TurnEnd,
-    TurnRef,
-    TurnSingle,
-    TurnStart,
-    require_turn_id,
-    require_uint64,
-)
+from .errors import ChatProtocolError
+from .model import ObjectKey, ParsedMessage, TextPart
+
+UINT64_MAX = (1 << 64) - 1
 
 
-class _StrictJsonError(ValueError):
-    pass
+def validate_uint64(value, field, positive=True):
+    if type(value) is not int or not (int(positive) <= value <= UINT64_MAX):
+        raise ChatProtocolError(f"{field} must be {'positive ' if positive else ''}uint64")
+    return value
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
+def _string(value, field, *, nonempty=False, max_bytes=None):
+    if not isinstance(value, str) or (nonempty and not value):
+        raise ChatProtocolError(f"{field} must be {'nonempty ' if nonempty else ''}string")
+    try:
+        size = len(value.encode('utf-8'))
+    except UnicodeError:
+        raise ChatProtocolError(f"{field} must be valid UTF-8") from None
+    if max_bytes is not None and size > max_bytes:
+        raise ChatProtocolError(f"{field} exceeds UTF-8 byte limit")
+    return value
+
+
+def validate_turn_id(value):
+    return _string(value, 'turn_id', nonempty=True, max_bytes=128)
+
+
+def _fields(value, required, field):
+    if not isinstance(value, dict) or set(value) != set(required):
+        raise ChatProtocolError(f"{field} has missing or unknown fields")
+
+
+def _json_value(value):
+    if value is None or type(value) in (bool, int):
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    if isinstance(value, str):
+        _string(value, 'extensions string')
+        return
+    if isinstance(value, list):
+        for item in value:
+            _json_value(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _string(key, 'extensions key')
+            _json_value(item)
+        return
+    raise ChatProtocolError('extensions must contain JSON values')
+
+
+def validate_payload(payload):
+    if not isinstance(payload, dict):
+        raise ChatProtocolError('payload must be JSON object')
+    kind = payload.get('kind')
+    fields = {
+        'turn.single': {'kind', 'turn_id', 'reply_to_seqs', 'content'},
+        'turn.start': {'kind', 'turn_id', 'reply_to_seqs', 'content'},
+        'turn.append': {'kind', 'turn_id', 'pre_seq', 'content'},
+        'turn.end': {'kind', 'turn_id', 'pre_seq'},
+        'turn.cancel': {'kind', 'target_turn'},
+        'submission.reserve': {'kind', 'reserved_through'},
+    }
+    if not isinstance(kind, str) or kind not in fields:
+        raise ChatProtocolError('kind is not supported')
+    required = fields[kind]
+    if not required <= payload.keys() or payload.keys() - required - {'extensions'}:
+        raise ChatProtocolError('payload has missing or unknown fields')
+    if 'turn_id' in payload:
+        validate_turn_id(payload['turn_id'])
+    if 'pre_seq' in payload:
+        validate_uint64(payload['pre_seq'], 'pre_seq')
+    if 'reserved_through' in payload:
+        validate_uint64(payload['reserved_through'], 'reserved_through')
+    if 'target_turn' in payload:
+        target = payload['target_turn']
+        _fields(target, {'principal', 'turn_id'}, 'target_turn')
+        validate_uint64(target['principal'], 'target_turn.principal', positive=False)
+        validate_turn_id(target['turn_id'])
+    if 'reply_to_seqs' in payload:
+        replies = payload['reply_to_seqs']
+        if not isinstance(replies, list):
+            raise ChatProtocolError('reply_to_seqs must be array')
+        for seq in replies:
+            validate_uint64(seq, 'reply_to_seqs item')
+        if len(set(replies)) != len(replies):
+            raise ChatProtocolError('reply_to_seqs contains duplicates')
+    if 'content' in payload:
+        content = payload['content']
+        if not isinstance(content, list) or (kind != 'turn.single' and not content):
+            raise ChatProtocolError('content must be array, nonempty for streaming events')
+        for part in content:
+            _fields(part, {'type', 'text'}, 'content part')
+            if part['type'] != 'text':
+                raise ChatProtocolError('content part type must be text')
+            _string(part['text'], 'content text', nonempty=True)
+    if 'extensions' in payload:
+        if not isinstance(payload['extensions'], dict):
+            raise ChatProtocolError('extensions must be object')
+        try:
+            _json_value(payload['extensions'])
+        except RecursionError:
+            raise ChatProtocolError('extensions contains a cycle or excessive nesting') from None
+    return payload
+
+
+def make_content(parts):
+    try:
+        result = []
+        for part in parts:
+            if not isinstance(part, TextPart):
+                raise ChatProtocolError('content entries must be TextPart')
+            result.append({'type': 'text', 'text': part.text})
+        return result
+    except TypeError:
+        raise ChatProtocolError('content must be iterable') from None
+
+
+def encode_payload(payload):
+    validate_payload(payload)
+    try:
+        return json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                          separators=(',', ':')).encode('utf-8')
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise ChatProtocolError('payload cannot be encoded as UTF-8 JSON') from None
+
+
+def _unique_object(pairs):
+    result = {}
     for key, value in pairs:
         if key in result:
-            raise _StrictJsonError(f"duplicate JSON member: {key}")
+            raise ChatProtocolError('JSON object contains duplicate fields')
         result[key] = value
     return result
 
 
-def _reject_constant(value: str) -> None:
-    raise _StrictJsonError(f"non-finite JSON number: {value}")
+def _invalid_constant(value):
+    raise ChatProtocolError('JSON contains non-finite number')
 
 
-def _validate_json_tree(value: Any) -> None:
-    stack = [value]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            try:
-                item.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise ChatProtocolError("JSON strings must contain valid Unicode scalar values") from exc
-        elif isinstance(item, dict):
-            for key, child in item.items():
-                if not isinstance(key, str):
-                    raise ChatProtocolError("JSON object keys must be strings")
-                stack.extend((key, child))
-        elif isinstance(item, (list, tuple)):
-            stack.extend(item)
-        elif isinstance(item, float) and not math.isfinite(item):
-            raise ChatProtocolError("JSON numbers must be finite")
-        elif item is not None and not isinstance(item, (bool, int, float)):
-            raise ChatProtocolError("value is not JSON encodable")
-
-
-def _extensions(data: dict[str, Any]) -> dict[str, Any] | None:
-    if "extensions" not in data:
-        return None
-    value = data["extensions"]
-    if not isinstance(value, dict):
-        raise ChatProtocolError("extensions must be a JSON object")
-    return value
-
-
-def _exact_fields(data: dict[str, Any], required: set[str]) -> None:
-    allowed = required | {"extensions"}
-    if set(data) != required and set(data) != allowed:
-        missing = sorted(required - set(data))
-        extra = sorted(set(data) - allowed)
-        detail = []
-        if missing:
-            detail.append(f"missing fields {missing}")
-        if extra:
-            detail.append(f"unknown fields {extra}")
-        raise ChatProtocolError("; ".join(detail) or "invalid field set")
-
-
-def _turn_ref(value: Any, name: str = "TurnRef") -> TurnRef:
-    if not isinstance(value, dict) or set(value) != {"principal", "turn_id"}:
-        raise ChatProtocolError(f"{name} must contain exactly principal and turn_id")
-    return TurnRef(require_uint64(value["principal"], f"{name}.principal"), require_turn_id(value["turn_id"]))
-
-
-def _replies(value: Any) -> tuple[TurnRef, ...]:
-    if not isinstance(value, list):
-        raise ChatProtocolError("reply_to_turns must be a JSON array")
-    result = tuple(_turn_ref(item, "reply_to_turns item") for item in value)
-    if len(set(result)) != len(result):
-        raise ChatProtocolError("reply_to_turns must not contain duplicates")
-    return result
-
-
-def _content(value: Any, *, required_nonempty: bool) -> tuple[TextPart, ...]:
-    if not isinstance(value, list):
-        raise ChatProtocolError("content must be a JSON array")
-    if required_nonempty and not value:
-        raise ChatProtocolError("content must be a non-empty JSON array")
-    parts: list[TextPart] = []
-    for item in value:
-        if not isinstance(item, dict) or set(item) != {"type", "text"}:
-            raise ChatProtocolError("each content part must contain exactly type and text")
-        if item["type"] != "text":
-            raise ChatProtocolError("content part type must be text")
-        parts.append(TextPart(item["text"]))
-    return tuple(parts)
-
-
-def parse_payload(payload: bytes) -> ChatEvent:
-    if not isinstance(payload, bytes):
-        raise MalformedPayloadError("payload must be bytes")
+def parse_message(event_message):
     try:
-        data = json.loads(
-            payload.decode("utf-8", errors="strict"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise MalformedPayloadError("payload is not strict UTF-8 JSON") from exc
-    if not isinstance(data, dict):
-        raise MalformedPayloadError("payload must be a JSON object")
-    _validate_json_tree(data)
-    kind = data.get("kind")
-    kinds = {KIND_TURN_SINGLE, KIND_TURN_START, KIND_TURN_APPEND, KIND_TURN_END, KIND_TURN_CANCEL}
-    if not isinstance(kind, str) or kind not in kinds:
-        raise InvalidKindError("payload kind is missing or unknown")
-
-    if kind == KIND_TURN_SINGLE:
-        _exact_fields(data, {"kind", "turn_id", "reply_to_turns", "content"})
-        return TurnSingle(require_turn_id(data["turn_id"]), _replies(data["reply_to_turns"]), _content(data["content"], required_nonempty=False), _extensions(data))
-    if kind == KIND_TURN_START:
-        _exact_fields(data, {"kind", "turn_id", "reply_to_turns", "content"})
-        return TurnStart(require_turn_id(data["turn_id"]), _replies(data["reply_to_turns"]), _content(data["content"], required_nonempty=True), _extensions(data))
-    if kind == KIND_TURN_APPEND:
-        _exact_fields(data, {"kind", "turn_id", "pre_seq", "content"})
-        return TurnAppend(require_turn_id(data["turn_id"]), require_uint64(data["pre_seq"], "pre_seq", nonzero=True), _content(data["content"], required_nonempty=True), _extensions(data))
-    if kind == KIND_TURN_END:
-        _exact_fields(data, {"kind", "turn_id", "pre_seq", "status"})
-        if data["status"] != "completed":
-            raise ChatProtocolError("turn.end status must be completed")
-        return TurnEnd(require_turn_id(data["turn_id"]), require_uint64(data["pre_seq"], "pre_seq", nonzero=True), _extensions(data))
-    _exact_fields(data, {"kind", "target_turn"})
-    return TurnCancel(_turn_ref(data["target_turn"], "target_turn"), _extensions(data))
-
-
-def encode_payload(data: dict[str, Any]) -> bytes:
-    _validate_json_tree(data)
-    try:
-        return json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
-        raise ChatProtocolError("payload cannot be encoded as strict UTF-8 JSON") from exc
-
-
-def _part_dict(part: TextPart) -> dict[str, str]:
-    if not isinstance(part, TextPart):
-        raise ChatProtocolError("content items must be TextPart values")
-    return {"type": "text", "text": part.text}
-
-
-def _ref_dict(ref: TurnRef) -> dict[str, Any]:
-    if not isinstance(ref, TurnRef):
-        raise ChatProtocolError("turn references must be TurnRef values")
-    return {"principal": ref.principal, "turn_id": ref.turn_id}
-
-
-def _with_extensions(data: dict[str, Any], extensions: dict[str, Any] | None) -> dict[str, Any]:
-    if extensions is not None:
-        if not isinstance(extensions, dict):
-            raise ChatProtocolError("extensions must be a JSON object")
-        data["extensions"] = extensions
-    return data
-
-
-def encode_single(turn_ref: TurnRef, replies: Iterable[TurnRef], content: Iterable[TextPart], extensions: dict[str, Any] | None) -> bytes:
-    replies = tuple(replies)
-    if len(set(replies)) != len(replies) or turn_ref in replies:
-        raise ChatProtocolError("reply_to_turns must be unique and cannot contain the created turn")
-    parts = tuple(content)
-    return encode_payload(_with_extensions({"kind": KIND_TURN_SINGLE, "turn_id": require_turn_id(turn_ref.turn_id), "reply_to_turns": [_ref_dict(r) for r in replies], "content": [_part_dict(p) for p in parts]}, extensions))
-
-
-def encode_start(turn_ref: TurnRef, replies: Iterable[TurnRef], content: Iterable[TextPart], extensions: dict[str, Any] | None) -> bytes:
-    replies = tuple(replies)
-    if len(set(replies)) != len(replies) or turn_ref in replies:
-        raise ChatProtocolError("reply_to_turns must be unique and cannot contain the created turn")
-    parts = tuple(content)
-    if not parts:
-        raise ChatProtocolError("content must not be empty")
-    return encode_payload(_with_extensions({"kind": KIND_TURN_START, "turn_id": turn_ref.turn_id, "reply_to_turns": [_ref_dict(r) for r in replies], "content": [_part_dict(p) for p in parts]}, extensions))
-
-
-def encode_append(turn_id: str, pre_seq: int, content: Iterable[TextPart], extensions: dict[str, Any] | None) -> bytes:
-    parts = tuple(content)
-    if not parts:
-        raise ChatProtocolError("content must not be empty")
-    return encode_payload(_with_extensions({"kind": KIND_TURN_APPEND, "turn_id": require_turn_id(turn_id), "pre_seq": require_uint64(pre_seq, "pre_seq", nonzero=True), "content": [_part_dict(p) for p in parts]}, extensions))
-
-
-def encode_end(turn_id: str, pre_seq: int, extensions: dict[str, Any] | None) -> bytes:
-    return encode_payload(_with_extensions({"kind": KIND_TURN_END, "turn_id": require_turn_id(turn_id), "pre_seq": require_uint64(pre_seq, "pre_seq", nonzero=True), "status": "completed"}, extensions))
-
-
-def encode_cancel(target_turn: TurnRef, extensions: dict[str, Any] | None) -> bytes:
-    return encode_payload(_with_extensions({"kind": KIND_TURN_CANCEL, "target_turn": _ref_dict(target_turn)}, extensions))
-
-
-def parse_message(message: Any) -> ParsedMessage:
-    try:
-        seq = require_uint64(message.seq, "EventMessage.seq", nonzero=True)
-        ts_ms = require_uint64(message.ts_ms, "EventMessage.ts_ms")
-        channel_id = require_uint64(message.channel_id, "EventMessage.channel_id", nonzero=True)
-        principal = require_uint64(message.principal, "EventMessage.principal")
-        recipients = tuple(require_uint64(v, "EventMessage.recipient") for v in message.recipients)
-        raw_keys = tuple(message.object_keys)
-    except (AttributeError, TypeError) as exc:
-        raise ChatProtocolError("EventMessage envelope is malformed") from exc
-    if len(raw_keys) > 1024:
-        raise ChatProtocolError("EventMessage contains more than 1024 ObjectKeys")
-    try:
-        keys = tuple(ObjectKey(k.object_id, k.object_token) for k in raw_keys)
-        event = parse_payload(message.payload)
-    except AttributeError as exc:
-        raise ChatProtocolError("EventMessage ObjectKeys are malformed") from exc
-    ref = event.target_turn if isinstance(event, TurnCancel) else TurnRef(principal, event.turn_id)
-    return ParsedMessage(seq, ts_ms, channel_id, principal, recipients, keys, event, ref)
+        seq = validate_uint64(event_message.seq, 'seq')
+        channel = validate_uint64(event_message.channel_id, 'channel_id')
+        principal = validate_uint64(event_message.principal, 'principal', positive=False)
+        timestamp = validate_uint64(event_message.ts_ms, 'ts_ms', positive=False)
+        uuid = validate_uint64(event_message.uuid, 'uuid')
+        recipients = tuple(validate_uint64(p, 'recipient', positive=False)
+                           for p in event_message.recipients)
+        objects = tuple(ObjectKey(validate_uint64(k.object_id, 'object_id'),
+                                  _string(k.object_token, 'object_token', nonempty=True))
+                        for k in event_message.object_keys)
+        if len(objects) > 1024:
+            raise ChatProtocolError('object_keys exceeds 1024 entries')
+        if not isinstance(event_message.payload, bytes):
+            raise ChatProtocolError('payload must be UTF-8 bytes')
+        payload = json.loads(event_message.payload.decode('utf-8'),
+                             object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+        validate_payload(payload)
+        if payload['kind'] == 'submission.reserve' and objects:
+            raise ChatProtocolError('submission.reserve cannot contain object_keys')
+        return ParsedMessage(seq, channel, principal, timestamp, uuid, recipients, objects, payload)
+    except ChatProtocolError:
+        raise
+    except (ValueError, TypeError, AttributeError, UnicodeError, RecursionError):
+        raise ChatProtocolError('event must contain valid chat.v1 JSON and envelope fields') from None
