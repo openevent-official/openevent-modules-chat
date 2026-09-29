@@ -9,8 +9,8 @@ def check():
     try:
         installed = version('openevent-sdk')
         parts = re.match(r'^(\d+)\.(\d+)\.(\d+)', installed)
-        if not parts or tuple(map(int, parts.groups())) < (0, 8, 1):
-            raise RuntimeError('openevent-sdk>=0.8.1 is required')
+        if not parts or tuple(map(int, parts.groups())) < (0, 11, 1):
+            raise RuntimeError('openevent-sdk>=0.11.1 is required')
         from openevent.sdk import OpenEventClient
         from openevent.sdk.proto import openevent_pb2
         if 'timeout_ms' not in inspect.signature(OpenEventClient).parameters:
@@ -24,7 +24,7 @@ def check():
             raise RuntimeError('installed SDK protobuf does not support UUIDs')
         return installed
     except (PackageNotFoundError, ImportError) as exc:
-        raise RuntimeError('Install openevent-sdk>=0.8.1 in the current Python environment') from exc
+        raise RuntimeError('Install openevent-sdk>=0.11.1 in the current Python environment') from exc
 
 
 if __name__ == '__main__':

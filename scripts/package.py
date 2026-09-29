@@ -1,9 +1,11 @@
 """Small make helpers; never select an artifact left by a failed build."""
 from pathlib import Path
+from email.parser import BytesParser
 import os
 import shutil
 import subprocess
 import sys
+from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
@@ -34,7 +36,8 @@ def pip(*args):
 action = sys.argv[1]
 if action == 'build':
     remove(ROOT / 'dist')
-    remove(ROOT / 'build')
+    remove(ROOT / 'build/package')
+    remove(ROOT / 'build/wheel-test')
     for path in (ROOT / 'src').glob('*.egg-info'):
         remove(path)
     # Setuptools writes metadata beside its input sources. Build a local copy so
@@ -47,6 +50,12 @@ if action == 'build':
                     ignore=shutil.ignore_patterns('*.egg-info', '__pycache__', '*.pyc'))
     pip('wheel', '--no-deps', '--wheel-dir', str(ROOT / 'dist'), str(source))
     (ROOT / 'dist/.success').touch()
+elif action == 'dependencies':
+    with ZipFile(wheel()) as archive:
+        metadata_path, = [name for name in archive.namelist() if name.endswith('.dist-info/METADATA')]
+        requirements = BytesParser().parsebytes(archive.read(metadata_path)).get_all('Requires-Dist', [])
+    if requirements:
+        pip('install', '--no-compile', *requirements)
 elif action == 'install':
     args = sys.argv[2:]
     destinations = ('--target', '--prefix', '--root')

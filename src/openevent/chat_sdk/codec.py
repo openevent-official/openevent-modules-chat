@@ -55,7 +55,7 @@ def _json_value(value):
     raise ChatProtocolError('extensions must contain JSON values')
 
 
-def validate_payload(payload):
+def validate_payload(payload, *, object_keys=()):
     if not isinstance(payload, dict):
         raise ChatProtocolError('payload must be JSON object')
     kind = payload.get('kind')
@@ -63,6 +63,7 @@ def validate_payload(payload):
         'turn.single': {'kind', 'turn_id', 'reply_to_seqs', 'content'},
         'turn.start': {'kind', 'turn_id', 'reply_to_seqs', 'content'},
         'turn.append': {'kind', 'turn_id', 'pre_seq', 'content'},
+        'turn.reset': {'kind', 'turn_id', 'pre_seq', 'content'},
         'turn.end': {'kind', 'turn_id', 'pre_seq'},
         'turn.cancel': {'kind', 'target_turn'},
         'submission.reserve': {'kind', 'reserved_through'},
@@ -81,7 +82,7 @@ def validate_payload(payload):
     if 'target_turn' in payload:
         target = payload['target_turn']
         _fields(target, {'principal', 'turn_id'}, 'target_turn')
-        validate_uint64(target['principal'], 'target_turn.principal', positive=False)
+        validate_uint64(target['principal'], 'target_turn.principal')
         validate_turn_id(target['turn_id'])
     if 'reply_to_seqs' in payload:
         replies = payload['reply_to_seqs']
@@ -93,13 +94,17 @@ def validate_payload(payload):
             raise ChatProtocolError('reply_to_seqs contains duplicates')
     if 'content' in payload:
         content = payload['content']
-        if not isinstance(content, list) or (kind != 'turn.single' and not content):
-            raise ChatProtocolError('content must be array, nonempty for streaming events')
+        if not isinstance(content, list):
+            raise ChatProtocolError('content must be array')
+        if kind == 'turn.append' and not content and not object_keys:
+            raise ChatProtocolError('turn.append requires content or object_keys')
         for part in content:
             _fields(part, {'type', 'text'}, 'content part')
             if part['type'] != 'text':
                 raise ChatProtocolError('content part type must be text')
             _string(part['text'], 'content text', nonempty=True)
+    if kind == 'submission.reserve' and object_keys:
+        raise ChatProtocolError('submission.reserve cannot contain object_keys')
     if 'extensions' in payload:
         if not isinstance(payload['extensions'], dict):
             raise ChatProtocolError('extensions must be object')
@@ -122,8 +127,8 @@ def make_content(parts):
         raise ChatProtocolError('content must be iterable') from None
 
 
-def encode_payload(payload):
-    validate_payload(payload)
+def encode_payload(payload, *, object_keys=()):
+    validate_payload(payload, object_keys=object_keys)
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False,
                           separators=(',', ':')).encode('utf-8')
@@ -148,10 +153,10 @@ def parse_message(event_message):
     try:
         seq = validate_uint64(event_message.seq, 'seq')
         channel = validate_uint64(event_message.channel_id, 'channel_id')
-        principal = validate_uint64(event_message.principal, 'principal', positive=False)
+        principal = validate_uint64(event_message.principal, 'principal')
         timestamp = validate_uint64(event_message.ts_ms, 'ts_ms', positive=False)
         uuid = validate_uint64(event_message.uuid, 'uuid')
-        recipients = tuple(validate_uint64(p, 'recipient', positive=False)
+        recipients = tuple(validate_uint64(p, 'recipient')
                            for p in event_message.recipients)
         objects = tuple(ObjectKey(validate_uint64(k.object_id, 'object_id'),
                                   _string(k.object_token, 'object_token', nonempty=True))
@@ -162,9 +167,7 @@ def parse_message(event_message):
             raise ChatProtocolError('payload must be UTF-8 bytes')
         payload = json.loads(event_message.payload.decode('utf-8'),
                              object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
-        validate_payload(payload)
-        if payload['kind'] == 'submission.reserve' and objects:
-            raise ChatProtocolError('submission.reserve cannot contain object_keys')
+        validate_payload(payload, object_keys=objects)
         return ParsedMessage(seq, channel, principal, timestamp, uuid, recipients, objects, payload)
     except ChatProtocolError:
         raise

@@ -104,6 +104,69 @@ test('roles have independent turn ids and completed single turns stay completed'
   assert.equal(state.turns.get(turnKey('agent', 'same')).state, 'completed');
 });
 
+test('empty start, attachment-only append, reset and subsequent append preserve turn identity', () => {
+  const state = session();
+  apply(state, page([event(1, 'turn.start', {turn_id: 'a', content: [], reply_to_seqs: []})], 2));
+  const key = turnKey('agent', 'a');
+  assert.equal(state.turns.get(key).state, 'open');
+  apply(state, page([event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: []}, 'agent', [{object_id: '42'}])], 3));
+  assert.deepEqual(state.turns.get(key).attachments, [{object_id: '42', event_seq: '2'}]);
+  apply(state, page([
+    event(3, 'turn.reset', {turn_id: 'a', pre_seq: '2', content: [{type: 'text', text: '重新'}]}, 'agent', [{object_id: '43'}]),
+    event(4, 'turn.append', {turn_id: 'a', pre_seq: '3', content: [{type: 'text', text: '回答'}]}),
+  ], 5));
+  const turn = state.turns.get(key);
+  assert.equal(turn.creationSeq, '1'); assert.equal(turn.tailSeq, '4'); assert.equal(turn.contentVersion, 1);
+  assert.equal(turn.parts.map(part => part.text).join(''), '重新回答');
+  assert.deepEqual(turn.attachments, [{object_id: '43', event_seq: '3'}]);
+  assert.deepEqual(state.order, [key]); assert.equal(state.creationIndex.get('1'), key);
+  apply(state, page([event(5, 'turn.reset', {turn_id: 'a', pre_seq: '4', content: []})], 6));
+  assert.equal(state.turns.get(key).state, 'open'); assert.deepEqual(state.turns.get(key).parts, []);
+  assert.deepEqual(state.turns.get(key).attachments, []);
+  apply(state, page([event(6, 'turn.cancel', {target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
+    event(7, 'turn.reset', {turn_id: 'a', pre_seq: '5', content: [{type: 'text', text: '迟到'}]})], 8));
+  assert.equal(state.turns.get(key).state, 'cancelled'); assert.deepEqual(state.turns.get(key).parts, []);
+});
+
+test('reset replaces old lists without reading their contents and supports further changes in the page', () => {
+  const first = create(1); first.attachments = [{object_id: '40'}];
+  const state = apply(session(), page([first], 2));
+  const before = state.turns.get(turnKey('agent', 'a'));
+  const oldParts = before.parts; const oldAttachments = before.attachments;
+  const unreadable = {get() { throw new Error('reset must not read the old list'); }};
+  before.parts = new Proxy(oldParts, unreadable);
+  before.attachments = new Proxy(oldAttachments, unreadable);
+  apply(state, page([
+    event(2, 'turn.reset', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '替换'}]}, 'agent', [{object_id: '41'}]),
+    event(3, 'turn.append', {turn_id: 'a', pre_seq: '2', content: [{type: 'text', text: '追加'}]}, 'agent', [{object_id: '42'}]),
+    event(4, 'turn.reset', {turn_id: 'a', pre_seq: '3', content: [{type: 'text', text: '最后'}]}, 'agent', [{object_id: '43'}]),
+    event(5, 'turn.append', {turn_id: 'a', pre_seq: '4', content: [{type: 'text', text: '内容'}]}, 'agent', [{object_id: '44'}]),
+  ], 6));
+  const turn = state.turns.get(before.key);
+  assert.equal(turn.parts.map(part => part.text).join(''), '最后内容');
+  assert.deepEqual(turn.attachments, [{object_id: '43', event_seq: '4'}, {object_id: '44', event_seq: '5'}]);
+  assert.equal(turn.contentVersion, 2); assert.equal(turn.tailSeq, '5'); assert.equal(turn.creationSeq, '1');
+  assert.deepEqual(oldParts, [{type: 'text', text: '开头'}]);
+  assert.deepEqual(oldAttachments, [{object_id: '40', event_seq: '1'}]);
+});
+
+test('a malformed event after append and reset rolls back the entire page, including attachments and chain tail', () => {
+  const first = create(1); first.attachments = [{object_id: '40'}];
+  const state = apply(session(), page([first], 2));
+  const before = state.turns.get(turnKey('agent', 'a'));
+  const oldParts = before.parts; const oldAttachments = before.attachments;
+  assert.throws(() => apply(state, page([
+    event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '追加'}]}, 'agent', [{object_id: '41'}]),
+    event(3, 'turn.reset', {turn_id: 'a', pre_seq: '2', content: []}, 'agent', [{object_id: '42'}]),
+    event(4, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '错误分叉'}]}),
+  ], 5)));
+  assert.equal(state.turns.get(before.key), before); assert.equal(state.fetchSeq, '2');
+  assert.equal(before.tailSeq, '1'); assert.equal(before.contentVersion, 0);
+  assert.equal(before.parts, oldParts); assert.deepEqual(before.parts, [{type: 'text', text: '开头'}]);
+  assert.equal(before.attachments, oldAttachments); assert.deepEqual(before.attachments, [{object_id: '40', event_seq: '1'}]);
+  assert.throws(() => apply(state, page([event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: []})], 3)));
+});
+
 test('large legal content arrays append without a function argument limit', () => {
   const state = apply(session(), page([create(1)], 2));
   const content = Array.from({length: 150000}, () => ({type: 'text', text: 'a'}));
@@ -122,9 +185,8 @@ test('page commits reuse session indexes and unchanged turns without leaking mal
   apply(state, page([append], 4));
   assert.equal(state.turns, turns); assert.equal(state.order, order); assert.equal(state.creationIndex, creationIndex);
   assert.equal(state.turns.get(untouched.key), untouched);
-  const revision = state.revision;
   assert.throws(() => apply(state, page([create(4, 'c'), create(5, 'c')], 6)));
-  assert.equal(state.fetchSeq, '4'); assert.equal(state.revision, revision);
+  assert.equal(state.fetchSeq, '4');
   assert.deepEqual(state.order, [turnKey('agent', 'a'), turnKey('agent', 'b')]);
   assert.equal(state.creationIndex.has('4'), false); assert.equal(state.turns.has(turnKey('agent', 'c')), false);
 });

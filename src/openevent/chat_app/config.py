@@ -150,6 +150,7 @@ class ConfigStore:
         self.sessions = {}
         self.requests = {}
         self.channels = set()
+        self.recoverable = {}
         self._directory_lock = None
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -183,52 +184,43 @@ class ConfigStore:
                     continue
                 regular_file(path)
                 self._register(SessionConfig.parse(strict_json(path.read_bytes().decode("utf-8")), path.name))
-            pending_files = {}
-            temporary = {}
-            for path in self.pending.iterdir():
+            seen_sessions = set(self.sessions)
+            seen_requests = set(self.requests)
+            seen_channels = set(self.channels)
+            for path in sorted(self.pending.iterdir()):
                 regular_file(path)
-                if path.name.endswith(".config.tmp"):
-                    sid = valid_ulid(path.name.removesuffix(".config.tmp"))
-                    temporary[sid] = path
-                    SessionConfig.parse(strict_json(path.read_bytes().decode("utf-8")), sid + ".json")
-                elif path.name.endswith(".json"):
-                    sid = valid_ulid(path.stem)
-                    data = strict_json(path.read_bytes().decode("utf-8"))
-                    required = {"format_version", "create_request_id", "session_id", "scan_start_seq"}
-                    if set(data) not in (required, required | {"channel_id"}):
-                        raise ValueError("invalid pending fields")
-                    if type(data["format_version"]) is not int or data["format_version"] != 1 or data["session_id"] != sid:
-                        raise ValueError("invalid pending identity")
-                    valid_ulid(data["create_request_id"])
-                    uint64_string(data["scan_start_seq"])
-                    if "channel_id" in data:
-                        uint64_string(data["channel_id"])
-                    pending_files[sid] = (path, data)
-                else:
+                if path.suffix != ".json":
                     raise ValueError("unexpected pending file")
-            if set(temporary) - set(pending_files):
-                raise ValueError("temporary configuration without pending transaction")
-            for sid, (path, data) in pending_files.items():
-                formal = self.sessions.get(sid)
-                if formal is None:
-                    reason = "Channel created but configuration not committed" if "channel_id" in data else "Channel creation result is uncertain"
-                    raise ConfigurationError(f"{reason}; pending session {sid}")
-                if data != formal.as_json():
-                    raise ConfigurationError(f"pending and committed configuration disagree for session {sid}")
-                if sid in temporary:
-                    if strict_json(temporary[sid].read_bytes().decode("utf-8")) != formal.as_json():
-                        raise ValueError("temporary configuration mismatch")
-                    temporary[sid].unlink()
-                path.unlink()
+                sid = valid_ulid(path.stem)
+                data = strict_json(path.read_bytes().decode("utf-8"))
+                required = {"format_version", "create_request_id", "session_id", "scan_start_seq"}
+                if set(data) not in (required, required | {"channel_id"}):
+                    raise ValueError("invalid pending fields")
+                if type(data["format_version"]) is not int or data["format_version"] != 1 or data["session_id"] != sid:
+                    raise ValueError("invalid pending identity")
+                request = valid_ulid(data["create_request_id"])
+                uint64_string(data["scan_start_seq"])
+                if "channel_id" not in data:
+                    raise ConfigurationError(f"Channel creation result is uncertain; pending session {sid}")
+                record = SessionConfig.parse(data, path.name)
+                if sid in seen_sessions or request in seen_requests or record.channel_id in seen_channels:
+                    raise ConfigurationError("duplicate session, channel, or creation request")
+                seen_sessions.add(sid)
+                seen_requests.add(request)
+                seen_channels.add(record.channel_id)
+                self.recoverable[sid] = record
         except (OSError, ValueError, TypeError) as exc:
             if isinstance(exc, ConfigurationError):
                 raise
             entry = path.name if "path" in locals() else self.directory.name
             raise ConfigurationError(f"invalid session configuration entry {entry}") from exc
 
-    def _register(self, session):
+    def _check_unique(self, session):
         if session.session_id in self.sessions or session.channel_id in self.channels or session.create_request_id in self.requests:
             raise ConfigurationError("duplicate session, channel, or creation request")
+
+    def _register(self, session):
+        self._check_unique(session)
         self.sessions[session.session_id] = session
         self.requests[session.create_request_id] = session.session_id
         self.channels.add(session.channel_id)
@@ -247,22 +239,27 @@ class ConfigStore:
         return pending
 
     def commit(self, pending):
-        session = SessionConfig.parse(pending, pending["session_id"] + ".json")
         with self.lock:
-            temp = self.pending / (session.session_id + ".config.tmp")
+            source = self.pending / (pending["session_id"] + ".json")
+            regular_file(source)
+            data = strict_json(source.read_bytes().decode("utf-8"))
+            if data != pending:
+                raise ConfigurationError("pending configuration mismatch")
+            session = SessionConfig.parse(data, source.name)
+            self._check_unique(session)
             final = self.directory / (session.session_id + ".json")
-            if final.exists():
+            if final.exists() or final.is_symlink():
                 raise ConfigurationError("session configuration already exists")
-            write_json(temp, pending, exclusive=True)
-            os.replace(temp, final)
+            os.replace(source, final)
             regular_file(final)
             confirmed = SessionConfig.parse(strict_json(final.read_bytes().decode("utf-8")), final.name)
             if confirmed != session:
                 raise ConfigurationError("committed configuration mismatch")
             self._register(confirmed)
-            (self.pending / (session.session_id + ".json")).unlink()
+            self.recoverable.pop(session.session_id, None)
         return session
 
     def close(self):
         if self._directory_lock is not None:
             self._directory_lock.release()
+            self._directory_lock = None

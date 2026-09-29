@@ -20,6 +20,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     service = server = None
+    exit_code = 1
     try:
         config = ServerConfig.load(args.config)
         service = ChatService(config)
@@ -31,18 +32,17 @@ def main(argv=None):
             signal.signal(signal.SIGTERM, stop)
         logging.info("chat server listening on %s:%s", args.host, server.server_port)
         server.serve_forever()
-        return 1 if service.fatal.is_set() else 0
+        exit_code = 0
     except ConfigurationError as exc:
         logging.error("chat configuration error: %s", exc)
-        return 1
     except Exception as exc:
         logging.error("chat server stopped during startup or serving (%s); check configuration and OpenEvent availability", type(exc).__name__)
-        return 1
     finally:
         if server is not None:
             server.server_close()
         if service is not None:
             service.close()
+    return 1 if service is not None and service.fatal.is_set() else exit_code
 
 
 if __name__ == "__main__":

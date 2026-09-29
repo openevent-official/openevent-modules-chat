@@ -20,7 +20,7 @@ function list(value, name) {
 
 function parts(value) {
   return list(value, '消息正文').map(part => {
-    if (!part || part.type !== 'text' || typeof part.text !== 'string') throw new Error('消息正文格式不正确');
+    if (!part || part.type !== 'text' || typeof part.text !== 'string' || !part.text) throw new Error('消息正文格式不正确');
     return {type: 'text', text: part.text};
   });
 }
@@ -40,8 +40,8 @@ export function createSession(description) {
   }
   return {
     id: description.session_id, start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
-    turns: new Map(), order: [], creationIndex: new Map(), revision: 0, fileInfo: new FileInfoStore(), historySerial: 0,
-    inventory: null, pending: null, text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
+    turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new FileInfoStore(), historySerial: 0,
+    inventory: null, pending: null, preparation: 'waiting', preparationError: '', text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
   };
 }
 
@@ -79,10 +79,9 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
       const replyTo = list(payload.reply_to_seqs, '回复引用').map(seq => decimal(seq));
       if (new Set(replyTo).size !== replyTo.length) throw new Error('回复引用重复');
       const content = parts(payload.content);
-      if (payload.kind === 'turn.start' && !content.length) throw new Error('流式消息缺少正文');
       turns.set(key, {
         key, role: event.publisher_role, id: payload.turn_id, creationSeq: event.event_seq,
-        replies: replyTo,
+        replies: replyTo, tailSeq: event.event_seq, contentVersion: 0,
         parts: content, attachments, state: payload.kind === 'turn.single' ? 'completed' : 'open',
       });
       order.push(key);
@@ -91,29 +90,35 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     }
     let key;
     if (payload.kind === 'turn.cancel') key = turnKey(payload.target_turn?.role, payload.target_turn?.turn_id);
-    else if (payload.kind === 'turn.append' || payload.kind === 'turn.end') {
+    else if (['turn.append', 'turn.reset', 'turn.end'].includes(payload.kind)) {
       key = turnKey(event.publisher_role, payload.turn_id);
       decimal(payload.pre_seq);
     } else throw new Error('无法识别的消息类型');
     const original = turns.get(key) ?? session.turns.get(key);
     if (!original) throw new Error('消息缺少创建事件');
-    const content = payload.kind === 'turn.append' ? parts(payload.content) : [];
-    if (payload.kind === 'turn.append' && !content.length) throw new Error('追加消息缺少正文');
+    const content = ['turn.append', 'turn.reset'].includes(payload.kind) ? parts(payload.content) : [];
+    if (payload.kind === 'turn.append' && !content.length && !attachments.length) throw new Error('追加消息缺少正文和附件');
     if (original.state !== 'open') continue;
-    const turn = turns.get(key) ?? {...original, parts: original.parts.slice(), attachments: original.attachments.slice()};
-    if (payload.kind === 'turn.append') {
-      for (const part of content) turn.parts.push(part);
+    if (payload.kind !== 'turn.cancel' && payload.pre_seq !== original.tailSeq) throw new Error('消息链前驱不正确');
+    let turn;
+    if (payload.kind === 'turn.reset') {
+      turn = {...original, parts: content, attachments, contentVersion: original.contentVersion + 1};
     } else {
-      turn.state = payload.kind === 'turn.cancel' ? 'cancelled' : 'completed';
+      turn = turns.get(key) ?? {...original, parts: original.parts.slice(), attachments: original.attachments.slice()};
+      if (payload.kind === 'turn.append') {
+        for (const part of content) turn.parts.push(part);
+      } else {
+        turn.state = payload.kind === 'turn.cancel' ? 'cancelled' : 'completed';
+      }
+      for (const attachment of attachments) turn.attachments.push(attachment);
     }
-    for (const attachment of attachments) turn.attachments.push(attachment);
+    if (payload.kind !== 'turn.cancel') turn.tailSeq = event.event_seq;
     turns.set(key, turn);
   }
   for (const [key, turn] of turns) session.turns.set(key, turn);
   for (const key of order) session.order.push(key);
   for (const [seq, key] of creationIndex) session.creationIndex.set(seq, key);
   session.fetchSeq = page.next_seq;
-  if (turns.size) session.revision++;
   return turns;
 }
 
@@ -149,13 +154,12 @@ export function inspectSubmission(session, pending, page = null, requestSerial =
 }
 
 export class FileInfoStore {
-  constructor(onChange = () => {}) { this.entries = new Map(); this.generation = 0; this.revision = 0; this.onChange = onChange; }
-  changed() { this.revision++; this.onChange(); }
-  clear() { this.generation++; this.entries.clear(); this.changed(); }
+  constructor(onChange = () => {}) { this.entries = new Map(); this.generation = 0; this.onChange = onChange; }
+  clear() { this.generation++; this.entries.clear(); this.onChange(); }
   uploaded(result) {
     const info = fileInfo(result);
     this.entries.set(result.object_id, info);
-    this.changed();
+    this.onChange(result.object_id);
     return info;
   }
   get(objectId) { return this.entries.get(objectId); }
@@ -170,17 +174,17 @@ export class FileInfoStore {
       const info = fileInfo(result, id);
       if (generation === this.generation && this.entries.get(id) === entry) {
         this.entries.set(id, info);
-        this.changed();
+        this.onChange(id);
       }
       return info;
     }).catch(error => {
       if (generation === this.generation && this.entries.get(id) === entry) {
         this.entries.set(id, {state: 'unavailable', error: error.message});
-        this.changed();
+        this.onChange(id);
       }
       return null;
     });
-    this.changed();
+    this.onChange(id);
     return entry.promise;
   }
 }

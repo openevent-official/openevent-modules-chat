@@ -9,9 +9,8 @@ import grpc
 class FailureInfo:
     stage: str
     category: Literal["external_unavailable", "authentication", "permission",
-                      "not_found", "protocol", "contract", "lifecycle"]
+                      "not_found", "request_rejected", "protocol", "contract", "lifecycle"]
     grpc_code: grpc.StatusCode | None
-    retryable: bool
     detail: str
 
 
@@ -74,7 +73,11 @@ def make_failure(stage, exc=None, *, attempts=1, category=None, detail=None):
         return exc.failure
     code = exc.code() if isinstance(exc, grpc.RpcError) else None
     if category is None:
-        if code in {grpc.StatusCode.CANCELLED, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNKNOWN,
+        if ((stage == "PublishAutoSeq" and code in {
+                grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.RESOURCE_EXHAUSTED})
+                or (stage == "WriteObject" and code == grpc.StatusCode.INVALID_ARGUMENT)):
+            category = "request_rejected"
+        elif code in {grpc.StatusCode.CANCELLED, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNKNOWN,
                     grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL,
                     grpc.StatusCode.RESOURCE_EXHAUSTED}:
             category = "external_unavailable"
@@ -90,5 +93,5 @@ def make_failure(stage, exc=None, *, attempts=1, category=None, detail=None):
             category = "lifecycle"
         else:
             category = "contract"
-    return FailureInfo(stage, category, code, category == "external_unavailable",
+    return FailureInfo(stage, category, code,
                        detail or f"{stage} failed after {attempts} attempts")

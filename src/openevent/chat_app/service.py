@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import Future
 import json
 import logging
 import threading
+import grpc
 
 from openevent.chat_sdk import ObjectKey, TextPart, TurnRef, create_client
 from openevent.chat_sdk.errors import make_failure
@@ -15,6 +17,8 @@ from .config import ConfigStore, MAX_UINT64, ServerConfig, SessionConfig, new_ul
 
 LOG = logging.getLogger(__name__)
 MAX_OBJECT_BYTES = 4 * 1024 * 1024
+RETRYABLE_RPC_CODES = {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNKNOWN,
+                       grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL}
 
 
 class AppError(Exception):
@@ -35,7 +39,7 @@ class AppError(Exception):
 def failure_json(failure):
     return {"stage": failure.stage, "category": failure.category,
             "grpc_code": failure.grpc_code.name if failure.grpc_code is not None else None,
-            "retryable": failure.retryable, "detail": failure.detail}
+            "detail": failure.detail}
 
 
 def bad_request(message="request is invalid"):
@@ -89,7 +93,7 @@ class ChatService:
         self.config = config
         self.events = events_client if events_client is not None else OpenEventClient(config.openevent_target, timeout_ms=config.rpc_timeout_ms)
         self._owns_events = events_client is None or owns_events
-        self._events_closed = False
+        self._events_closing = False
         self._transport_lock = threading.Lock()
         self.chat_factory = chat_factory
         self.on_fatal = on_fatal
@@ -97,15 +101,28 @@ class ChatService:
         self.failure = None
         self._fatal_lock = threading.Lock()
         self._index_lock = threading.RLock()
-        self._create_lock = threading.Lock()
+        self._creating = {}
+        self._closing = threading.Event()
+        self._close_lock = threading.Lock()
         self._uploads_lock = threading.Lock()
         self.uploads = {}
         self.sessions = {}
         self.store = None
         try:
             self.store = ConfigStore(config.channels_dir)
+            self._index_lock = self.store.lock
             for record in self.store.sessions.values():
                 self.sessions[record.session_id] = self._worker(record)
+            for record in tuple(self.store.recoverable.values()):
+                worker = self._worker(record)
+                try:
+                    self._call("CreateSession", lambda: self.store.commit(record.as_json()),
+                               session_id=record.session_id, channel_id=record.channel_id,
+                               filename=record.session_id + ".json")
+                except Exception:
+                    worker.chat.close()
+                    raise
+                self.sessions[record.session_id] = worker
         except Exception:
             self.close()
             raise
@@ -113,6 +130,11 @@ class ChatService:
     def ensure_running(self):
         if self.fatal.is_set():
             raise AppError(503, "server_unavailable", "chat server is stopping", self.failure)
+
+    def _accepting(self):
+        self.ensure_running()
+        if self._closing.is_set():
+            raise AppError(503, "server_unavailable", "chat server is stopping")
 
     def _fail(self, failure, *, session_id=None, channel_id=None, uuid=None,
               from_seq=None, event_seq=None, object_id=None, filename=None):
@@ -147,7 +169,7 @@ class ChatService:
         raise self._fail(make_failure(stage, category="contract", detail=detail), session_id=session_id,
                          event_seq=event_seq, object_id=object_id)
 
-    def _call(self, stage, operation, *, fatal=False, session_id=None, channel_id=None,
+    def _call(self, stage, operation, *, session_id=None, channel_id=None,
               from_seq=None, event_seq=None, object_id=None, filename=None):
         self.ensure_running()
         try:
@@ -156,23 +178,48 @@ class ChatService:
             raise
         except Exception as exc:
             failure = make_failure(stage, exc)
-            if fatal or failure.category != "external_unavailable":
-                raise self._fail(failure, session_id=session_id, channel_id=channel_id,
-                                 uuid=getattr(exc, "uuid", None), from_seq=from_seq, event_seq=event_seq,
-                                 object_id=object_id, filename=filename) from exc
-            raise AppError(503, "server_unavailable", "external service temporarily unavailable", failure) from exc
+            if self.fatal.is_set() or (self._closing.is_set() and
+                    (failure.category == "lifecycle" or failure.grpc_code == grpc.StatusCode.CANCELLED)):
+                raise AppError(503, "server_unavailable", "chat server is stopping", failure) from exc
+            raise self._fail(failure, session_id=session_id, channel_id=channel_id,
+                             uuid=getattr(exc, "uuid", None), from_seq=from_seq, event_seq=event_seq,
+                             object_id=object_id, filename=filename) from exc
         self.ensure_running()
         return result
 
-    def _rpc(self, stage, method, *, fatal=False, session_id=None, event_seq=None, filename=None, **kwargs):
-        return self._call(stage, lambda: method(**kwargs), fatal=fatal, session_id=session_id,
-                          event_seq=event_seq, object_id=kwargs.get("object_id"), filename=filename)
+    def _rpc(self, stage, method, *, session_id=None, event_seq=None, filename=None, **kwargs):
+        # SDK operations already own their retries. Only direct idempotent RPCs
+        # use this loop; non-idempotent writes get exactly one attempt.
+        retries = self.config.max_retries if stage not in {"CreateChannel", "WriteObject"} else 0
+        for attempt in range(retries + 1):
+            self.ensure_running()
+            if self._events_closing:
+                raise AppError(503, "server_unavailable", "chat server is stopping")
+            try:
+                result = method(**kwargs)
+            except Exception as exc:
+                # gRPC raises ValueError if close wins the race between the
+                # admission check above and invoking a unary RPC on its channel.
+                locally_closed = self._events_closing and isinstance(exc, ValueError)
+                failure = make_failure(stage, exc, attempts=attempt + 1,
+                                       category="lifecycle" if locally_closed else None)
+                if self.fatal.is_set() or locally_closed or (self._closing.is_set() and failure.grpc_code == grpc.StatusCode.CANCELLED):
+                    raise AppError(503, "server_unavailable", "chat server is stopping", failure) from exc
+                if stage == "WriteObject" and failure.category == "request_rejected":
+                    raise AppError(400, "invalid_request", "object write was rejected", failure) from exc
+                if failure.grpc_code in RETRYABLE_RPC_CODES and attempt < retries:
+                    self.fatal.wait(0.1)
+                    continue
+                raise self._fail(failure, session_id=session_id, event_seq=event_seq,
+                                 object_id=kwargs.get("object_id"), filename=filename) from exc
+            self.ensure_running()
+            return result
 
     def _worker(self, record):
         chat = self._call("GetChannel", lambda: self.chat_factory(
             self.events, principal=self.config.user_principal, token=self.config.user_openevent_token,
             channel_id=record.channel_id, max_retries=self.config.max_retries,
-            channel_validator=lambda channel: self._check_channel(channel, record.session_id, record.channel_id)), fatal=True,
+            channel_validator=lambda channel: self._check_channel(channel, record.session_id, record.channel_id)),
             session_id=record.session_id, channel_id=record.channel_id, filename=record.session_id + ".json")
         return SessionWorker(record, chat)
 
@@ -191,7 +238,7 @@ class ChatService:
             raise ValueError("ChannelInfo does not match immutable session configuration")
 
     def _session(self, session_id):
-        self.ensure_running()
+        self._accepting()
         with self._index_lock:
             session = self.sessions.get(session_id)
         if session is None:
@@ -199,7 +246,7 @@ class ChatService:
         return session
 
     def list_sessions(self):
-        self.ensure_running()
+        self._accepting()
         with self._index_lock:
             return {"sessions": [self.sessions[key].public_config() for key in sorted(self.sessions)]}
 
@@ -209,39 +256,63 @@ class ChatService:
             request_id = valid_ulid(body["create_request_id"])
         except ValueError:
             raise bad_request("canonical create_request_id required") from None
-        with self._create_lock:
-            self.ensure_running()
+        with self._index_lock:
+            self._accepting()
+            task = self._creating.get(request_id)
             sid = self.store.requests.get(request_id)
-            if sid is not None:
-                return 200, self._session(sid).public_config()
-            sid = new_ulid()
+            if sid in self.sessions:
+                return 200, self.sessions[sid].public_config()
+            owner = task is None
+            if owner:
+                task = self._creating[request_id] = Future()
+        if not owner:
+            return 200, task.result()
+        try:
+            result = self._create_session(request_id)
+        except Exception as exc:
+            with self._index_lock:
+                del self._creating[request_id]
+            task.set_exception(exc)
+            raise
+        with self._index_lock:
+            del self._creating[request_id]
+        task.set_result(result)
+        return 201, result
+
+    def _create_session(self, request_id):
+        self.ensure_running()
+        sid = new_ulid()
+        channel_id = None
+        try:
             status = self._rpc("GetStatus", self.events.get_status, principal=self.config.user_principal,
                                token=self.config.user_openevent_token, session_id=sid)
             maximum = self._status_seq(status, sid)
             if maximum == MAX_UINT64:
                 raise AppError(503, "sequence_exhausted", "no session scan position remains")
-            channel_id = None
-            try:
-                pending = self.store.begin(sid, request_id, maximum + 1)
-                result = self._rpc("CreateChannel", self.events.create_channel, fatal=True,
-                                   principal=self.config.user_principal, token=self.config.user_openevent_token,
-                                   name="chat-" + sid, visibility=2, protocol="chat.v1", description="",
-                                   members=(self.config.agent_principal,), session_id=sid, filename=sid + ".json")
-                self._call("CreateChannel", lambda: self._check_channel(result.channel, sid),
-                           fatal=True, session_id=sid, filename=sid + ".json")
-                channel_id = result.channel.channel_id
-                pending = self.store.record_channel(pending, channel_id)
-                record = self.store.commit(pending)
-                worker = self._worker(record)
-                with self._index_lock:
-                    self.ensure_running()
+            pending = self.store.begin(sid, request_id, maximum + 1)
+            result = self._rpc("CreateChannel", self.events.create_channel,
+                               principal=self.config.user_principal, token=self.config.user_openevent_token,
+                               name="chat-" + sid, visibility=2, protocol="chat.v1", description="",
+                               members=(self.config.agent_principal,), session_id=sid, filename=sid + ".json")
+            self._call("CreateChannel", lambda: self._check_channel(result.channel, sid),
+                       session_id=sid, filename=sid + ".json")
+            channel_id = result.channel.channel_id
+            pending = self.store.record_channel(pending, channel_id)
+            record = self.store.commit(pending)
+            worker = self._worker(record)
+            with self._index_lock:
+                failed = self.fatal.is_set()
+                if not failed:
                     self.sessions[sid] = worker
-                return 201, worker.public_config()
-            except AppError:
-                raise
-            except Exception as exc:
-                raise self._fail(make_failure("CreateSession", exc, detail="session configuration transaction failed"),
-                                 session_id=sid, channel_id=channel_id, filename=sid + ".json") from exc
+            if failed:
+                worker.chat.close()
+                self.ensure_running()
+            return worker.public_config()
+        except AppError:
+            raise
+        except Exception as exc:
+            raise self._fail(make_failure("CreateSession", exc, detail="session configuration transaction failed"),
+                             session_id=sid, channel_id=channel_id, filename=sid + ".json") from exc
 
     def _status_seq(self, status, session_id):
         value = getattr(status, "max_seq", None)
@@ -297,7 +368,7 @@ class ChatService:
         fields(body, {"count"})
         count = number(body["count"])
         with worker.write_lock:
-            self.ensure_running()
+            self._accepting()
             if worker.batch_start == 0:
                 status = self._rpc("GetStatus", self.events.get_status, principal=self.config.user_principal,
                                    token=self.config.user_openevent_token, session_id=session_id)
@@ -317,7 +388,7 @@ class ChatService:
                     raise AppError(503, "submission_id_exhausted", "no sufficient submission numbers remain")
                 new_end = upper + min(max(10000, count), MAX_UINT64 - upper)
                 self._call("PublishAutoSeq", lambda: worker.chat.reserve_submissions(reserved_through=new_end),
-                           fatal=True, session_id=session_id)
+                           session_id=session_id)
                 with worker.state_lock:
                     worker.batch_start, worker.batch_end, worker.next_to_issue = upper + 1, new_end, upper + 1
                     worker.submissions = {}
@@ -340,11 +411,14 @@ class ChatService:
         objects = [number(value) for value in attachments]
         if len(set(replies)) != len(replies):
             raise bad_request("duplicate reply seq")
+        result = self._submission_result(worker, submission)
+        if result is not None:
+            return result
         with worker.write_lock:
-            self.ensure_running()
-            with worker.state_lock:
-                if not worker.contains(submission):
-                    raise AppError(409, "submission_out_of_range", "submission number is outside the current batch")
+            self._accepting()
+            result = self._submission_result(worker, submission)
+            if result is not None:
+                return result
             with self._uploads_lock:
                 keys = []
                 for object_id in objects:
@@ -353,40 +427,50 @@ class ChatService:
                         raise AppError(409, "attachment_unavailable", "upload record is unavailable; upload the file again")
                     keys.append(ObjectKey(object_id, record[0]))
             with worker.state_lock:
-                worker.submissions[submission] = None
+                worker.submissions[submission] = "processing"
             turn_id = "user:" + str(submission)
-            seq = self._call("PublishAutoSeq", lambda: worker.chat.single_turn(
+            self._call("PublishAutoSeq", lambda: worker.chat.single_turn(
                 turn_id=turn_id, content=(TextPart(text),) if text else (), reply_to_seqs=tuple(replies),
-                object_keys=tuple(keys)), fatal=True, session_id=session_id)
+                object_keys=tuple(keys)), session_id=session_id)
             with worker.state_lock:
-                worker.submissions[submission] = seq
-            return {"status": "committed", "submission_id": str(submission),
-                    "turn_ref": {"role": "user", "turn_id": turn_id}}
+                worker.submissions[submission] = "committed"
+            return 201, self._committed(submission)
 
-    def submission(self, session_id, submission_id):
-        worker = self._session(session_id)
-        submission = number(submission_id)
+    @staticmethod
+    def _committed(submission):
+        return {"status": "committed", "submission_id": str(submission),
+                "turn_ref": {"role": "user", "turn_id": "user:" + str(submission)}}
+
+    def _submission_result(self, worker, submission):
         with worker.state_lock:
             if not worker.contains(submission):
                 raise AppError(409, "submission_out_of_range", "submission number is outside the current batch")
-            if submission not in worker.submissions:
-                raise AppError(404, "submission_not_observed", "submission has not been admitted")
-            seq = worker.submissions[submission]
-        if seq is None:
+            state = worker.submissions.get(submission)
+        if state == "processing":
             return 202, {"submission_id": str(submission), "status": "processing"}
-        return 200, {"submission_id": str(submission), "seq": str(seq)}
+        if state == "committed":
+            return 200, self._committed(submission)
+        return None
+
+    @staticmethod
+    def _ready(worker):
+        with worker.state_lock:
+            if not worker.batch_start:
+                raise AppError(409, "session_not_initialized", "prepare the session before this operation")
 
     def cancel(self, session_id, body):
         worker = self._session(session_id)
         fields(body, {"target_turn_id"})
         target = text_value(body["target_turn_id"], nonempty=True, max_bytes=128)
+        self._ready(worker)
         with worker.write_lock:
+            self._accepting()
             self._call("PublishAutoSeq", lambda: worker.chat.cancel_turn(target_turn=TurnRef(self.config.agent_principal, target)),
-                       fatal=True, session_id=session_id)
+                       session_id=session_id)
         return {"status": "committed"}
 
     def upload(self, session_id, *, name, content_type, data):
-        self._session(session_id)
+        self._ready(self._session(session_id))
         name = text_value(name, nonempty=True, max_bytes=255)
         content_type = text_value(content_type or "application/octet-stream", nonempty=True, max_bytes=255)
         if not isinstance(data, bytes) or not 1 <= len(data) <= MAX_OBJECT_BYTES:
@@ -446,15 +530,28 @@ class ChatService:
         return metadata, data
 
     def close(self):
-        for worker in list(self.sessions.values()):
-            worker.chat.close()
-        if self.store is not None:
-            self.store.close()
-        if self._owns_events:
-            self._close_events()
+        with self._close_lock:
+            with self._index_lock:
+                self._closing.set()
+                tasks = tuple(self._creating.values())
+            for task in tasks:
+                try:
+                    task.result()
+                except Exception:
+                    pass
+            try:
+                for worker in tuple(self.sessions.values()):
+                    worker.chat.close()
+            finally:
+                if self.store is not None:
+                    self.store.close()
+                if self._owns_events:
+                    self._close_events()
 
     def _close_events(self):
         with self._transport_lock:
-            if not self._events_closed:
+            if not self._events_closing:
+                # Close admission before cancelling RPCs; a request may be
+                # between two direct calls or waiting to retry its last one.
+                self._events_closing = True
                 self.events.close()
-                self._events_closed = True

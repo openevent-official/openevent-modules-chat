@@ -23,21 +23,25 @@ class ChatHTTPServer(ThreadingHTTPServer):
     def __init__(self, address, service, *, origin=None):
         self.service = service
         self.origin = origin.rstrip("/") if origin else None
-        self._serving = threading.Event()
+        self._stop_requested = False
+        self._shutdown_started = False
         super().__init__(address, ChatRequestHandler)
         service.on_fatal = self.request_stop
 
     def request_stop(self):
-        if self._serving.is_set():
+        # Signal handlers can reenter this method; do not acquire a lock here.
+        self._stop_requested = True
+
+    def service_actions(self):
+        # This hook only runs inside the serving loop, so shutdown cannot wait
+        # for a loop that has not started. Only the serving thread starts it.
+        if self._stop_requested and not self._shutdown_started:
+            self._shutdown_started = True
             threading.Thread(target=self.shutdown, daemon=True).start()
 
     def serve_forever(self, poll_interval=0.1):
-        self._serving.set()
-        try:
-            if not self.service.fatal.is_set():
-                super().serve_forever(poll_interval)
-        finally:
-            self._serving.clear()
+        if not self._stop_requested and not self.service.fatal.is_set():
+            super().serve_forever(poll_interval)
 
 
 class ChatRequestHandler(BaseHTTPRequestHandler):
@@ -221,12 +225,6 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 raise bad_request("invalid history limit")
             self._json(200, service.history(sid, query["fetch_seq"], int(limit_text)))
             return
-        if self.command == "GET" and operation == "submissions" and len(parts) == 4:
-            if parsed.query:
-                raise bad_request("query is not supported")
-            status, result = service.submission(sid, parts[3])
-            self._json(status, result)
-            return
         if self.command == "GET" and operation == "attachments" and (len(parts) == 4 or len(parts) == 5 and parts[4] == "metadata"):
             query = self._query(parsed.query, {"event_seq"})
             if len(parts) == 5:
@@ -242,7 +240,11 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if operation == "attachments":
                 self._upload(sid)
                 return
-            method = {"submissions": service.allocate, "turns": service.send, "cancellations": service.cancel}.get(operation)
+            if operation == "turns":
+                status, result = service.send(sid, self._json_body())
+                self._json(status, result)
+                return
+            method = {"submissions": service.allocate, "cancellations": service.cancel}.get(operation)
             if method is not None:
                 self._json(201, method(sid, self._json_body()))
                 return

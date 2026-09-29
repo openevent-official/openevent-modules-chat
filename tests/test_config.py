@@ -1,6 +1,7 @@
 """Portable directory locking and process-interruption recovery."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import multiprocessing
 from pathlib import Path
 import tempfile
@@ -78,7 +79,7 @@ class DirectoryTests(unittest.TestCase):
                 process.close()
                 parent.close()
 
-    def test_failed_commit_keeps_evidence_and_blocks_restart(self):
+    def test_failed_commit_keeps_complete_pending_for_validated_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "channels"
             store = config.ConfigStore(directory)
@@ -92,11 +93,86 @@ class DirectoryTests(unittest.TestCase):
                 self.assertTrue((store.pending / (pending["session_id"] + ".json")).is_file())
             finally:
                 store.close()
-            with self.assertRaisesRegex(config.ConfigurationError, "Channel created but configuration not committed"):
-                config.ConfigStore(directory)
-            # Failed startup must also release its lock.
-            with self.assertRaisesRegex(config.ConfigurationError, "Channel created but configuration not committed"):
-                config.ConfigStore(directory)
+            reopened = config.ConfigStore(directory)
+            try:
+                sid = pending["session_id"]
+                self.assertEqual(reopened.sessions, {})
+                self.assertEqual(reopened.requests, {})
+                self.assertEqual(reopened.recoverable[sid].as_json(), pending)
+                self.assertTrue((reopened.pending / (sid + ".json")).is_file())
+                self.assertFalse((directory / (sid + ".json")).exists())
+            finally:
+                reopened.close()
+
+    def test_commit_atomically_moves_the_original_complete_pending(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "channels"
+            store = config.ConfigStore(directory)
+            try:
+                pending = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 123), 456)
+                source = store.pending / (pending["session_id"] + ".json")
+                target = directory / source.name
+                with patch.object(config.os, "replace", wraps=config.os.replace) as move:
+                    session = store.commit(pending)
+                move.assert_called_once_with(source, target)
+                self.assertEqual(json.loads(target.read_text()), session.as_json())
+                self.assertFalse(source.exists())
+                self.assertEqual({path.name for path in directory.iterdir() if path.is_file()},
+                                 {".lock", target.name})
+            finally:
+                store.close()
+
+    def test_partial_pending_refuses_startup_without_altering_other_pending(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "channels"
+            store = config.ConfigStore(directory)
+            full = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 123), 456)
+            partial = store.begin(config.new_ulid(), config.new_ulid(), 789)
+            store.close()
+            before = {path.name: path.read_bytes() for path in (directory / ".pending").iterdir()}
+            for _ in range(2):
+                with self.assertRaisesRegex(config.ConfigurationError, "creation result is uncertain"):
+                    config.ConfigStore(directory)
+            self.assertEqual({path.name: path.read_bytes() for path in (directory / ".pending").iterdir()}, before)
+            self.assertFalse((directory / (full["session_id"] + ".json")).exists())
+            self.assertIn(partial["session_id"] + ".json", before)
+
+    def test_duplicates_across_formal_and_pending_or_between_pending_are_rejected(self):
+        for collision in ("session_id", "create_request_id", "channel_id"):
+            for first_is_committed in (False, True):
+                with self.subTest(collision=collision, committed=first_is_committed), tempfile.TemporaryDirectory() as temporary:
+                    directory = Path(temporary) / "channels"
+                    store = config.ConfigStore(directory)
+                    first = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 1), 100)
+                    if first_is_committed:
+                        store.commit(first)
+                    second = dict(first, session_id=config.new_ulid(), create_request_id=config.new_ulid(), channel_id="101")
+                    second[collision] = first[collision]
+                    if not first_is_committed and collision == "session_id":
+                        # A second file with the same identity is necessarily also a filename mismatch.
+                        filename = config.new_ulid() + ".json"
+                    else:
+                        filename = second["session_id"] + ".json"
+                    (store.pending / filename).write_text(json.dumps(second))
+                    store.close()
+                    before = {str(path.relative_to(directory)): path.read_bytes()
+                              for path in directory.rglob("*.json")}
+                    with self.assertRaises(config.ConfigurationError):
+                        config.ConfigStore(directory)
+                    self.assertEqual({str(path.relative_to(directory)): path.read_bytes()
+                                      for path in directory.rglob("*.json")}, before)
+
+    def test_old_config_temp_and_malformed_pending_are_not_repaired(self):
+        for filename, body in (("old.config.tmp", "{}"), ("partial.json", '{"format_version":')):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "channels"
+                store = config.ConfigStore(directory)
+                path = store.pending / filename
+                path.write_text(body)
+                store.close()
+                with self.assertRaises(config.ConfigurationError):
+                    config.ConfigStore(directory)
+                self.assertEqual(path.read_text(), body)
 
     def test_existing_directory_can_restart_through_an_ancestor_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:

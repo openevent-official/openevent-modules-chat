@@ -1,5 +1,6 @@
 """Synchronous Chat calls and caller-owned streaming writers."""
 from contextlib import contextmanager
+from dataclasses import replace
 import math
 import threading
 
@@ -43,8 +44,7 @@ def _items(values, field):
 def _freeze(payload, recipients, object_keys, extensions):
     if extensions is not None:
         payload["extensions"] = extensions
-    encoded = encode_payload(payload)
-    recipients = tuple(validate_uint64(value, "recipient", positive=False)
+    recipients = tuple(validate_uint64(value, "recipient")
                        for value in _items(recipients, "recipients"))
     keys = _items(object_keys, "object_keys")
     if len(keys) > 1024:
@@ -61,6 +61,7 @@ def _freeze(payload, recipients, object_keys, extensions):
                 object_id=key.object_id, object_token=key.object_token))
         except (TypeError, ValueError, UnicodeError):
             raise ChatProtocolError("object_token must be valid UTF-8 string") from None
+    encoded = encode_payload(payload, object_keys=frozen_keys)
     return encoded, recipients, tuple(frozen_keys)
 
 
@@ -227,6 +228,12 @@ class ChatProtocolClient:
                 try:
                     seq = self._rpc("GetSeqByUuid", lambda: self._events.get_seq_by_uuid(uuid))
                 except _RpcFailure as lookup_error:
+                    if lookup_error.failure.grpc_code == grpc.StatusCode.NOT_FOUND:
+                        failure = replace(
+                            lookup_error.failure, category="contract",
+                            detail="GetSeqByUuid did not find a UUID already reported as committed")
+                        self._fail(failure)
+                        raise PublishFailedError(failure, uuid, uncertain=True) from None
                     raise PublishFailedError(lookup_error.failure, uuid, uncertain=True) from None
                 return self._committed_seq(seq, "GetSeqByUuid", uuid)
             raise PublishFailedError(error.failure, uuid, uncertain=uncertain) from None
@@ -249,7 +256,7 @@ class ChatProtocolClient:
                              recipients, object_keys, extensions)
             return self._publish(frozen)
 
-    def start_turn(self, *, turn_id, content, reply_to_seqs=(), recipients=(),
+    def start_turn(self, *, turn_id, content=(), reply_to_seqs=(), recipients=(),
                    object_keys=(), extensions=None):
         with self._operation():
             frozen = _freeze({"kind": "turn.start", "turn_id": validate_turn_id(turn_id),
@@ -343,8 +350,6 @@ class ChatProtocolClient:
                 raise SyncReadError(error.failure) from None
             try:
                 watermark = validate_uint64(status.max_seq, "max_seq", positive=False)
-                if validate_uint64(status.min_seq, "min_seq", positive=False) != 0:
-                    raise ChatProtocolError("invalid minimum seq")
             except (AttributeError, ChatProtocolError):
                 failure = make_failure("GetStatus", category="contract",
                                        detail="GetStatus returned an invalid message range")
@@ -361,22 +366,27 @@ class ChatProtocolClient:
                         break
                     payload = message.payload
                     kind = payload["kind"]
-                    if kind == "submission.reserve" or terminal:
+                    if kind == "submission.reserve":
                         continue
                     if kind == "turn.cancel":
                         target = payload["target_turn"]
-                        if (creation_seq is not None and target["principal"] == self._principal
-                                and target["turn_id"] == turn_id):
+                        if target["principal"] == self._principal and target["turn_id"] == turn_id:
+                            if creation_seq is None:
+                                self._invalid_recovery(message.seq, "cancel precedes target creation")
                             terminal = True
                         continue
                     if message.principal != self._principal or payload["turn_id"] != turn_id:
                         continue
                     if kind in {"turn.start", "turn.single"}:
+                        if creation_seq is not None:
+                            self._invalid_recovery(message.seq, "target has multiple creation events")
                         creation_seq = message.seq
                         last_seq = message.seq
                         terminal = kind == "turn.single"
-                    elif creation_seq is not None:
-                        if kind == "turn.append":
+                    elif not terminal:
+                        if creation_seq is None or payload["pre_seq"] != last_seq:
+                            self._invalid_recovery(message.seq, "target has a broken or forked chain")
+                        if kind in {"turn.append", "turn.reset"}:
                             last_seq = message.seq
                         elif kind == "turn.end":
                             terminal = True
@@ -389,6 +399,12 @@ class ChatProtocolClient:
             if terminal:
                 raise TurnWriterStateError("Target turn has already ended")
             return TurnWriter(self, turn_id, creation_seq, last_seq)
+
+    def _invalid_recovery(self, seq, reason):
+        failure = make_failure("Fetch", category="protocol",
+                               detail=f"Invalid target turn history at seq {seq}: {reason}")
+        self._fail(failure)
+        raise SyncReadError(failure)
 
 
 class TurnWriter:
@@ -410,8 +426,11 @@ class TurnWriter:
     def creation_seq(self):
         return self._creation_seq
 
-    def append(self, *, content, recipients=(), object_keys=(), extensions=None):
+    def append(self, *, content=(), recipients=(), object_keys=(), extensions=None):
         return self._write("turn.append", content, recipients, object_keys, extensions)
+
+    def reset(self, *, content=(), recipients=(), object_keys=(), extensions=None):
+        return self._write("turn.reset", content, recipients, object_keys, extensions)
 
     def complete(self, *, recipients=(), extensions=None):
         return self._write("turn.end", None, recipients, (), extensions)
@@ -421,7 +440,7 @@ class TurnWriter:
             if self._state != "open":
                 raise TurnWriterStateError(f"Writing object is {self._state}")
             payload = {"kind": kind, "turn_id": self._turn_id, "pre_seq": self._last_seq}
-            if kind == "turn.append":
+            if kind in {"turn.append", "turn.reset"}:
                 payload["content"] = make_content(content)
             frozen = _freeze(payload, recipients, object_keys, extensions)
             try:

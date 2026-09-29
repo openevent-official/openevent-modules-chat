@@ -2,7 +2,7 @@
 
 [English version](CHAT_PROTOCOL.md)
 
-> 状态：当前协议规格，SDK 已实现
+> 状态：公开协议规格
 > 适用范围：OpenEvent Channel `protocol="chat.v1"` 的事件 payload
 
 ## 1. 协议边界
@@ -13,11 +13,12 @@
 Channel 历史本身不说明哪些 principal 是用户或 Agent。角色映射属于协议之外的应用职责。协议记录参与者可见的
 互动事件和发送编号预留控制事件；Agent 内部状态、隐藏推理、模型请求、工具内部状态、密钥和调试日志不属于本协议。
 
-协议定义五种 turn 事件和一种发送编号预留控制事件：
+协议定义六种 turn 事件和一种发送编号预留控制事件：
 
 - `turn.single`
 - `turn.start`
 - `turn.append`
+- `turn.reset`
 - `turn.end`
 - `turn.cancel`
 - `submission.reserve`
@@ -29,6 +30,10 @@ OpenEvent 不解析 JSON payload。本文定义事件是否符合协议，但不
 
 本规格使用 `reply_to_seqs`，旧字段 `reply_to_turns` 不属于本规格。仍使用初始 `chat.v1` 名称，不提供旧字段双读、
 自动转换或旧历史迁移。
+
+协议包含 `turn.reset` 和第 4 节的空内容写入规则，reset 的完整规则见第 15 节。
+Channel 仍使用 `chat.v1`；已有合法历史保持原有含义。发送使用这些扩展的事件前，部署方必须确保相关 SDK、后端、浏览器和其它读取方
+都支持本规格；本规格不提供能力协商，也不保证旧读取方能处理新增 kind 或新的空内容条件。
 
 ## 2. Channel 与 OpenEvent 字段
 
@@ -45,14 +50,15 @@ payload 不包含版本字段。`ChannelInfo.description` 没有 `chat.v1` schem
 OpenEvent 顶层字段保持原生语义：
 
 - `EventMessage.seq` 是权威全局事件顺序，也是 `pre_seq` 和 `reply_to_seqs` 引用的事件位置；它不是 `turn_id`。
-- `EventMessage.principal` 是发布者。`turn.single` 或 `turn.start` 的发布者是 turn owner；append/end 的发布者必须是
+- `EventMessage.principal` 是发布者。`turn.single` 或 `turn.start` 的发布者是 turn owner；append/reset/end 的发布者必须是
   该 owner。
 - `EventMessage.ts_ms` 是服务端接收时间。
 - `EventMessage.uuid` 是 OpenEvent 为这一条已提交消息分配的非零 UUID；它不是 `turn_id`、TurnRef、创建事件 seq、
   `pre_seq`、回复引用或 payload 字段。UUID 的领取、消费、重复拒绝和结果不确定语义只由 OpenEvent API 契约定义。
 - `EventMessage.recipients` 可以在遵循 OpenEvent 服务端发布校验规则的前提下自由承载应用语义。
   `chat.v1` 不要求它为空、在同一 turn 内保持不变或与回复关系一致。
-- turn 事件的 `EventMessage.object_keys` 可以非空，其含义由应用定义；基础协议不把它与某个 content part 关联。
+- turn 事件的 `EventMessage.object_keys` 可以非空，对象内容和展示含义由应用定义；基础协议不把它与某个 content part 关联。
+  reset 对当前附件集合的替换范围见第 15 节，不改变 ObjectKey 本身的访问或保留语义。
   `submission.reserve` 的 `object_keys` 必须为空。
 
 OpenEvent recipients 是筛选字段，不是 ACL。需要重建完整会话的读取方应使用
@@ -67,8 +73,8 @@ OpenEvent recipients 是筛选字段，不是 ACL。需要重建完整会话的�
 
 | 字段 | 规则 |
 | --- | --- |
-| `kind` | 必填 string，只能是 `turn.single`、`turn.start`、`turn.append`、`turn.end`、`turn.cancel` 或 `submission.reserve` |
-| `turn_id` | `turn.single`、`turn.start`、`turn.append`、`turn.end` 必填；`turn.cancel` 和 `submission.reserve` 必须缺省 |
+| `kind` | 必填 string，只能是 `turn.single`、`turn.start`、`turn.append`、`turn.reset`、`turn.end`、`turn.cancel` 或 `submission.reserve` |
+| `turn_id` | `turn.single`、`turn.start`、`turn.append`、`turn.reset`、`turn.end` 必填；`turn.cancel` 和 `submission.reserve` 必须缺省 |
 | `extensions` | 可选 JSON object，只由应用解释 |
 
 `turn_id` 必须是非空 string，UTF-8 编码不超过 128 bytes。生产者和消费者使用精确字符串相等比较，不得裁剪、
@@ -113,14 +119,22 @@ payload 大小上限由 OpenEvent 部署控制，`chat.v1` 不定义第二套字
 }
 ```
 
-content 必须是 JSON array。`turn.single` 可以使用空数组，以支持由应用定义的纯对象附件 turn；`turn.start` 和 `turn.append`
-必须使用非空数组。每一项必须是只包含以下字段的 object：
+`content` 必须是 JSON array。各事件的空数组条件统一如下：
+
+| 事件 | 空数组条件 |
+| --- | --- |
+| `turn.single` | 可以为空，以支持由应用定义的纯对象附件 turn。 |
+| `turn.start` | 可以为空，顶层 `object_keys` 也可以同时为空；仍创建可被取消的流式 turn，不表示完成。 |
+| `turn.append` | 仅在本事件顶层 `object_keys` 非空时可以为空，用于只追加附件；`content` 与 `object_keys` 同时为空违反协议。 |
+| `turn.reset` | 可以为空；清空与替换的含义见第 15 节。 |
+
+数组中的每一项必须是只包含以下字段的 object：
 
 - `type`：固定 string `text`；
 - `text`：非空 string。
 
 part 顺序有意义。应用对 `turn.single` 直接使用该事件的 part 顺序；对流式 turn 按合法 turn 链顺序重建内容，并在
-每个事件内保持 part 列表顺序。
+每个事件内保持 part 列表顺序；遇到 reset 时按第 15 节替换此前聚合的内容。
 分片边界没有协议语义：应用可以追加字符、词、句子或更大的文本片段。
 
 协议不定义二进制、图片、音频、工具调用或其它 content part。应用可以在承载事件的 OpenEvent 消息上附加
@@ -158,7 +172,7 @@ OpenEvent `seq` 同时是该 turn 的 `creation_seq`、`start_seq` 和 `terminal
 
 ## 6. `turn.start`
 
-`turn.start` 创建一个允许后续 append 的流式 turn，也是该 turn 的第一条消息。写入方在发布前生成 `turn_id`，
+`turn.start` 创建一个允许后续 append 和 reset 的流式 turn，也是该 turn 的第一条消息。写入方在发布前生成 `turn_id`，
 OpenEvent 顶层 principal 与 payload `turn_id` 共同组成该 turn 的 TurnRef。
 
 ```json
@@ -184,7 +198,7 @@ OpenEvent 顶层 principal 与 payload `turn_id` 共同组成该 turn 的 TurnRe
   再出现任一种创建事件都构成协议冲突。
 
 `turn.start` 永久确定该 turn 的 TurnRef、owner 和 `reply_to_seqs`。它没有 `pre_seq`，其 OpenEvent `seq` 是该 turn 的
-`creation_seq`、`start_seq`，也是后续 append/end 链的起点。
+`creation_seq`、`start_seq`，也是后续 append/reset/end 链的起点。
 
 ## 7. `turn.append`
 
@@ -205,7 +219,7 @@ OpenEvent 顶层 principal 与 payload `turn_id` 共同组成该 turn 的 TurnRe
 
 - 要产生 turn 状态效果，目标 TurnRef 必须由同一 Channel 中更早的 `turn.start` 创建并且尚未终结。`turn.single`
   创建的 turn 已经终结，后续 append 不产生 turn 状态效果。
-- 对尚未终结的流式 turn，`pre_seq` 必须存在且等于该 turn 前一个合法 `turn.start` 或 `turn.append` 的 OpenEvent `seq`。
+- 对尚未终结的流式 turn，`pre_seq` 必须存在且等于该 turn 当前合法链尾（`turn.start`、`turn.append` 或 `turn.reset`）的 OpenEvent `seq`。
 - 除可选 `extensions` 外，payload 必须且只能包含 `kind`、`turn_id`、`pre_seq` 和 `content`；因此不得包含
   `reply_to_seqs` 或 `target_turn`。
 - 对产生状态效果的流式 turn，OpenEvent 顶层 `principal` 必须等于 `turn.start` 确定的 owner。
@@ -227,7 +241,7 @@ OpenEvent 顶层 principal 与 payload `turn_id` 共同组成该 turn 的 TurnRe
 
 - 要产生 turn 状态效果，目标 TurnRef 必须由同一 Channel 中更早的 `turn.start` 创建并且尚未终结。`turn.single`
   创建的 turn 已经 completed，后续 `turn.end` 不产生 turn 状态效果。
-- 对尚未终结的流式 turn，`pre_seq` 必须存在且等于该 turn 前一个合法 `turn.start` 或 `turn.append` 的 OpenEvent `seq`。
+- 对尚未终结的流式 turn，`pre_seq` 必须存在且等于该 turn 当前合法链尾（`turn.start`、`turn.append` 或 `turn.reset`）的 OpenEvent `seq`。
 - 除可选 `extensions` 外，payload 必须且只能包含 `kind`、`turn_id` 和 `pre_seq`；因此不得包含
   `content`、`reply_to_seqs` 或 `target_turn`。
 - 该事件只保存完成状态，不重复保存最终内容快照。
@@ -263,21 +277,21 @@ turn 有两种内容与终态形式：
 - `turn.single` 创建的 turn 没有 append 链；该事件自身提供全部内容，并在同一个 seq 正常完成。
 - `turn.start` 创建的流式 turn 使用下面的 `pre_seq` 单链，并由后续 `turn.end` 或 `turn.cancel` 终结。
 
-对于 `turn.start` 创建的同一个 TurnRef，最早终态之前的 `turn.start`、合法 `turn.append` 与作为该最早终态的合法 `turn.end` 通过
+对于 `turn.start` 创建的同一个 TurnRef，最早终态之前的 `turn.start`、合法 `turn.append`、合法 `turn.reset` 与作为该最早终态的合法 `turn.end` 通过
 `pre_seq` 形成单链：
 
 - `turn.start` 是链头，没有前驱；其 OpenEvent `seq` 是第一个链尾，但不是 turn ID。
-- 后续 append 或正常 end 指向当前 append 链尾。
-- 在最早终态之前，最多只能有一个 append 或 end 使用同一个 `pre_seq` 作为前驱；多个后继构成分叉，违反协议。
+- 后续 append、reset 或正常 end 指向当前链尾。
+- 在最早终态之前，最多只能有一个 append、reset 或 end 使用同一个 `pre_seq` 作为前驱；多个后继构成分叉，违反协议。
 - `turn.cancel` 通过 `target_turn` 关联 turn，不是链后继，永远不包含 `pre_seq`。
 
 `turn.single` 的终态事件就是它自己。`turn.start` 创建的 turn，其终态事件是在该 TurnRef 的所有符合格式的
 `turn.end` 和 `turn.cancel` 中 OpenEvent 全局 `seq` 最小的事件。因此，并发完成与中止会得到所有读取方一致的确定结果。
 
-事件按 OpenEvent `seq` 升序处理。一个 TurnRef 一旦进入终态，之后针对它的 append、end 或 cancel 都不能改变已经
+事件按 OpenEvent `seq` 升序处理。一个 TurnRef 一旦进入终态，之后针对它的 append、reset、end 或 cancel 都不能改变已经
 确定的终态、最终内容或终态前链尾；这些事件即使已经提交，也不产生 turn 状态效果。协议不要求实现为终态后事件增加
 特殊的解析、字段提取或验证顺序，应用也不需要判断这些事件相对于终态是否“合法”。只有最早终态 `seq` 之前的合法
-start/append 参与流式 turn 的最终内容重建；single turn 的最终内容固定为 `turn.single.content`。
+start/append/reset 参与流式 turn 的最终内容重建，reset 的替换规则见第 15 节；single turn 的最终内容固定为 `turn.single.content`。
 
 不同 TurnRef 可以同时保持打开并并发追加，它们的事件可以在 OpenEvent 全局顺序中交错；每个 turn 的 `pre_seq`
 链决定自己的局部内容顺序。
@@ -290,12 +304,12 @@ start/append 参与流式 turn 的最终内容重建；single turn 的最终内�
 - 数组元素必须满足第 3 节的非零 `uint64` JSON integer 规则，数组内不得重复。列表保留写入方给出的顺序，不要求按 seq
   排序；顺序本身不增加优先级、路由或执行顺序语义。空数组表示没有协议层父 turn，多个元素表示同时回应多个更早的 turn。
 - 每个 seq 必须等于同一 Channel 中某条更早已提交的 `turn.single` 或 `turn.start` 的 OpenEvent `EventMessage.seq`。
-  不得引用 append、end、cancel、`submission.reserve`、其它 Channel 的消息、当前创建事件自身或尚未提交的事件。
+  不得引用 append、reset、end、cancel、`submission.reserve`、其它 Channel 的消息、当前创建事件自身或尚未提交的事件。
 - 本文把一个 turn 的创建事件 seq 称为 `creation_seq`。它直接取自 `turn.single` 或 `turn.start` 的顶层 `EventMessage.seq`，
-  是派生值，不新增同名 payload 字段。`turn_id` 和完整 TurnRef 仍标识 turn，append/end 的 `pre_seq` 和 cancel 的 `target_turn`
+  是派生值，不新增同名 payload 字段。`turn_id` 和完整 TurnRef 仍标识 turn，append/reset/end 的 `pre_seq` 和 cancel 的 `target_turn`
   保持各自语义；UUID 不用作回复引用。
 - 引用指向整个 turn，不是它的某个 append，也不冻结回复发布时的文本快照。被引用 turn 可以仍在输出、已经 completed 或
-  cancelled；它后续合法追加的内容仍属于同一个被引用 turn。若应用需要固定当时看到的内容，由应用在协议之外处理。
+  cancelled；它后续合法追加或重置的内容仍属于同一个被引用 turn。若应用需要固定当时看到的内容，由应用在协议之外处理。
 - 回复列表由创建事件固定，后续不能修改；它不隐含任何 OpenEvent `recipients` 值。
 
 写入方负责提供满足上述条件的创建事件 seq，可以直接使用已观察到的创建消息位置。协议不要求 SDK 或应用为了核验回复目标再发起
@@ -317,6 +331,7 @@ Fetch、扫描历史或维护一套额外索引；读取方可在正常历史读
 - Channel visibility、成员变化和授权策略；
 - recipients 和事件路由；
 - 解释 `extensions` 和 ObjectKey；
+- 决定何时重置尚未终态的流式 turn，以及重试、进度提示和历史审计的展示策略；reset 不直接重试模型或撤销工具执行；
 - 决定 Chat 发布调用返回错误后的应用行为。直接使用 OpenEvent 发布的生产者遵守 OpenEvent UUID 契约；
   Chat Python SDK 在内部领取并传递 UUID；
 - OpenEvent 已消费消息 UUID 拒绝之外的业务级幂等和去重；
@@ -334,7 +349,8 @@ principal 或其它字段。它不创建 Chat operation ID，也不提供业务�
 - 移除成员不能收回其已经获得的数据或 ObjectKey。
 - ObjectKey 是 bearer capability，可以永久转交。
 - 任何具备 Channel 写权限的 principal 都能中止任意已有 TurnRef。
-- Chat 事件是 append-only；协议不定义编辑、删除、脱敏或保留期操作。
+- Chat 事件是 append-only；reset 只改变未终态 turn 的当前聚合，不改写或删除旧事件，也不撤销旧 ObjectKey。
+  协议不定义历史编辑、删除、脱敏或保留期操作。
 
 应用不得把参与者不应读取的隐藏推理、凭据、Agent 私有状态或其它数据写入 payload、extensions 或附加对象。
 
@@ -374,3 +390,55 @@ principal 或其它字段。它不创建 Chat operation ID，也不提供业务�
 
 如何把编号映射为 `turn_id`、前端每次领取多少、旧批编号是否过期、结果查询保留多久，以及换批前如何等待正在发布的消息，
 均由应用定义。它们不改变本节的预留事件字段或 turn 状态机。
+
+## 15. `turn.reset`
+
+`turn.reset` 替换发布 principal 所拥有的、尚未终态的流式 turn 的当前文本和附件集合，并保持同一个 turn 继续输出。
+例如应用可以在模型流式调用中断后重试，用重试内容覆盖当前回复，何时重试和采用哪些模型结果仍由应用决定。
+
+```json
+{
+  "kind": "turn.reset",
+  "turn_id": "turn-agent-1",
+  "pre_seq": 123403,
+  "content": []
+}
+```
+
+字段与链规则：
+
+- 除可选 `extensions` 外，payload 必须且只能包含 `kind`、`turn_id`、`pre_seq` 和 `content`；不得包含
+  `reply_to_seqs` 或 `target_turn`。`turn_id` 和 `pre_seq` 满足第 3 节，`content` 满足第 4 节。
+- 要产生状态效果，目标 TurnRef 必须由同一 Channel 中更早的 `turn.start` 创建并且尚未终态；OpenEvent 顶层
+  `principal` 必须等于该 owner。reset 不创建 turn，不能修改其它 owner 的 turn。
+- `pre_seq` 必须等于该 turn 当前合法链尾，即最近的合法 `turn.start`、`turn.append` 或 `turn.reset` 的 seq。
+  生效后 reset 自身的 seq 成为新链尾，后续 append、reset 或 end 连接这个新链尾。
+- reset 不绕过旧写入。写入方必须先确定旧链写入的结果，且不会再有针对旧链尾的未决发布，才能在正确链尾上提交 reset。
+  reset 与旧 append 使用同一前驱会构成第 10 节禁止的分叉；仅仅没有查到旧消息，不代表可以忽略它仍可能提交的请求。
+- reset 不是终态。可以连续重置，也可以在 reset 后直接 end；不要求重置后一定出现 append。
+  已 completed 或 cancelled 的 turn（包括 single turn）不会因 reset 重新打开；终态后的处理统一遵守第 10 节。
+
+当前内容的替换规则：
+
+- 按 seq 处理一个生效的 reset 时，丢弃此前为该 turn 聚合的文本，以 reset 的 `content` 作为新的文本 part 列表。
+  空数组表示清空文本；非空数组表示用这些 part 立即替换。后续合法 append 追加到这个新列表。
+- 同时清空此前为该 turn 聚合的附件集合，以 reset 所在 `EventMessage.object_keys` 作为新附件集合的起点。
+  该列表为空表示清空附件；可以在新列表中再次引用仍需保留的 ObjectKey。后续事件的对象内容和展示继续由应用解释，
+  但不得把 reset 之前的事件附件重新作为当前集合的一部分。`object_keys` 始终位于 OpenEvent 顶层，不新增同名 payload 字段。
+- `content` 和顶层 `object_keys` 可以同时为空。此时 turn 仍存在且仍为流式状态，只是当前没有文本或附件。
+- reset 不改变 owner、TurnRef、`creation_seq`、`start_seq` 或创建时的 `reply_to_seqs`。依赖创建 seq 的排序和引用位置不变；
+  指向这个 turn 的回复仍引用原创建事件，不能把 reset seq 作为新的回复目标。
+- 旧 start、append、reset 及其对象引用仍留在不可变历史中；reset 不删除对象、不撤销访问权限，也不撤销任何已经发生的应用副作用。
+  无论实时读取还是从头重放，同一事件前缀必须得到相同的当前文本、附件边界、链尾和终态。
+
+例如以下事件都属于同一个 TurnRef：
+
+| seq | 事件 | `pre_seq` | 当前文本 | 当前状态 |
+| --- | --- | --- | --- | --- |
+| 100 | start，content 为“旧” | 无 | 旧 | 流式 |
+| 101 | append，content 为“回答” | 100 | 旧回答 | 流式 |
+| 105 | reset，content 为“新” | 101 | 新 | 流式 |
+| 106 | append，content 为“回答” | 105 | 新回答 | 流式 |
+| 108 | end | 106 | 新回答 | completed |
+
+如果 cancel 在 seq 104 已经生效，表中的 reset 和后续事件均不改变 turn，最终保留“旧回答”和 cancelled 状态。

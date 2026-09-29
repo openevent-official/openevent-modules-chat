@@ -2,7 +2,7 @@
 
 [English version](CHAT_SDK.md)
 
-> 状态：当前 SDK 的公开契约，已实现
+> 状态：公开契约
 > 适用范围：`openevent.chat_sdk` 0.1.0
 
 ## 1. 范围与前提
@@ -10,11 +10,11 @@
 Chat Python SDK 提供 `chat.v1` 写入、一次一页的 Fetch 读取和无状态消息解析。它不提供 worker、Agent runtime、UI、角色映射、应用授权、业务幂等或持久化的应用投影。
 
 SDK 要求 Python 3.10 或更高版本、当前环境已安装
-`openevent-sdk>=0.8.1`，以及一个已存在、调用方可读且
+`openevent-sdk>=0.11.1`，以及一个已存在、调用方可读且
 `protocol="chat.v1"` 的 Channel。SDK 使用注入的 OpenEvent 公开 client，
 不会从源码安装 SDK，也不会生成 protobuf 模块。
 
-`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为已安装的 `0.8.1`，Python 调用形态以该版本的公开接口为准。
+`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为已安装的 `0.11.1`，Python 调用形态以该版本的公开接口为准。
 
 ## 2. 构造
 
@@ -52,6 +52,10 @@ SDK 只读取、不修改注入 client 的 `timeout_ms`，也不关闭注入 cli
 
 `ParsedMessage.payload` 同样支持 `submission.reserve` 控制事件，以 `kind` 区分事件类型，`reserved_through` 保留为 Python `int`；
 字段合法性以[公开协议](CHAT_PROTOCOL_cn.md)为准。它不带 turn 身份，调用方不能假定每条解析消息都有 `turn_id`。
+
+`ParsedMessage.payload` 的公开类型分支支持 `kind="turn.reset"`，保留协议定义的 `turn_id`、`pre_seq`、
+`content` 和可选 `extensions`；附件仍来自该条 OpenEvent 消息顶层的 `object_keys`。解析器只校验单条字段，
+不会据此判断目标是否仍可重置，也不会删除前面的解析消息。按协议维护 turn 投影的调用方自行应用 reset。
 
 ### 2.1 一次读取一页
 
@@ -99,16 +103,21 @@ seq = chat.cancel_turn(target_turn=TurnRef(9002, "other-turn"))
 
 所有发布方法成功返回都表示本次事件已经由 OpenEvent 提交；成功不表示应用投影或浏览器已经观察到这条消息。
 `start_turn()` 返回公开导出的 `TurnWriter`，其 `creation_seq` 是本次创建事件位置；`single_turn()` 直接返回创建事件 seq。
-这两个创建事件位置均可用于后续回复的 `reply_to_seqs`。`writer.append()`、`writer.complete()`、`cancel_turn()` 和
+这两个创建事件位置均可用于后续回复的 `reply_to_seqs`。`writer.append()`、`writer.reset()`、`writer.complete()`、`cancel_turn()` 和
 `reserve_submissions()` 返回各自事件已经提交的 seq。
 
 - `single_turn` 创建 completed turn，`content` 可以为空。
-- `start_turn` 创建流式 turn，`content` 必须非空；只有 `turn.start` 确认提交成功后才返回绑定该 turn 的写入对象。
+- `start_turn` 创建流式 turn；`content` 可以为空，默认 `()`。只有 `turn.start` 确认提交成功后才返回绑定该 turn 的写入对象。
 - `writer.append` 追加内容，`writer.complete` 正常结束；它们只操作对象绑定的流式 turn，不再传入 `turn_id`，也不自动读取历史。
+- `writer.reset` 清空该流式 turn 当前可见的正文和附件，并以本次 `content` 与 `object_keys` 替换；两者可以同时为空。
+  它继续使用原 turn，不改变创建位置或回复关系，也不结束该 turn；已生效的 end/cancel 不能被重置撤销。完整状态规则由公开协议定义。
 - `cancel_turn` 接收完整 `TurnRef`，目标 owner 可以不是当前 client principal。
-- `single_turn`、`start_turn` 和 `writer.append` 接受 `object_keys: Iterable[ObjectKey] = ()`。附件只写入本次发布事件的 OpenEvent 顶层
-  `object_keys`，不从此前事件继承或回写创建事件。`writer.append` 携带附件时仍须提供符合协议的非空 `content`。
+- `single_turn`、`start_turn`、`writer.append` 和 `writer.reset` 接受 `object_keys: Iterable[ObjectKey] = ()`。附件只写入本次发布事件的 OpenEvent 顶层
+  `object_keys`，不从此前事件继承或回写创建事件。`writer.append` 可以省略 `content`，仅追加附件；没有内容也没有附件的空调用抛出 `ChatProtocolError`。
 - 只有 `single_turn` 和 `start_turn` 接受 `reply_to_seqs: Iterable[int] = ()`，默认不回复任何 turn。
+
+`start_turn` 和 `writer.append` 的 `content` 参数均为 `Iterable[TextPart] = ()`，分别支持空内容 start 和纯附件 append。
+SDK 按[协议第 4 节](CHAT_PROTOCOL_cn.md#4-content-part)校验内容与附件组合，已有 TextPart 的非空文本要求保持不变，不自动补占位文字。
 
 所有发布方法都可以传入可选的 `recipients` 和 `extensions`。recipients 与 ObjectKey 保留调用方的顺序和重复项；`extensions` 必须是 JSON object。SDK 会在发布前拒绝本地可判断的非法输入。
 
@@ -127,22 +136,31 @@ SDK 不为回复引用调用 Fetch 或 GetStatus，不核验目标是否存在�
 公开写入签名为：
 
 ```text
-writer.append(*, content, recipients=(), object_keys=(), extensions=None) -> int
+writer.append(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
+writer.reset(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
 writer.complete(*, recipients=(), extensions=None) -> int
 ```
 
-新建对象的 `last_seq` 等于 `creation_seq`。每次 append 或 complete 用当前 `last_seq` 填写 `pre_seq`；append 成功后在返回前
+新建对象的内部 `last_seq` 指向该 turn 已确认的链尾。每次 append、reset 或 complete 用当前 `last_seq` 填写 `pre_seq`；append 或 reset 成功后在返回前
 更新 `last_seq`，complete 成功后在返回前更新 `last_seq` 并进入 `completed`。同一个对象内的状态判断、发布、重试和结果登记串行执行；不同 turn
 的对象可以独立写入。对象状态是本地写入状态，不是会话展示投影；`completed` 只表示本对象的 end 已提交，不改变协议的最早终态规则。
+
+reset 成功后对象仍为 `open`，下一次 append/reset/complete 接续 reset 的 seq；`turn_id` 和 `creation_seq` 不变。
+`content: Iterable[TextPart] = ()` 与 `object_keys` 在本次发布前物化并冻结，和其它写入使用同一对象锁与第 4 节的 UUID 重试规则。
+SDK 不保存或回传被替换的内容，也不读取历史来判定远端是否已有取消。reset 返回成功只证明 reset 事件已提交；
+如果更早已有有效 end/cancel，投影仍保持该终态，调用方按正常读取结果停止写入。
 
 同一 turn 同时只由一个写入对象负责；调用方持有它并用它完成后续追加和结束。正常读取观察到有效取消后，调用方停止续写并释放对象；
 `cancel_turn()` 只发布取消事实，不反查或修改任何对象。对象释放或析构不发起 RPC，不自动发布 end/cancel，也不表示已发出的请求被取消。
 client 不保留对象引用，因此无需按 turn 回收接口或终态记录表。对象每次写入先检查绑定 client 的生命周期；client 失败或关闭后，所有绑定它的对象都不能继续写入。
 
-append 或 complete 的发布结果不确定时，对象进入 `unresolved`，之后的 append、complete 抛出 `TurnWriterStateError`，不能沿旧链尾继续写。
+append、reset 或 complete 的发布结果不确定时，对象进入 `unresolved`，之后的 append、reset、complete 抛出 `TurnWriterStateError`，不能沿旧链尾继续写。
 一次历史读取或释放对象都不能证明旧写入不会再提交；恢复该 turn 前必须满足第 3.2 节的旧写入处置条件。
 尚未发出 Publish，或能确定整次逻辑发布未提交且不会再提交时，失败保留原 `last_seq` 和 `open` 状态。`completed` 对象也拒绝后续写入。
 `start_turn()` 失败时不返回对象；如果创建结果不确定，同样必须先处置原写入，再决定是否恢复。
+
+reset 不是未知发布结果的补救操作。重试模型之前，应用必须停止旧模型输出进入此 writer，并等旧的 Chat 写入完成；
+不能让旧输出在 reset 后继续 append。`unresolved` 对象不能靠 reset 恢复为 `open`，一次 Fetch 未看到旧写入也不解除交接前提。
 
 ### 3.2 显式恢复已有流式 turn
 
@@ -164,7 +182,10 @@ SDK 取得一次 GetStatus 水位，从 `state_start_seq` 按页读完固定范�
 返回 `open` 的新对象，并设置其 `creation_seq` 和 `last_seq`；目标不存在时抛出 `TurnNotFoundError`，已经终结时抛出 `TurnWriterStateError`。
 失败不返回对象，也不在 client 中留下目标状态。恢复过程解析 `submission.reserve` 并推进读取位置，不把它当作 turn 事件。
 
-只有显式 `resume_turn()` 扫描恢复历史；构造、普通 `fetch_page()`、创建、取消和对象的 append/complete 都不自动触发恢复。
+恢复按公开协议识别有效 `turn.reset` 并把其 seq 作为新链尾，继续处理其后的追加和终态；
+reset 不改变目标的创建 seq，也不使已终结的目标恢复为可续写。恢复对象无需保存重置前后正文或附件。
+
+只有显式 `resume_turn()` 扫描恢复历史；构造、普通 `fetch_page()`、创建、取消和对象的 append/reset/complete 都不自动触发恢复。
 恢复期间的错误和整个 client 的失败范围遵循第 4～5 节。
 
 ### 3.3 发布编号预留控制事件
@@ -201,7 +222,8 @@ SDK 不计算批大小、不比较历史预留上限，也不分配 `submission_
 它的 `uuid` 属性始终是本次逻辑发布取得的非零 UUID，调用方可以把它连同结构化失败信息写入脱敏错误日志；它不是下一次 Chat 写入的参数，
 也不提供跨进程恢复或重发能力。应用必须自行决定业务恢复策略。
 
-需要表达根因的公开错误都通过只读 `failure: FailureInfo` 返回同一种结构；`FailureInfo` 从 `openevent.chat_sdk` 公开导出：
+需要表达根因的公开错误都通过只读 `failure: FailureInfo` 返回同一种结构；`FailureInfo` 从 `openevent.chat_sdk` 公开导出。
+错误结构如下：
 
 ```python
 @dataclass(frozen=True)
@@ -209,39 +231,49 @@ class FailureInfo:
     stage: str
     category: Literal[
         "external_unavailable", "authentication", "permission", "not_found",
-        "protocol", "contract", "lifecycle",
+        "request_rejected", "protocol", "contract", "lifecycle",
     ]
     grpc_code: grpc.StatusCode | None
-    retryable: bool
     detail: str
 ```
 
 - `stage` 指出失败发生在哪一步，例如 `GetChannel`、`GetStatus`、`Fetch`、`get_uuid`、`PublishAutoSeq` 或 `GetSeqByUuid`。
 - `category` 是应用应当用于分支判断的稳定分类；不要解析 `detail`。
 - `grpc_code` 保留最后一次收到的 gRPC status；失败不是 gRPC 返回或尚未收到 status 时为 `None`。
-- `retryable` 只说明根因在外部条件恢复后重新建立 client 可能成功，不是要求调用方立即重试，更不表示写入可以安全重发。
 - `detail` 必须说清具体原因，例如 `Fetch failed after 4 attempts` 或 `Fetch returned seq 119 followed by seq 118`，不能只写
   `operation failed`。它可以用于脱敏日志，但不能包含 token、ObjectKey、payload 或完整正文。
 
 分类按根因确定：外部服务或传输暂时不能完成合法调用是 `external_unavailable`；凭据无效、ACL 拒绝和资源明确不存在分别是
-`authentication`、`permission`、`not_found`；非法 `chat.v1` 输入或历史是 `protocol`；OpenEvent 响应违反公开契约、服务明确报告
-持久化数据损坏，或 SDK 发出的已校验请求仍被当作非法请求拒绝，是 `contract`；已经发出的操作只因显式关闭
-而无法给出结果、且没有更具体根因时才是 `lifecycle`。
+`authentication`、`permission`、`not_found`；远端按公开参数、成员约束或请求大小规则拒绝本次请求是 `request_rejected`；
+非法 `chat.v1` 输入或历史是 `protocol`；明确的契约矛盾、服务报告的持久化数据损坏或不可能的本地状态才是 `contract`。
+已经发出的操作只因显式关闭而无法给出结果、且没有更具体根因时才是 `lifecycle`。
+
+通过本地字段格式检查不代表服务端提交时的
+全部条件仍然满足：例如 recipient 在发布提交前被合法移出 Channel，`PublishAutoSeq` 会按 OpenEvent 契约返回
+`INVALID_ARGUMENT`，不能因此判断基础设施损坏。SDK 不为错误分类额外查询成员或部署上限。
 
 gRPC status 需要结合操作阶段解释，稳定映射如下：
 
 | gRPC status 或本地根因 | `category` |
 | --- | --- |
 | `CANCELLED`、`DEADLINE_EXCEEDED`、`UNKNOWN`、`UNAVAILABLE`、暂时性 `RESOURCE_EXHAUSTED`，以及重试耗尽的暂时性 `INTERNAL` | `external_unavailable` |
+| `PublishAutoSeq` 的 `INVALID_ARGUMENT`（包括提交时的 recipient 成员约束拒绝）或 `RESOURCE_EXHAUSTED`（payload 大小限制） | `request_rejected` |
+| 直接调用 `WriteObject` 的 `INVALID_ARGUMENT`，下文已经证实契约矛盾的情况除外 | `request_rejected` |
+| 直接调用 `WriteObject` 的 `RESOURCE_EXHAUSTED`（对象文件空间、quota 或 inode 不足） | `external_unavailable` |
 | `UNAUTHENTICATED` | `authentication` |
 | `PERMISSION_DENIED` | `permission` |
 | 明确的资源不存在 | `not_found` |
 | 非法 `chat.v1` 输入或历史 | `protocol` |
-| `DATA_LOSS`、SDK 已确认的持久化数据损坏、SDK 已校验请求收到 `INVALID_ARGUMENT`、意外的 `ABORTED`/`ALREADY_EXISTS`、非法响应或不可能的本地状态 | `contract` |
+| `DATA_LOSS`、SDK 已确认的持久化数据损坏、明确违反该 RPC 公开契约的拒绝、意外的 `ABORTED`/`ALREADY_EXISTS`、非法响应或不可能的本地状态 | `contract` |
 | 只由显式关闭造成的操作终止 | `lifecycle` |
 
-如果某个 status 在具体 RPC 中有更明确的公开语义，使用那个语义；不能仅凭错误文本猜测。具体 status 始终保留在 `grpc_code`。
-`retryable=true` 只用于外部条件恢复后重建 client 可能成功的 `external_unavailable`；其它分类固定为 `false`。
+具体 RPC 的映射优先于通用 status 行；直接 RPC 的行供复用 `FailureInfo` 的应用使用，不新增 Chat SDK 的对象写入方法。
+对 `WriteObject`，如果调用方已经核验实际请求满足该 RPC 全部相关公开静态前提（包括 principal、metadata 和 data 约束），
+仍收到 `INVALID_ARGUMENT`，这时有明确契约矛盾，归入 `contract`。只做字段格式检查不能作此判断。
+`PublishAutoSeq` 的 recipient 成员关系可能在提交前变化，本地校验不能证明它持续成立，因此不能套用这一静态前提判断。
+分类只依赖 RPC 阶段、公开语义和已经确定的事实，不解析错误文本。具体 status 始终保留在 `grpc_code`。
+`PublishAutoSeq` 的大小限制不是等待即可消失的暂时资源故障。调用方按 `category` 和操作阶段处理错误；分类本身不表示写入可以安全重发。
+最后一次远端拒绝不能证明此前同一 UUID 的不确定尝试没有提交；整次逻辑发布的提交判断、writer 未决状态和重发限制保持本节及第 3.1 节的规则。
 
 `ChannelInitializationError`、`FetchPageError`、`SyncReadError`、`UuidAllocationError`、`PublishFailedError` 和 `ClientFailedError`
 都公开 `failure`。包装错误必须保留最初的 `FailureInfo`，不能在 `ClientFailedError` 中丢成笼统的“client failed”。
@@ -257,7 +289,7 @@ gRPC status 需要结合操作阶段解释，稳定映射如下：
 - `TurnWriterStateError`：写入对象已完成或未决，或者显式恢复的目标已终结。
 - `SyncReadError` 和 `UuidAllocationError`：尚未发出 Publish；`failure` 给出失败的 RPC 或生命周期根因。
 - `PublishFailedError`：取得 UUID 后，PublishAutoSeq 或 UUID 查询失败，或已经开始的 Publish 被 client 生命周期中断。其 `uuid` 和
-  `failure` 可用于记录错误；无论 `failure.retryable` 为何，都不能据此自动重发一条新的 Chat 消息。
+  `failure` 可用于记录错误；无论错误分类为何，都不能据此自动重发一条新的 Chat 消息。
 - `ClientFailedError` 和 `ClientClosedError`：client 永久失败或已关闭。
 
 ## 5. Client 生命周期
@@ -284,3 +316,6 @@ chat.close()
 
 SDK 构造和对象写入不重建历史。显式 `resume_turn()` 的耗时随读取范围增长，不维护编号分配状态或核验历史预留额度。
 每条消息最多接受 1024 个 ObjectKey，SDK 错误不会记录 ObjectKey token、principal token、payload 或完整正文。
+
+reset、空内容 start 和纯附件 append 扩展仍使用 `chat.v1`。开始发布这些事件前，部署中的 SDK、Agent、Chat Server 和浏览器等所有读取方必须同时支持对应的解析、内容规则及投影行为；
+旧读取方可能不识别 reset，或拒绝新规则允许的空内容事件，不能视为兼容。reset 只改变当前可见正文与附件集合，不删除历史事件中的 ObjectKey 或 ObjectStorage 对象。

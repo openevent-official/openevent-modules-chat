@@ -5,11 +5,11 @@
 本文只给出最小调用示例。完整的公开 API、重试和生命周期规则见
 [CHAT_SDK_cn.md](CHAT_SDK_cn.md)。
 
-以下示例使用当前 SDK 的按创建事件 seq 回复、独立写入对象和显式恢复接口。
+以下示例使用按创建事件 seq 回复、独立写入对象、显式恢复、空内容 start 与 reset 接口。
 
 ## 运行前提
 
-安装 `openevent-modules-chat` 及其 `openevent-sdk>=0.8.1` 依赖。构造
+安装 `openevent-modules-chat` 及其 `openevent-sdk>=0.11.1` 依赖。构造
 client 前，需要创建一个 `protocol="chat.v1"` 的非系统 Channel。
 
 ## 创建 Client
@@ -72,6 +72,31 @@ SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议�
 调用方停止续写并释放对应对象，释放本身不发布事件或撤销在途请求。
 继续旧 turn 必须显式调用 `resume_turn()`；前提和失败处理见[写入 API](CHAT_SDK_cn.md#3-写入-api)。
 输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#3-写入-api)。
+
+## 重置未结束的输出
+
+模型流中断后，应用先停止接收旧模型输出，并等待旧的 Chat 写入全部确认完成，再在同一个 writer 上重置并写入重试输出。
+下面先用空内容建立可取消的 turn，再追加模型输出；空内容的完整条件见[协议第 4 节](CHAT_PROTOCOL_cn.md#4-content-part)。
+
+```python
+writer = chat.start_turn(
+    turn_id="retryable-reply-1",
+    reply_to_seqs=(user_creation_seq,),
+    content=(),
+)
+writer.append(content=(TextPart("中断前的部分内容"),))
+# 已停止旧模型的输出调度，旧 Chat 写入均已确认；本地 writer 仍为 open。
+writer.reset()
+# 可以直接继续重试输出；正常读取观察到有效取消时停止续写。
+writer.append(content=(TextPart("重试得到的新内容"),))
+writer.complete()
+```
+
+也可以用 `writer.reset(content=(TextPart("重试的第一段"),))` 一次清除旧内容并写入新首段。
+reset 成功返回只表示事件已提交，不能把提交成功当作用户尚未取消的证明。应用可以在重试前回读，但这不是必须的同步屏障，
+也不能排除回读后发生新的取消；按正常读取观察到有效取消时停止续写即可。
+网页仍显示同一个 turn，创建位置和回复关系不变。内容与附件的替换、取消竞态、发布未决和恢复限制只由
+[公开写入契约](CHAT_SDK_cn.md#31-独立写入对象)规定；不能用 reset 绕过未决写入或重新打开已经结束的 turn。
 
 ## 关闭
 

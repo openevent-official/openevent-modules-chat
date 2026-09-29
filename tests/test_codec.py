@@ -27,11 +27,12 @@ class CodecTests(unittest.TestCase):
         payload = {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': [99]}
         self.assertEqual(parse_message(self.event(payload)).payload, payload)
 
-    def test_six_kinds_and_empty_stream_content(self):
+    def test_seven_kinds_and_empty_content_rules(self):
         good = [
             {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': []},
-            {'kind': 'turn.start', 'turn_id': 't', 'content': [{'type': 'text', 'text': 'x'}], 'reply_to_seqs': []},
+            {'kind': 'turn.start', 'turn_id': 't', 'content': [], 'reply_to_seqs': []},
             {'kind': 'turn.append', 'turn_id': 't', 'content': [{'type': 'text', 'text': 'x'}], 'pre_seq': 1},
+            {'kind': 'turn.reset', 'turn_id': 't', 'content': [], 'pre_seq': 1},
             {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1},
             {'kind': 'turn.cancel', 'target_turn': {'principal': 2, 'turn_id': 't'}},
             {'kind': 'submission.reserve', 'reserved_through': UINT64_MAX},
@@ -39,9 +40,14 @@ class CodecTests(unittest.TestCase):
         for payload in good:
             with self.subTest(kind=payload['kind']):
                 self.assertEqual(parse_message(self.event(encode_payload(payload))).payload, payload)
-        for payload in good[1:3]:
-            with self.assertRaises(ChatProtocolError):
-                encode_payload(dict(payload, content=[]))
+        attachment_only = dict(good[2], content=[])
+        objects = [pb.ObjectKey(object_id=1, object_token='cap')]
+        encoded = encode_payload(attachment_only, object_keys=objects)
+        self.assertEqual(parse_message(self.event(encoded, object_keys=objects)).payload, attachment_only)
+        with self.assertRaises(ChatProtocolError):
+            encode_payload(attachment_only)
+        with self.assertRaises(ChatProtocolError):
+            parse_message(self.event(attachment_only))
 
     def test_reject_bad_protocol_without_echoing_payload(self):
         good = {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': []}
@@ -68,7 +74,7 @@ class CodecTests(unittest.TestCase):
             def __str__(self): return 'private credentials'
         failure = make_failure('Fetch', RpcFailure(), attempts=4)
         self.assertEqual(failure.category, 'external_unavailable')
-        self.assertTrue(failure.retryable)
+        self.assertFalse(hasattr(failure, 'retryable'))
         self.assertNotIn('private', failure.detail)
         wrapped = ClientFailedError(failure)
         self.assertIs(make_failure('Other', wrapped), failure)
@@ -82,11 +88,45 @@ class CodecTests(unittest.TestCase):
         failure = make_failure('Fetch', RemoteCancellation())
         self.assertEqual(failure.category, 'external_unavailable')
         self.assertEqual(failure.grpc_code, grpc.StatusCode.CANCELLED)
-        self.assertTrue(failure.retryable)
         self.assertNotIn('private', failure.detail)
         closed = make_failure('Fetch', ClientClosedError('closed'))
         self.assertEqual(closed.category, 'lifecycle')
-        self.assertFalse(closed.retryable)
+
+    def test_remote_rejections_are_classified_by_rpc_stage(self):
+        class RpcFailure(grpc.RpcError):
+            def __init__(self, code): self._code = code
+            def code(self): return self._code
+            def __str__(self): return 'private remote details'
+
+        cases = [
+            ('PublishAutoSeq', grpc.StatusCode.INVALID_ARGUMENT, 'request_rejected'),
+            ('PublishAutoSeq', grpc.StatusCode.RESOURCE_EXHAUSTED, 'request_rejected'),
+            ('WriteObject', grpc.StatusCode.INVALID_ARGUMENT, 'request_rejected'),
+            ('WriteObject', grpc.StatusCode.RESOURCE_EXHAUSTED, 'external_unavailable'),
+            ('Fetch', grpc.StatusCode.INVALID_ARGUMENT, 'contract'),
+            ('PublishAutoSeq', grpc.StatusCode.DATA_LOSS, 'contract'),
+            ('PublishAutoSeq', grpc.StatusCode.ABORTED, 'contract'),
+        ]
+        for stage, code, category in cases:
+            with self.subTest(stage=stage, code=code):
+                failure = make_failure(stage, RpcFailure(code))
+                self.assertEqual(failure.category, category)
+                self.assertEqual(failure.grpc_code, code)
+                self.assertNotIn('private', failure.detail)
+        proven = make_failure('WriteObject', RpcFailure(grpc.StatusCode.INVALID_ARGUMENT),
+                              category='contract')
+        self.assertEqual(proven.category, 'contract')
+
+    def test_business_principals_and_recipients_must_be_nonzero(self):
+        payload = {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': []}
+        with self.assertRaises(ChatProtocolError):
+            parse_message(self.event(payload, recipients=[0]))
+        message = self.event(payload)
+        message.principal = 0
+        with self.assertRaises(ChatProtocolError):
+            parse_message(message)
+        with self.assertRaises(ChatProtocolError):
+            encode_payload({'kind': 'turn.cancel', 'target_turn': {'principal': 0, 'turn_id': 't'}})
 
 
 if __name__ == '__main__':

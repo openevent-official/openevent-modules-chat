@@ -13,6 +13,9 @@ let pageSuspended = false;
 let queryController = null;
 let queryTimer = null;
 let queryGeneration = 0;
+let preparationController = null;
+let preparationTimer = null;
+let preparationGeneration = 0;
 let renderQueued = false;
 let listing = false;
 let creating = false;
@@ -50,11 +53,11 @@ function message(error) {
   return typeof detail === 'string' && detail && detail !== summary ? `${summary}：${detail}` : summary;
 }
 function temporary(error) {
-  return error instanceof TypeError || error?.status === 0 ||
+  return error instanceof TypeError || error?.status === 0 || [502, 504].includes(error?.status) ||
     (error?.status === 503 && (!error.failure?.category || error.failure.category === 'external_unavailable'));
 }
 
-async function request(url, {method = 'GET', body, signal, binary = false} = {}) {
+export async function request(url, {method = 'GET', body, signal, binary = false} = {}) {
   const generation = epoch;
   const controller = new AbortController();
   const cancel = () => controller.abort();
@@ -62,24 +65,46 @@ async function request(url, {method = 'GET', body, signal, binary = false} = {})
   if (signal?.aborted) controller.abort();
   requests.add(controller);
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 30000);
+  const timeout = binary || body instanceof FormData || url.endsWith('/submissions') ? 120000 : 30000;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeout);
   const headers = {};
   if (body !== undefined && !(body instanceof FormData)) {
     headers['Content-Type'] = 'application/json'; body = JSON.stringify(body);
   }
   try {
-    const response = await fetch(url, {method, body, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store'});
+    const cancelled = new Promise((_, reject) => {
+      const rejectAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+      if (controller.signal.aborted) rejectAbort();
+      else controller.signal.addEventListener('abort', rejectAbort, {once: true});
+    });
+    const operation = async () => {
+      const response = await fetch(url, {method, body, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store'});
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (binary && response.ok) {
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const cache = response.headers.get('Cache-Control') || '';
+        if (response.headers.get('Content-Type')?.toLowerCase() !== 'application/octet-stream' ||
+            !/^attachment(?:;|$)/i.test(disposition) || response.headers.get('X-Content-Type-Options')?.toLowerCase() !== 'nosniff' ||
+            !/(?:^|,)\s*private\s*(?:,|$)/i.test(cache) || !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(cache)) {
+          throw new Error('下载响应格式不正确');
+        }
+        return {data: await response.blob(), response};
+      }
+      return {text: await response.text(), response};
+    };
+    const result = await Promise.race([operation(), cancelled]);
+    const {response} = result;
     if (response.status === 401) {
       if (epoch === generation && loggedIn) logout('访问口令无效，请重新输入。');
       throw new ApiError(401, 'unauthenticated', '访问口令无效，请重新输入。');
     }
     if (!response.ok) {
       let data;
-      try { data = await response.json(); } catch { /* A proxy may return a non-JSON failure. */ }
+      try { data = JSON.parse(result.text); } catch { /* A proxy may return a non-JSON failure. */ }
       throw new ApiError(response.status, data?.error?.code || 'request_failed', data?.error?.message || `请求未完成（${response.status}）`, data?.error?.failure);
     }
-    if (binary) return {data: await response.blob(), response};
-    const data = await response.json();
+    if (binary) return result;
+    const data = JSON.parse(result.text);
     return {data, status: response.status};
   } catch (error) {
     if (timedOut) throw new ApiError(0, 'timeout', '请求超时，请稍后再试。');
@@ -101,7 +126,7 @@ function writeToken(value) {
 
 function logout(reason = '') {
   epoch++; loggedIn = false; activeId = null; listing = false; creating = false;
-  historyLoop.stop(); stopQuery();
+  historyLoop.stop(); stopQuery(); stopPreparation();
   for (const controller of requests) controller.abort();
   requests.clear();
   for (const session of sessions.values()) session.fileInfo.clear();
@@ -141,7 +166,14 @@ function register(description) {
   if (session) {
     if (session.start !== candidate.start) throw new Error('会话读取起点发生变化');
   } else {
-    session = candidate; session.fileInfo.onChange = scheduleRender; session.canceling = new Map();
+    session = candidate; session.canceling = new Map(); session.downloads = new Set();
+    session.fileInfo.onChange = objectId => {
+      if (renderedMessages?.session === session) {
+        const keys = objectId === undefined ? renderedMessages.views.keys() : renderedMessages.byObject.get(objectId) || [];
+        for (const key of keys) renderedMessages.dirty.add(key);
+      }
+      scheduleRender();
+    };
     sessions.set(session.id, session);
   }
   return session;
@@ -183,9 +215,9 @@ async function createConversation() {
 
 function activate(id) {
   if (!loggedIn || !sessions.has(id)) return;
-  activeId = id; stopQuery();
+  stopQuery(); stopPreparation(); activeId = id;
   const session = current(); session.sync = 'loading'; session.error = '';
-  render(); historyLoop.activate(session); startQuery();
+  render(); historyLoop.activate(session); prepareSession(); startQuery();
 }
 
 const historyLoop = new ActiveLoop({
@@ -196,15 +228,19 @@ const historyLoop = new ActiveLoop({
   apply: (session, page, serial) => {
     const changes = applyPage(session, page);
     for (const [key, turn] of changes) {
+      if (turn.role === 'user') session.title = null;
+      if (renderedMessages?.session === session) {
+        renderedMessages.dirty.add(key);
+        for (const dependent of renderedMessages.byReply.get(turn.creationSeq) || []) renderedMessages.dirty.add(dependent);
+      }
       if (turn.state !== 'open' && session.canceling.has(key)) finishCancellation(session, turn);
     }
+    const recovered = session.sync === 'retrying';
     session.sync = 'ready'; session.error = '';
+    if (recovered) requirePreparation(session);
     const result = inspectSubmission(session, session.pending, page, serial);
     if (result === 'committed') confirmSend(session, session.pending);
-    else if (result === 'absent') {
-      session.pending = null; session.notice = '已确认这条消息没有发送成功。草稿已保留，可以重新发送。';
-      stopQuery();
-    }
+    else if (result === 'absent') rejectSend(session, session.pending, '已确认这条消息没有发送成功。');
     scheduleRender();
   },
   error: (session, error) => {
@@ -214,44 +250,74 @@ const historyLoop = new ActiveLoop({
 });
 
 function stopQuery() {
+  if (queryController && ['sending', 'unknown'].includes(current()?.pending?.phase)) {
+    current().pending.uncertain = true;
+    if (current().pending.phase === 'sending') current().pending.phase = 'unknown';
+  }
   queryGeneration++; clearTimeout(queryTimer); queryTimer = null;
   queryController?.abort(); queryController = null;
 }
 
 function startQuery(delay = 0) {
   const session = current();
-  if (pageSuspended || !session?.pending || session.pending.phase !== 'unknown' || queryController || queryTimer) return;
+  if (pageSuspended || !session?.pending || !['unknown', 'sending'].includes(session.pending.phase) ||
+      session.pending.queryStopped || session.preparation !== 'ready' || queryController || queryTimer) return;
   const generation = queryGeneration;
-  queryTimer = setTimeout(() => { queryTimer = null; querySubmission(session, session.pending, generation); }, delay);
+  if (delay) queryTimer = setTimeout(() => { queryTimer = null; querySubmission(session, session.pending, generation); }, delay);
+  else querySubmission(session, session.pending, generation);
 }
 
 async function querySubmission(session, pending, generation) {
   if (!pending || current() !== session || generation !== queryGeneration || session.pending !== pending) return;
   const controller = new AbortController(); queryController = controller;
+  const previouslyUncertain = !!pending.uncertain;
   let again = true;
   try {
-    const {data, status} = await request(endpoint(session, `/submissions/${pending.submissionId}`), {signal: controller.signal});
+    const {data, status} = await request(endpoint(session, '/turns'), {method: 'POST', signal: controller.signal, body: {
+      submission_id: pending.submissionId, text: pending.text, reply_to_seqs: pending.replies, attachments: pending.attachments,
+    }});
     if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
-    if (data.submission_id !== pending.submissionId) throw new Error('发送结果的编号不匹配');
-    if (status === 202 && data.status === 'processing') pending.detail = '后端正在处理，正在等待结果…';
-    else if (status === 200) { decimal(data.seq); confirmSend(session, pending); again = false; }
-    else throw new Error('发送查询返回格式不正确');
+    pending.uncertain = true;
+    if (data?.submission_id !== pending.submissionId) throw new Error('发送结果的编号不匹配');
+    if (status === 202 && data.status === 'processing') {
+      pending.phase = 'unknown'; pending.detail = '后端正在处理，正在等待结果…';
+    } else if ([200, 201].includes(status) && data.status === 'committed' &&
+        data.turn_ref?.role === 'user' && data.turn_ref.turn_id === `user:${pending.submissionId}`) {
+      confirmSend(session, pending); again = false;
+    } else throw new Error('发送响应格式不正确');
   } catch (error) {
     if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
     if (error.status === 409 && error.code === 'submission_out_of_range') {
-      beginOldBatchCheck(session, pending); pending.detail = '正在读取消息记录，确认这次发送结果…';
-      if (session.sync !== 'stopped') historyLoop.kick();
+      if (previouslyUncertain) {
+        beginOldBatchCheck(session, pending); pending.detail = '正在读取消息记录，确认这次发送结果…';
+        if (session.sync !== 'stopped') historyLoop.kick();
+      } else { pending.submissionId = null; pending.phase = 'allocating'; }
+      requirePreparation(session);
       again = false;
-    } else if (error.status === 404 && error.code === 'submission_not_observed') {
-      pending.detail = '结果尚未确认，正在等待后端处理…';
-    } else if (temporary(error)) pending.detail = '暂时无法查询发送结果，稍后继续确认…';
-    else { pending.detail = message(error); pending.queryStopped = true; again = false; }
+    } else if (error.status === 409 && error.code === 'attachment_unavailable') {
+      // The backend checks the current batch's submission state before looking up attachments.
+      for (const file of session.files) { file.status = 'error'; file.error = '文件需要重新上传'; }
+      rejectSend(session, pending, '文件上传记录已失效，请重新上传后发送。'); again = false;
+    } else if (temporary(error)) {
+      pending.uncertain = true; pending.phase = 'unknown'; pending.detail = '发送结果未确认，正在重试确认…';
+    } else if (error.status >= 400 && error.status < 500 && !previouslyUncertain) {
+      rejectSend(session, pending, message(error)); again = false;
+    } else {
+      pending.uncertain = true; pending.phase = 'unknown'; pending.detail = message(error); pending.queryStopped = true; again = false;
+    }
   } finally {
     if (generation === queryGeneration) {
       queryController = null; scheduleRender();
       if (again && session.pending === pending && current() === session) startQuery(1000);
     }
   }
+}
+
+function rejectSend(session, pending, reason) {
+  if (!pending || session.pending !== pending) return;
+  session.pending = null; session.notice = `${reason} 草稿已保留，可以修改后重新发送。`;
+  if (current() === session) stopQuery();
+  scheduleRender();
 }
 
 function confirmSend(session, pending) {
@@ -262,56 +328,66 @@ function confirmSend(session, pending) {
   scheduleRender();
 }
 
-async function sendMessage() {
+function stopPreparation() {
+  preparationGeneration++; clearTimeout(preparationTimer); preparationTimer = null;
+  preparationController?.abort(); preparationController = null;
+}
+
+function requirePreparation(session) {
+  session.inventory = null; session.preparation = 'waiting'; session.preparationError = '';
+  if (current() === session) { stopQuery(); stopPreparation(); prepareSession(); }
+  scheduleRender();
+}
+
+async function prepareSession() {
   const session = current();
-  if (!session || session.pending || session.files.some(file => file.status !== 'ready')) return;
-  const generation = epoch;
-  const pending = {phase: 'allocating', submissionId: null, text: session.text, replies: session.replies.slice(), attachments: session.files.map(file => file.objectId)};
-  session.pending = pending; session.notice = ''; scheduleRender();
+  if (!session || pageSuspended || !loggedIn || preparationController || preparationTimer ||
+      (session.preparation === 'ready' && session.inventory && session.inventory.next <= session.inventory.end)) return;
+  const generation = preparationGeneration;
+  const controller = new AbortController(); preparationController = controller;
+  if (session.preparation !== 'ready') session.preparation = 'loading';
+  session.preparationError = ''; scheduleRender();
+  let retry = false;
   try {
-    while (valid(session, generation) && session.pending === pending) {
-      pending.phase = 'allocating';
-      let id = takeSubmission(session);
-      if (id === null) {
-        const {data} = await request(endpoint(session, '/submissions'), {method: 'POST', body: {count: '100'}});
-        if (!valid(session, generation) || session.pending !== pending) return;
-        setInventory(session, data); id = takeSubmission(session);
-      }
-      pending.submissionId = id; pending.phase = 'sending'; scheduleRender();
-      try {
-        const {data} = await request(endpoint(session, '/turns'), {method: 'POST', body: {
-          submission_id: id, text: pending.text, reply_to_seqs: pending.replies, attachments: pending.attachments,
-        }});
-        if (!valid(session, generation) || session.pending !== pending) return;
-        if (data.status !== 'committed' || data.submission_id !== id) throw new Error('发送响应无法确认');
-        confirmSend(session, pending); return;
-      } catch (error) {
-        if (!valid(session, generation) || session.pending !== pending) return;
-        if (error.status === 409 && error.code === 'submission_out_of_range') {
-          session.inventory = null; pending.submissionId = null; continue;
-        }
-        if (error.status === 409 && error.code === 'attachment_unavailable') {
-          for (const file of session.files) { file.status = 'error'; file.error = '文件需要重新上传'; }
-          session.pending = null; session.notice = '文件上传记录已失效，请重新上传后发送。'; return;
-        }
-        if (error.status >= 400 && error.status < 500) {
-          session.pending = null; session.notice = message(error); return;
-        }
-        pending.phase = 'unknown'; pending.detail = '发送结果未确认，正在查询…';
-        if (inspectSubmission(session, pending) === 'committed') confirmSend(session, pending);
-        else if (current() === session) startQuery();
-        return;
-      }
-    }
+    const {data} = await request(endpoint(session, '/submissions'), {method: 'POST', body: {count: '100'}, signal: controller.signal});
+    if (current() !== session || generation !== preparationGeneration) return;
+    setInventory(session, data); session.preparation = 'ready';
+    if (session.pending?.phase === 'allocating') allocatePending(session);
+    else startQuery();
   } catch (error) {
-    if (valid(session, generation) && session.pending === pending) {
-      session.pending = null; session.notice = `未取得发送编号，消息还没有发送。${message(error)}`;
+    if (current() !== session || generation !== preparationGeneration) return;
+    retry = temporary(error) && error.code !== 'submission_id_exhausted';
+    if (session.preparation !== 'ready') session.preparation = retry ? 'loading' : 'failed';
+    session.preparationError = retry ? '等待初始化，正在重试…' : message(error);
+    if (!retry && session.pending?.phase === 'allocating' && !session.pending.uncertain) {
+      rejectSend(session, session.pending, message(error));
     }
-  } finally { if (valid(session, generation)) scheduleRender(); }
+  } finally {
+    if (generation === preparationGeneration) {
+      preparationController = null; scheduleRender();
+      if (retry && current() === session && !pageSuspended) preparationTimer = setTimeout(() => {
+        preparationTimer = null; prepareSession();
+      }, 1000);
+    }
+  }
+}
+
+function allocatePending(session) {
+  const id = takeSubmission(session);
+  if (id === null) { prepareSession(); return; }
+  session.pending.submissionId = id; session.pending.phase = 'sending'; startQuery();
+}
+
+function sendMessage() {
+  const session = current();
+  if (!session || session.preparation !== 'ready' || session.pending || session.files.some(file => file.status !== 'ready')) return;
+  session.pending = {phase: 'allocating', submissionId: null, text: session.text, replies: session.replies.slice(),
+    attachments: session.files.map(file => file.objectId), uncertain: false};
+  session.notice = ''; allocatePending(session); scheduleRender();
 }
 
 async function upload(session, item) {
-  if (!valid(session) || !session.files.includes(item) || item.status === 'uploading') return;
+  if (!valid(session) || session.preparation !== 'ready' || session.pending || !session.files.includes(item) || item.status === 'uploading') return;
   if (!item.file) { item.status = 'error'; item.error = '请重新选择文件'; scheduleRender(); return; }
   if (item.file.size === 0 || item.file.size > MAX_FILE_BYTES) {
     item.status = 'error'; item.error = '请选择非空且不超过 4 MiB 的文件'; scheduleRender(); return;
@@ -325,13 +401,15 @@ async function upload(session, item) {
     fileInfo(data); item.objectId = data.object_id; item.status = 'ready'; session.fileInfo.uploaded(data);
   } catch (error) {
     if (!valid(session, generation) || !session.files.includes(item) || item.controller !== controller) return;
-    item.status = 'error'; item.error = message(error);
+    item.status = 'error'; item.error = error.code === 'timeout' ? '上传结果未确认，可以重新上传' : message(error);
+    if (error.code === 'session_not_initialized') requirePreparation(session);
   } finally {
     if (valid(session, generation) && session.files.includes(item) && item.controller === controller) { item.controller = null; scheduleRender(); }
   }
 }
 
 function metadata(session, reference, retry = false) {
+  if (retry && session.preparation !== 'ready') return;
   return session.fileInfo.ensure(reference, async ref => {
     const {data} = await request(endpoint(session, `/attachments/${ref.object_id}/metadata?event_seq=${ref.event_seq}`));
     return data;
@@ -339,6 +417,10 @@ function metadata(session, reference, retry = false) {
 }
 
 async function download(session, reference) {
+  if (session.preparation !== 'ready') return;
+  const key = `${reference.object_id}:${reference.event_seq}`;
+  if (session.downloads.has(key)) return;
+  session.downloads.add(key); scheduleRender();
   const generation = epoch;
   try {
     const {data, response} = await request(endpoint(session, `/attachments/${reference.object_id}?event_seq=${reference.event_seq}`), {binary: true});
@@ -352,7 +434,7 @@ async function download(session, reference) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (error) {
     if (valid(session, generation)) { session.notice = `下载未完成：${message(error)}`; scheduleRender(); }
-  }
+  } finally { if (valid(session, generation)) { session.downloads.delete(key); scheduleRender(); } }
 }
 
 function finishCancellation(session, turn) {
@@ -361,6 +443,7 @@ function finishCancellation(session, turn) {
 }
 
 async function cancelTurn(session, turn) {
+  if (session.preparation !== 'ready') return;
   const status = session.canceling.get(turn.key);
   if (session.turns.get(turn.key)?.state !== 'open' || (status && status !== 'unknown')) return;
   const generation = epoch; session.canceling.set(turn.key, 'sending'); session.notice = ''; scheduleRender();
@@ -375,6 +458,7 @@ async function cancelTurn(session, turn) {
     } else finishCancellation(session, latest);
   } catch (error) {
     if (valid(session, generation)) {
+      if (error.code === 'session_not_initialized') requirePreparation(session);
       const latest = session.turns.get(turn.key);
       if (latest.state === 'open') {
         session.canceling.set(turn.key, 'unknown'); session.notice = `取消结果未确认，可以手动重试取消。${message(error)}`;
@@ -396,14 +480,15 @@ export function textPrefix(parts, limit, trim = false) {
 }
 
 function title(session) {
+  if (session.title) return session.title;
   for (const key of session.order) {
     const turn = session.turns.get(key);
     if (turn.role === 'user') {
       const text = textPrefix(turn.parts, 35, true);
-      if (text) return text;
+      if (text) return session.title = text;
     }
   }
-  return `会话 ${session.id.slice(-6)}`;
+  return session.title = `会话 ${session.id.slice(-6)}`;
 }
 
 function snippet(turn) {
@@ -417,15 +502,24 @@ function updateAttachment(session, view) {
   const ref = view.ref;
   let info = session.fileInfo.get(ref.object_id);
   if (!info) { metadata(session, ref); info = session.fileInfo.get(ref.object_id); }
-  if (view.info === info) return;
+  const downloading = session.downloads.has(`${ref.object_id}:${ref.event_seq}`);
+  if (view.info === info) {
+    if (view.retry) view.retry.disabled = session.preparation !== 'ready';
+    view.download.disabled = session.preparation !== 'ready' || downloading;
+    setText(view.download, downloading ? '正在下载…' : '下载');
+    return;
+  }
   view.info = info;
   const body = node('div', 'attachment-info');
   body.append(node('strong', '', info?.state === 'ready' ? info.name || '附件' : '附件'));
   body.append(node('span', 'muted', info?.state === 'ready' ? `${formatSize(info.nbytes)} · ${info.type}` : info?.state === 'unavailable' ? '文件信息暂不可用' : '正在读取文件信息…'));
   if (info?.description) body.append(node('span', 'muted', info.description));
   view.element.replaceChildren(node('span', 'file-icon', '↧'), body);
-  if (info?.state === 'unavailable') view.element.append(button('重试信息', () => metadata(session, ref, true)));
-  view.element.append(button('下载', () => download(session, ref)));
+  view.retry = info?.state === 'unavailable' ? button('重试信息', () => metadata(session, ref, true)) : null;
+  if (view.retry) { view.retry.disabled = session.preparation !== 'ready'; view.element.append(view.retry); }
+  view.download = button(downloading ? '正在下载…' : '下载', () => download(session, ref));
+  view.download.disabled = session.preparation !== 'ready' || downloading;
+  view.element.append(view.download);
 }
 
 function setText(element, text) { if (element.textContent !== text) element.textContent = text; }
@@ -439,13 +533,24 @@ function updateChildren(container, children) {
   });
 }
 
+function addReference(index, id, key) {
+  if (!index.has(id)) index.set(id, new Set());
+  index.get(id).add(key);
+}
+
+function removeReference(index, id, key) {
+  const keys = index.get(id);
+  keys?.delete(key);
+  if (keys?.size === 0) index.delete(id);
+}
+
 function createTurnView(session, turn) {
   const article = node('article', `turn ${turn.role}`); article.id = `message-${turn.creationSeq}`;
   const header = node('div', 'turn-heading');
   const state = node('span', 'turn-state');
   header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? '你' : '↗'), node('strong', '', turn.role === 'user' ? '你' : 'Agent'), state);
   const reply = button('回复', () => {
-    if (session.pending) return;
+    if (session.preparation !== 'ready' || session.pending) return;
     if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
     else session.replies.push(turn.creationSeq);
     scheduleRender(); $('message-input').focus();
@@ -470,7 +575,15 @@ function createTurnView(session, turn) {
 
 function updateTurnView(session, view, turn, selected) {
   if (view.turn !== turn) {
-    // Text parts and attachments only grow. Keep existing nodes while streaming.
+    if (view.turn && view.turn.contentVersion !== turn.contentVersion) {
+      view.text.data = ''; view.partCount = 0;
+      for (const attachment of view.attachments) {
+        attachment.element.remove();
+        removeReference(renderedMessages.byObject, attachment.ref.object_id, turn.key);
+      }
+      view.attachments = [];
+    }
+    // Appends grow existing nodes; reset starts a new content generation in place.
     if (view.partCount < turn.parts.length) {
       view.text.appendData(turn.parts.slice(view.partCount).map(part => part.text).join(''));
       view.partCount = turn.parts.length;
@@ -480,24 +593,19 @@ function updateTurnView(session, view, turn, selected) {
     while (view.attachments.length < turn.attachments.length) {
       const attachment = {ref: turn.attachments[view.attachments.length], element: node('div', 'attachment'), info: null};
       view.attachments.push(attachment); view.article.append(attachment.element);
+      addReference(renderedMessages.byObject, attachment.ref.object_id, turn.key);
     }
     view.turn = turn;
   }
-  const pending = !!session.pending;
-  if (view.selected !== selected || view.pending !== pending) {
-    setText(view.reply, selected ? '已选回复' : '回复');
-    view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
-    view.reply.disabled = pending; view.reply.setAttribute('aria-pressed', String(selected));
-    view.selected = selected; view.pending = pending;
-  }
+  const pending = !!session.pending || session.preparation !== 'ready';
+  setText(view.reply, selected ? '已选回复' : '回复');
+  view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
+  view.reply.disabled = pending; view.reply.setAttribute('aria-pressed', String(selected));
   if (view.cancel) {
     const status = session.canceling.get(turn.key);
-    if (view.cancelState !== turn.state || view.cancelStatus !== status) {
-      view.cancel.hidden = turn.state !== 'open';
-      setText(view.cancel, status === 'sending' ? '正在取消…' : status === 'committed' ? '等待取消结果' : status === 'unknown' ? '重试取消' : '停止输出');
-      view.cancel.disabled = status === 'sending' || status === 'committed';
-      view.cancelState = turn.state; view.cancelStatus = status;
-    }
+    view.cancel.hidden = turn.state !== 'open';
+    setText(view.cancel, status === 'sending' ? '正在取消…' : status === 'committed' ? '等待取消结果' : status === 'unknown' ? '重试取消' : '停止输出');
+    view.cancel.disabled = session.preparation !== 'ready' || status === 'sending' || status === 'committed';
   }
   for (const quote of view.quotes) {
     const target = session.turns.get(session.creationIndex.get(quote.seq));
@@ -508,15 +616,37 @@ function updateTurnView(session, view, turn, selected) {
 
 function renderTurns(session) {
   const container = $('messages');
-  const signature = session ? `${session.revision}|${session.fileInfo.revision}|${session.replies.join(',')}|${JSON.stringify([...session.canceling])}|${!!session.pending}` : '';
-  if (renderedMessages && renderedMessages.session === session && renderedMessages.signature === signature) return;
   const switching = renderedMessages?.session !== session;
   if (switching && renderedMessages?.session) renderedMessages.session.scrollTop = container.scrollTop;
+  if (switching || !renderedMessages) {
+    container.replaceChildren();
+    renderedMessages = {session, views: new Map(), byReply: new Map(), byObject: new Map(), dirty: new Set(session?.order),
+      selected: new Set(), canceling: new Map(), downloads: new Set(), empty: false};
+  }
+  const viewState = renderedMessages;
+  const selected = new Set(session?.replies);
+  if (session) {
+    // Only changes to all controls require visiting all messages.
+    if (viewState.pending !== !!session.pending || viewState.preparation !== session.preparation) {
+      for (const key of viewState.views.keys()) viewState.dirty.add(key);
+    }
+    for (const seq of new Set([...viewState.selected, ...selected])) {
+      if (viewState.selected.has(seq) !== selected.has(seq)) viewState.dirty.add(session.creationIndex.get(seq));
+    }
+    for (const key of new Set([...viewState.canceling.keys(), ...session.canceling.keys()])) {
+      if (viewState.canceling.get(key) !== session.canceling.get(key)) viewState.dirty.add(key);
+    }
+    for (const key of new Set([...viewState.downloads, ...session.downloads])) {
+      if (viewState.downloads.has(key) !== session.downloads.has(key)) {
+        for (const owner of viewState.byObject.get(key.split(':')[0]) || []) viewState.dirty.add(owner);
+      }
+    }
+    viewState.pending = !!session.pending; viewState.preparation = session.preparation;
+    viewState.selected = selected; viewState.canceling = new Map(session.canceling); viewState.downloads = new Set(session.downloads);
+  }
+  if (!switching && !viewState.dirty.size && (viewState.empty || viewState.views.size)) return;
   const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
   const oldTop = container.scrollTop;
-  if (switching || !renderedMessages) {
-    container.replaceChildren(); renderedMessages = {session, views: new Map(), empty: false};
-  }
   if (!session || !session.order.length) {
     if (!renderedMessages.empty) {
       const empty = node('div', 'empty-state');
@@ -525,25 +655,27 @@ function renderTurns(session) {
     }
   } else {
     if (renderedMessages.empty) { container.replaceChildren(); renderedMessages.empty = false; }
-    const selected = new Set(session.replies);
-    for (const key of session.order) {
+    for (const key of viewState.dirty) {
       const turn = session.turns.get(key);
+      if (!turn) continue;
       let view = renderedMessages.views.get(key);
       if (!view) {
         view = createTurnView(session, turn); renderedMessages.views.set(key, view); container.append(view.article);
+        for (const seq of turn.replies) addReference(viewState.byReply, seq, key);
       }
       updateTurnView(session, view, turn, selected.has(turn.creationSeq));
     }
   }
-  renderedMessages.signature = signature;
+  viewState.dirty.clear();
   if (switching) container.scrollTop = session?.scrollTop ?? container.scrollHeight;
   else if (atBottom) container.scrollTop = container.scrollHeight;
   else container.scrollTop = oldTop;
 }
 
 function renderComposer(session) {
-  const disabled = !session || !!session.pending;
+  const disabled = !session || session.preparation !== 'ready' || !!session.pending;
   $('message-input').disabled = disabled; $('choose-files').disabled = disabled;
+  $('file-input').disabled = disabled;
   $('send').disabled = disabled || session.files.some(file => file.status !== 'ready');
   const value = session?.text || ''; if ($('message-input').value !== value) $('message-input').value = value;
   const previous = renderedComposer?.session === session ? renderedComposer : null;
@@ -567,7 +699,8 @@ function renderComposer(session) {
     setText(view.name, info?.state === 'ready' ? info.name : item.file?.name || '文件');
     setText(view.status, item.status === 'ready' ? '已上传' : item.status === 'uploading' ? '正在上传…' : item.error || '等待上传');
     view.status.className = item.status === 'error' ? 'error' : 'muted';
-    view.retry.hidden = item.status !== 'error'; view.retry.disabled = disabled;
+    view.retry.hidden = item.status !== 'error';
+    view.retry.disabled = disabled;
     view.remove.disabled = disabled; renderedComposer.files.set(item, view);
   }
   updateChildren($('draft-files'), [...renderedComposer.files.values()].map(view => view.row));
@@ -577,7 +710,16 @@ function renderComposer(session) {
     status = pending.phase === 'allocating' ? '正在准备发送…' : pending.phase === 'sending' ? '正在发送…' : pending.detail || '发送结果未确认…';
   }
   $('submission-status').textContent = status; $('submission-status').hidden = !status;
-  if (session?.pending?.queryStopped) $('submission-status').append(button('重新查询', () => { session.pending.queryStopped = false; startQuery(); }));
+  if (session && (session.preparation !== 'ready' || session.preparationError)) {
+    $('submission-status').hidden = false;
+    $('submission-status').append(node('div', '', session.preparationError || '会话初始化中…'));
+    if (session.preparation === 'failed' || (session.preparation === 'ready' && session.preparationError)) {
+      $('submission-status').append(button('重试初始化', prepareSession));
+    }
+  }
+  if (session?.pending?.queryStopped && session.preparation === 'ready') {
+    $('submission-status').append(button('重试确认', () => { session.pending.queryStopped = false; startQuery(); }));
+  }
 }
 
 function render() {
@@ -625,17 +767,20 @@ $('logout').addEventListener('click', () => logout());
 $('new-session').addEventListener('click', createConversation);
 $('refresh-sessions').addEventListener('click', loadSessions);
 $('composer').addEventListener('submit', event => { event.preventDefault(); sendMessage(); });
-$('message-input').addEventListener('input', event => { if (current() && !current().pending) current().text = event.target.value; });
+$('message-input').addEventListener('input', event => {
+  const session = current();
+  if (session?.preparation === 'ready' && !session.pending) session.text = event.target.value;
+});
 $('message-input').addEventListener('keydown', event => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); sendMessage(); }
 });
 $('choose-files').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', event => {
-  const session = current(); if (!session || session.pending) return;
+  const session = current(); if (!session || session.preparation !== 'ready' || session.pending) return;
   for (const file of event.target.files) { const item = {file, objectId: null, status: 'waiting'}; session.files.push(item); upload(session, item); }
   event.target.value = ''; scheduleRender();
 });
-window.addEventListener('pagehide', () => { pageSuspended = true; historyLoop.stop(); stopQuery(); for (const controller of requests) controller.abort(); });
+window.addEventListener('pagehide', () => { pageSuspended = true; historyLoop.stop(); stopQuery(); stopPreparation(); for (const controller of requests) controller.abort(); });
 window.addEventListener('pageshow', event => { pageSuspended = false; if (event.persisted && loggedIn && current()) activate(activeId); });
 
 const token = cookieToken();

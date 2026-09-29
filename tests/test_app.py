@@ -1,15 +1,19 @@
 """Application contract tests with an in-memory public OpenEvent boundary."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import http.client
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 from types import SimpleNamespace as NS
 import unittest
-from unittest.mock import DEFAULT, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 import grpc
 from openevent.sdk import OpenEventClient
@@ -20,11 +24,20 @@ from openevent.chat_sdk.errors import ChatProtocolError, FetchPageError, Publish
 from openevent.chat_app.config import ConfigStore, ConfigurationError, ServerConfig, new_ulid, strict_json
 from openevent.chat_app.http import ChatHTTPServer
 from openevent.chat_app.service import AppError, ChatService
+from openevent.chat_app import __main__ as entrypoint
 
 
 class Unavailable(grpc.RpcError):
     def code(self):
         return grpc.StatusCode.UNAVAILABLE
+
+
+class RpcError(grpc.RpcError):
+    def __init__(self, code):
+        self._code = code
+
+    def code(self):
+        return self._code
 
 
 class Events:
@@ -215,14 +228,131 @@ class AppTests(unittest.TestCase):
         self.assertEqual(results[0][1], results[1][1])
         self.assertEqual(self.events.calls.count("CreateChannel"), 1)
 
-    def test_processing_query_does_not_wait_for_publish_and_rotation_does(self):
+    def test_different_creations_and_existing_sessions_do_not_wait_for_one_create(self):
+        sid = self.session()
+        entered, release = threading.Event(), threading.Event()
+        original = self.events.create_channel
+        first_id, second_id = new_ulid(), new_ulid()
+        blocked = False
+        guard = threading.Lock()
+
+        def create(**kwargs):
+            nonlocal blocked
+            with guard:
+                wait = not blocked
+                blocked = True
+            if wait:
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError("test did not release creation")
+            return original(**kwargs)
+
+        with patch.object(self.events, "create_channel", side_effect=create), ThreadPoolExecutor(3) as pool:
+            first = pool.submit(self.service.create_session, {"create_request_id": first_id})
+            self.assertTrue(entered.wait(1))
+            try:
+                second = pool.submit(self.service.create_session, {"create_request_id": second_id})
+                self.assertEqual(second.result(1)[0], 201)
+                listed = pool.submit(self.service.list_sessions).result(1)
+                self.assertIn(sid, [record["session_id"] for record in listed["sessions"]])
+                self.assertFalse(first.done())
+            finally:
+                release.set()
+            self.assertEqual(first.result(1)[0], 201)
+
+    def test_same_creation_waiters_share_a_failure_and_do_not_create_again(self):
+        entered, release = threading.Event(), threading.Event()
+        request = {"create_request_id": new_ulid()}
+
+        def create(**kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release creation")
+            raise Unavailable()
+
+        with patch.object(self.events, "create_channel", side_effect=create) as called, ThreadPoolExecutor(2) as pool:
+            first = pool.submit(self.service.create_session, request)
+            self.assertTrue(entered.wait(1))
+            second = pool.submit(self.service.create_session, request)
+            release.set()
+            for result in (first, second):
+                self.assert_error("server_unavailable", lambda result=result: result.result(1))
+            self.assertEqual(called.call_count, 1)
+        self.assertEqual(len(list((self.path / ".pending").glob("*.json"))), 1)
+
+    def test_uninitialized_operations_reject_without_waiting_for_initialization_lock(self):
+        sid = self.session()
+        worker = self.service.sessions[sid]
+        self.events.calls.clear()
+        operations = (
+            ("session_not_initialized", lambda: self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")),
+            ("session_not_initialized", lambda: self.service.cancel(sid, {"target_turn_id": "agent:1"})),
+            ("submission_out_of_range", lambda: self.send(sid)),
+        )
+        with ThreadPoolExecutor(3) as pool, worker.write_lock:
+            for code, operation in operations:
+                future = pool.submit(operation)
+                error = self.assert_error(code, lambda: future.result(1))
+                self.assertEqual(error.status, 409)
+        self.assertEqual(self.events.calls, [])
+
+    def test_committed_repeat_returns_original_result_without_upload_records(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        uploaded = self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")
+        body = {"submission_id": "1", "text": "hello", "attachments": [uploaded["object_id"]]}
+        status, success = self.service.send(sid, body)
+        self.assertEqual(status, 201)
+        self.assertEqual(success, {"status": "committed", "submission_id": "1",
+                                  "turn_ref": {"role": "user", "turn_id": "user:1"}})
+        self.service.uploads.clear()
+        self.events.calls.clear()
+        self.assertEqual(self.service.send(sid, body), (200, success))
+        self.assertEqual(self.events.calls, [])
+
+    def test_concurrent_first_requests_recheck_the_same_number_after_the_lock(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        worker = self.service.sessions[sid]
+        actual_lock = worker.write_lock
+        entered = threading.Event()
+        counter_lock = threading.Lock()
+        waiting = 0
+
+        class WaitingLock:
+            def __enter__(self):
+                nonlocal waiting
+                with counter_lock:
+                    waiting += 1
+                    if waiting == 2:
+                        entered.set()
+                actual_lock.acquire()
+
+            def __exit__(self, *args):
+                actual_lock.release()
+
+        actual_lock.acquire()
+        with patch.object(worker, "write_lock", WaitingLock()), ThreadPoolExecutor(2) as pool:
+            first, second = pool.submit(self.send, sid), pool.submit(self.send, sid)
+            try:
+                self.assertTrue(entered.wait(1), "both requests must reach the Channel lock")
+                self.assertFalse(first.done())
+                self.assertFalse(second.done())
+            finally:
+                actual_lock.release()
+            results = [first.result(1), second.result(1)]
+        self.assertEqual(sorted(status for status, _ in results), [200, 201])
+        self.assertEqual(results[0][1], results[1][1])
+        self.assertEqual(self.events.calls.count("turn.single"), 1)
+
+    def test_repeated_send_does_not_wait_for_publish_and_rotation_does(self):
         sid = self.session()
         self.assertEqual(self.service.allocate(sid, {"count": "1"}), {"start": "1", "end": "1"})
         self.events.block_publish = True
         with ThreadPoolExecutor(3) as pool:
             sending = pool.submit(self.send, sid)
             self.assertTrue(self.events.publish_entered.wait(1))
-            status, result = self.service.submission(sid, "1")
+            status, result = pool.submit(self.send, sid).result(1)
             self.assertEqual((status, result["status"]), (202, "processing"))
             rotation = pool.submit(self.service.allocate, sid, {"count": "10000"})
             time.sleep(.03)
@@ -231,7 +361,6 @@ class AppTests(unittest.TestCase):
             self.events.publish_release.set()
             sending.result(1)
             self.assertEqual(rotation.result(1), {"start": "10001", "end": "20000"})
-        self.assert_error("submission_out_of_range", lambda: self.service.submission(sid, "1"))
         self.assert_error("submission_out_of_range", lambda: self.send(sid))
         self.assertEqual(self.events.calls.count("turn.single"), 1)
 
@@ -242,14 +371,14 @@ class AppTests(unittest.TestCase):
         self.service.close()
         self.events.calls.clear()
         self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        self.assert_error("submission_out_of_range", lambda: self.service.submission(sid, "1"))
+        self.assert_error("submission_out_of_range", lambda: self.send(sid))
         self.assertNotIn("Fetch", self.events.calls)
         self.assertEqual(self.service.allocate(sid, {"count": "2"}), {"start": "10001", "end": "10002"})
         self.assertEqual(self.events.calls.count("Fetch"), 1)
         self.events.calls.clear()
         self.service.allocate(sid, {"count": "1"})
         self.send(sid, "10001")
-        self.service.submission(sid, "10001")
+        self.assertEqual(self.send(sid, "10001")[0], 200)
         self.assertNotIn("Fetch", self.events.calls)
         self.assertNotIn("GetStatus", self.events.calls)
 
@@ -282,6 +411,77 @@ class AppTests(unittest.TestCase):
         self.events.bad_data = True
         self.assert_error("server_unavailable", lambda: self.service.download(sid, "1", "2"))
         self.assertTrue(self.service.fatal.is_set())
+
+    def test_read_object_retries_the_same_complete_file_request(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"whole file")
+        self.send(sid, attachments=["1"])
+        self.service.close()
+        self.config = replace(self.config, max_retries=3)
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        with patch.object(self.events, "read_object", side_effect=[
+                Unavailable(), RpcError(grpc.StatusCode.DEADLINE_EXCEEDED), NS(data=b"whole file")]) as read:
+            metadata, content = self.service.download(sid, "1", "2")
+        self.assertEqual(content, b"whole file")
+        self.assertEqual(metadata["nbytes"], len(content))
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual([call.kwargs for call in read.call_args_list], [
+            {"object_id": 1, "object_token": "object-secret", "offset": 0, "nbytes": len(content)}] * 3)
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_download_reads_one_byte_and_four_megabytes_in_one_rpc(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        for index, data in enumerate((b"x", b"x" * (4 * 1024 * 1024)), 1):
+            with self.subTest(size=len(data)):
+                obj = self.service.upload(sid, name="a.bin", content_type="application/octet-stream", data=data)
+                self.send(sid, str(index), attachments=[obj["object_id"]])
+                with patch.object(self.events, "read_object", wraps=self.events.read_object) as read:
+                    _, content = self.service.download(sid, obj["object_id"], str(index + 1))
+                self.assertEqual(content, data)
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(read.call_args.kwargs["offset"], 0)
+                self.assertEqual(read.call_args.kwargs["nbytes"], len(data))
+
+    def test_direct_get_status_retries_same_arguments_and_exhaustion_is_fatal(self):
+        self.service.close()
+        self.config = replace(self.config, max_retries=3)
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        with patch.object(self.events, "get_status", side_effect=[
+                Unavailable(), RpcError(grpc.StatusCode.INTERNAL), RpcError(grpc.StatusCode.UNKNOWN), NS(max_seq=0)]) as read:
+            self.session()
+        self.assertEqual(read.call_count, 4)
+        self.assertTrue(all(call == read.call_args_list[0] for call in read.call_args_list))
+        self.assertFalse(self.service.fatal.is_set())
+        with patch.object(self.events, "get_status", side_effect=Unavailable()) as read:
+            error = self.assert_error("server_unavailable", self.session)
+        self.assertEqual(read.call_count, 4)
+        self.assertEqual(error.failure.category, "external_unavailable")
+        self.assertIn("4 attempts", error.failure.detail)
+        self.assertTrue(self.service.fatal.is_set())
+
+    def test_write_object_rejection_is_local_but_uncertain_failure_is_not_retried(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        with patch.object(self.events, "write_object", side_effect=RpcError(grpc.StatusCode.INVALID_ARGUMENT)) as write:
+            error = self.assert_error("invalid_request", lambda: self.service.upload(
+                sid, name="a.txt", content_type="text/plain", data=b"a"))
+        self.assertEqual(error.status, 400)
+        self.assertEqual(error.failure.category, "request_rejected")
+        self.assertEqual(write.call_count, 1)
+        self.assertEqual(self.service.uploads, {})
+        self.assertFalse(self.service.fatal.is_set())
+        self.service.close()
+        self.config = replace(self.config, max_retries=3)
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        self.service.allocate(sid, {"count": "1"})
+        with patch.object(self.events, "write_object", side_effect=Unavailable()) as write:
+            self.assert_error("server_unavailable", lambda: self.service.upload(
+                sid, name="a.txt", content_type="text/plain", data=b"a"))
+        self.assertEqual(write.call_count, 1)
+        self.assertTrue(self.service.fatal.is_set())
+        self.assertEqual(self.service.uploads, {})
 
     def test_attachment_failures_log_location_without_capabilities_or_contents(self):
         sid = self.session()
@@ -320,6 +520,7 @@ class AppTests(unittest.TestCase):
 
     def test_upload_failure_logs_session_without_rpc_arguments(self):
         sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
         with patch.object(self.events, "write_object", side_effect=RuntimeError("user-secret file-secret")):
             self.assert_fatal_log(lambda: self.service.upload(
                 sid, name="file-secret.txt", content_type="text/plain", data=b"file-secret"),
@@ -331,18 +532,20 @@ class AppTests(unittest.TestCase):
         self.assert_error("attachment_unavailable", lambda: self.send(sid, attachments=["1"]))
         self.assertNotIn("turn.single", self.events.calls)
         self.assertFalse(self.service.fatal.is_set())
-        self.assert_error("submission_not_observed", lambda: self.service.submission(sid, "1"))
+        self.assertEqual(self.service.sessions[sid].submissions, {})
+        self.assertEqual(self.send(sid)[0], 201)
 
-    def test_read_transient_is_request_local_and_write_failure_is_fatal(self):
+    def test_read_failure_after_sdk_retries_is_fatal_without_an_outer_retry(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
         self.events.fail_fetch = True
         error = self.assert_error("server_unavailable", lambda: self.service.history(sid, "1"))
         self.assertEqual(error.failure.category, "external_unavailable")
-        self.assertFalse(self.service.fatal.is_set())
-        self.events.fail_publish = True
-        self.assert_error("server_unavailable", lambda: self.send(sid))
         self.assertTrue(self.service.fatal.is_set())
+        self.assertEqual(self.events.calls.count("Fetch"), 1)
+        self.assertNotIn("retryable", error.as_json()["error"]["failure"])
+        self.assert_error("server_unavailable", lambda: self.send(sid))
+        self.assertNotIn("turn.single", self.events.calls)
 
     def test_fatal_closes_shared_transport_before_another_session_retries(self):
         attempts = []
@@ -406,7 +609,7 @@ class AppTests(unittest.TestCase):
                     pending = calls.submit(
                         self.service._call, "single_turn",
                         lambda: chat.single_turn(turn_id="blocked", content=(TextPart("waiting"),)),
-                        fatal=True, session_id=sid)
+                        session_id=sid)
                     try:
                         self.assertTrue(entered.wait(2))
                         failure = make_failure("Fetch", category="contract", detail="test failure")
@@ -431,6 +634,131 @@ class AppTests(unittest.TestCase):
         self.service.close()
         self.assertFalse(self.events.closed)
 
+    def test_close_between_attachment_rpcs_prevents_the_next_call(self):
+        self.service.close()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat, owns_events=True)
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")
+        self.send(sid, attachments=["1"])
+        entered, release = threading.Event(), threading.Event()
+        locate = self.service._attachment
+
+        def attachment(*args):
+            key = locate(*args)
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not resume attachment request")
+            return key
+
+        with patch.object(self.service, "_attachment", side_effect=attachment), \
+                patch.object(self.events, "get_object_metadata", wraps=self.events.get_object_metadata) as metadata, \
+                ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(self.service.download, sid, "1", "2")
+            try:
+                self.assertTrue(entered.wait(1))
+                self.service.close()
+            finally:
+                release.set()
+            self.assert_error("server_unavailable", lambda: pending.result(1))
+            metadata.assert_not_called()
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_close_between_direct_rpc_attempts_does_not_restart_the_rpc(self):
+        self.service.close()
+        self.config = replace(self.config, max_retries=3)
+        self.service = ChatService(self.config, self.events, chat_factory=Chat, owns_events=True)
+        read = Mock(side_effect=Unavailable())
+        with patch.object(self.service.fatal, "wait", side_effect=lambda _: self.service.close()):
+            self.assert_error("server_unavailable", lambda: self.service._rpc("GetObjectMetadata", read))
+        read.assert_called_once_with()
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_real_closed_channel_after_direct_rpc_admission_is_only_shutdown(self):
+        self.service.close()
+        events = OpenEventClient("127.0.0.1:1", timeout_ms=100)
+        self.service = ChatService(self.config, events, owns_events=True)
+        entered, release = threading.Event(), threading.Event()
+
+        def read():
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not resume admitted RPC")
+            return events.get_object_metadata(1, "object-secret")
+
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(self.service._rpc, "GetObjectMetadata", read)
+            try:
+                self.assertTrue(entered.wait(1))
+                self.service.close()
+            finally:
+                release.set()
+            error = self.assert_error("server_unavailable", lambda: pending.result(1))
+        self.assertEqual(error.failure.category, "lifecycle")
+        self.assertIsInstance(error.__cause__, ValueError)
+        self.assertFalse(self.service.fatal.is_set())
+        self.assertIsNone(self.service.failure)
+
+    def test_real_rpc_failure_racing_with_close_still_preserves_the_failure(self):
+        self.service.close()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat, owns_events=True)
+
+        def read():
+            self.service.close()
+            raise RpcError(grpc.StatusCode.DATA_LOSS)
+
+        error = self.assert_error("server_unavailable", lambda: self.service._rpc("ReadObject", read))
+        self.assertEqual(error.failure.grpc_code, grpc.StatusCode.DATA_LOSS)
+        self.assertEqual(error.failure.category, "contract")
+        self.assertTrue(self.service.fatal.is_set())
+        self.assertIs(self.service.failure, error.failure)
+
+    def test_close_waits_for_creation_before_releasing_configuration_directory(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.events.create_channel
+
+        def create(**kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release creation")
+            return original(**kwargs)
+
+        with patch.object(self.events, "create_channel", side_effect=create), ThreadPoolExecutor(2) as pool:
+            creating = pool.submit(self.session)
+            self.assertTrue(entered.wait(1))
+            closing = pool.submit(self.service.close)
+            try:
+                self.assertTrue(self.service._closing.wait(1))
+                self.assertFalse(closing.done())
+                with self.assertRaises(ConfigurationError):
+                    ConfigStore(self.path)
+                self.assert_error("server_unavailable", self.session)
+            finally:
+                release.set()
+            sid = creating.result(1)
+            closing.result(1)
+        self.assertFalse(self.service.fatal.is_set())
+        reopened = ConfigStore(self.path)
+        try:
+            self.assertIn(sid, reopened.sessions)
+            self.assertEqual(reopened.recoverable, {})
+        finally:
+            reopened.close()
+
+    def test_main_reports_fatal_failure_that_arrives_during_close(self):
+        fatal = threading.Event()
+        service = NS(fatal=fatal, close=Mock(side_effect=fatal.set))
+        server = NS(server_port=8080, serve_forever=Mock(), server_close=Mock())
+        with patch.object(entrypoint.ServerConfig, "load", return_value=self.config), \
+                patch.object(entrypoint, "ChatService", return_value=service), \
+                patch.object(entrypoint, "ChatHTTPServer", return_value=server), \
+                patch.object(entrypoint.signal, "signal"), \
+                patch.object(entrypoint.logging, "basicConfig"):
+            self.assertEqual(entrypoint.main(["--config", "unused.json"]), 1)
+        server.serve_forever.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        service.close.assert_called_once_with()
+
     def test_uncertain_create_keeps_pending_and_blocks_restart(self):
         self.events.fail_create = True
         sid = new_ulid()
@@ -447,15 +775,93 @@ class AppTests(unittest.TestCase):
                 patch.object(self.service.store, "commit", side_effect=OSError("file-secret")):
             self.assert_fatal_log(lambda: self.session(), session_id=sid, channel_id="1", filename=sid + ".json")
 
-    def test_restart_cleans_only_pending_matching_committed_configuration(self):
+    def test_startup_finishes_complete_pending_after_validating_original_channel(self):
+        request = {"create_request_id": new_ulid()}
+        with patch.object(self.service.store, "commit", side_effect=OSError("interrupted before rename")):
+            self.assert_error("server_unavailable", lambda: self.service.create_session(request))
+        pending_path, = (self.path / ".pending").glob("*.json")
+        pending = json.loads(pending_path.read_text())
+        self.service.close()
+        self.events.calls.clear()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertEqual(self.events.calls, ["GetChannel"])
+        self.assertFalse(pending_path.exists())
+        formal = self.path / pending_path.name
+        self.assertEqual(json.loads(formal.read_text()), pending)
+        self.assertEqual(self.service.create_session(request), (200, {
+            "session_id": pending["session_id"], "scan_start_seq": pending["scan_start_seq"]}))
+        self.assertEqual(self.service.sessions[pending["session_id"]].chat.channel_id, int(pending["channel_id"]))
+
+    def test_pending_recovery_preserves_file_when_original_channel_does_not_match(self):
+        sid = self.session()
+        self.service.close()
+        formal = self.path / (sid + ".json")
+        pending = self.path / ".pending" / formal.name
+        formal.replace(pending)
+        original = pending.read_bytes()
+        self.events.channels[1].name = "wrong-channel-name"
+        self.events.calls.clear()
+        with self.assertRaises(AppError):
+            ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertEqual(self.events.calls, ["GetChannel"])
+        self.assertFalse(formal.exists())
+        self.assertEqual(pending.read_bytes(), original)
+
+    def test_pending_recovery_commit_failure_logs_location_and_releases_directory(self):
+        sid = self.session()
+        self.service.close()
+        formal = self.path / (sid + ".json")
+        pending = self.path / ".pending" / formal.name
+        formal.replace(pending)
+        original = pending.read_bytes()
+        self.events.calls.clear()
+        with patch.object(ConfigStore, "commit", side_effect=OSError("private file failure")), \
+                self.assertLogs("openevent.chat_app.service", level="ERROR") as captured:
+            with self.assertRaises(AppError) as caught:
+                ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertEqual(caught.exception.code, "server_unavailable")
+        self.assertEqual(len(captured.records), 1)
+        record = json.loads(captured.records[0].getMessage().removeprefix("chat server fatal: "))
+        self.assertEqual({key: value for key, value in record.items() if key != "failure"}, {
+            "session_id": sid, "channel_id": "1", "filename": sid + ".json"})
+        self.assertEqual(record["failure"]["stage"], "CreateSession")
+        self.assertEqual(record["failure"]["category"], "contract")
+        self.assertNotIn("private file failure", captured.records[0].getMessage())
+        self.assertEqual(self.events.calls, ["GetChannel"])
+        self.assertEqual(pending.read_bytes(), original)
+        self.assertFalse(formal.exists())
+        reopened = ConfigStore(self.path)
+        try:
+            self.assertIn(sid, reopened.recoverable)
+            self.assertEqual(reopened.sessions, {})
+        finally:
+            reopened.close()
+
+    def test_all_pending_conflicts_are_checked_before_any_remote_recovery(self):
+        sid = self.session()
+        self.service.close()
+        formal = self.path / (sid + ".json")
+        original = json.loads(formal.read_text())
+        formal.replace(self.path / ".pending" / formal.name)
+        other = dict(original, session_id=new_ulid(), create_request_id=new_ulid())
+        (self.path / ".pending" / (other["session_id"] + ".json")).write_text(json.dumps(other))
+        before = {path.name: path.read_bytes() for path in (self.path / ".pending").iterdir()}
+        self.events.calls.clear()
+        with self.assertRaises(ConfigurationError):
+            ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertEqual(self.events.calls, [])
+        self.assertEqual(list(self.path.glob("*.json")), [])
+        self.assertEqual({path.name: path.read_bytes() for path in (self.path / ".pending").iterdir()}, before)
+
+    def test_restart_rejects_even_matching_pending_and_formal_configuration(self):
         sid = self.session()
         formal = self.path / (sid + ".json")
         pending = self.path / ".pending" / (sid + ".json")
         pending.write_bytes(formal.read_bytes())
         self.service.close()
-        self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        self.assertFalse(pending.exists())
-        self.assertEqual(self.service.list_sessions()["sessions"][0]["session_id"], sid)
+        with self.assertRaises(ConfigurationError):
+            ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertTrue(pending.exists())
         self.assertTrue(formal.exists())
 
     def test_channel_scopes_and_cancel_never_scan(self):
@@ -472,6 +878,95 @@ class AppTests(unittest.TestCase):
         for data in ('{"x":1,"x":2}', '{"x":NaN}', '[]'):
             with self.assertRaises(ValueError):
                 strict_json(data)
+
+
+class HTTPStopTests(unittest.TestCase):
+    def setUp(self):
+        self.server = ChatHTTPServer(("127.0.0.1", 0), NS(fatal=threading.Event()))
+        self.thread = None
+        self.finished = threading.Event()
+
+    def tearDown(self):
+        if self.thread is not None and self.thread.is_alive():
+            self.server.shutdown()
+            self.thread.join(2)
+        self.server.server_close()
+
+    def start_server(self):
+        def serve():
+            self.server.serve_forever(poll_interval=.01)
+            self.finished.set()
+
+        self.thread = threading.Thread(target=serve, daemon=True)
+        self.thread.start()
+
+    def test_stop_before_serving_is_remembered_without_starting_shutdown(self):
+        with patch.object(self.server, "shutdown", wraps=self.server.shutdown) as shutdown:
+            self.server.request_stop()
+            self.server.request_stop()
+            self.start_server()
+            self.assertTrue(self.finished.wait(1), "an early stop must prevent serving")
+            shutdown.assert_not_called()
+
+    def test_stop_during_loop_start_is_not_lost_and_shutdown_starts_once(self):
+        base = ChatHTTPServer.__bases__[0]
+        serve = base.serve_forever
+
+        def stop_then_serve(server, poll_interval):
+            # Stop after the entry check but before the underlying loop starts.
+            server.request_stop()
+            server.request_stop()
+            return serve(server, poll_interval)
+
+        with patch.object(base, "serve_forever", stop_then_serve), \
+                patch.object(self.server, "shutdown", wraps=self.server.shutdown) as shutdown:
+            self.start_server()
+            self.assertTrue(self.finished.wait(1), "a stop at loop startup must complete")
+            self.server.request_stop()
+            shutdown.assert_called_once_with()
+
+    def test_reentrant_stop_signal_does_not_deadlock(self):
+        code = textwrap.dedent("""
+            import signal
+            import sys
+            import threading
+            from types import SimpleNamespace
+            from openevent.chat_app.http import ChatHTTPServer
+
+            server = ChatHTTPServer(('127.0.0.1', 0), SimpleNamespace(fatal=threading.Event()))
+            calls = 0
+            def stop(*_):
+                global calls
+                calls += 1
+                server.request_stop()
+
+            def trace(frame, event, arg):
+                # Reenter while the old Event implementation holds its lock;
+                # a lock-free implementation is reentered before it returns.
+                event_set = (frame.f_code is threading.Event.set.__code__
+                             and frame.f_locals.get('self') is server._stop_requested)
+                locked = (event == 'line' and event_set
+                          and frame.f_locals['self']._cond._lock.locked())
+                returning = (event == 'return'
+                             and frame.f_code is ChatHTTPServer.request_stop.__code__)
+                if locked or returning:
+                    sys.settrace(None)
+                    signal.raise_signal(signal.SIGTERM)
+                return trace
+
+            signal.signal(signal.SIGTERM, stop)
+            sys.settrace(trace)
+            signal.raise_signal(signal.SIGTERM)
+            assert calls == 2, calls
+            server.serve_forever(poll_interval=.01)
+            server.server_close()
+        """)
+        try:
+            result = subprocess.run([sys.executable, "-B", "-c", code],
+                                    capture_output=True, text=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("a repeated stop signal deadlocked the test subprocess")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class HTTPTests(unittest.TestCase):
@@ -524,8 +1019,35 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertFalse(self.service.fatal.is_set())
 
+    def test_http_send_reports_processing_and_replays_success_without_a_query_route(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        path = f"/api/chat/sessions/{sid}/turns"
+        body = {"submission_id": "1", "text": "hello"}
+        self.events.block_publish = True
+        with ThreadPoolExecutor(1) as pool:
+            first = pool.submit(self.request, "POST", path, body)
+            try:
+                self.assertTrue(self.events.publish_entered.wait(1))
+                status, headers, data = self.request("POST", path, body)
+                self.assertEqual(status, 202)
+                self.assertEqual(json.loads(data), {"submission_id": "1", "status": "processing"})
+                self.assertIn("no-store", headers["Cache-Control"])
+            finally:
+                self.events.publish_release.set()
+            status, _, first_data = first.result(1)
+        self.assertEqual(status, 201)
+        status, _, repeated = self.request("POST", path, body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(repeated), json.loads(first_data))
+        self.assertNotIn("seq", json.loads(repeated))
+        self.assertEqual(self.events.calls.count("turn.single"), 1)
+        status, _, _ = self.request("GET", f"/api/chat/sessions/{sid}/submissions/1")
+        self.assertEqual(status, 404)
+
     def test_http_multipart_and_attachment_download(self):
         sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
         boundary = "testboundary"
         body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="报告.txt"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n').encode()
         status, _, data = self.request("POST", f"/api/chat/sessions/{sid}/attachments", body,
@@ -533,7 +1055,6 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(json.loads(data)["nbytes"], 5)
         self.assertEqual(json.loads(data)["name"], "报告.txt")
-        self.service.allocate(sid, {"count": "1"})
         self.send(sid, attachments=["1"])
         status, headers, data = self.request("GET", f"/api/chat/sessions/{sid}/attachments/1?event_seq=2")
         self.assertEqual(status, 200)
@@ -543,6 +1064,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_http_multipart_uploads_email_as_an_ordinary_file(self):
         sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
         boundary = "testboundary"
         content = (b"From: sender@example.com\r\nTo: recipient@example.com\r\n"
                    b"Subject: Attached email\r\nContent-Type: text/plain\r\n\r\n"
@@ -556,7 +1078,6 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(uploaded["name"], "message.eml")
         self.assertEqual(uploaded["nbytes"], len(content))
         self.assertEqual(self.events.objects[int(uploaded["object_id"])][0].type, "message/rfc822")
-        self.service.allocate(sid, {"count": "1"})
         self.send(sid, attachments=[uploaded["object_id"]])
         status, _, downloaded = self.request(
             "GET", f'/api/chat/sessions/{sid}/attachments/{uploaded["object_id"]}?event_seq=2')
