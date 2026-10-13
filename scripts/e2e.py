@@ -84,7 +84,7 @@ def run():
     binary = str(Path(binary).resolve())
     import grpc
     from openevent.sdk import AdminClient, OpenEventClient
-    from openevent.chat_sdk import ObjectKey, TextPart, create_client
+    from openevent.chat_sdk import ObjectKey, RawExtensions, TextPart, create_client
     from openevent.chat_app.config import new_ulid
 
     with fixture_directory() as root:
@@ -120,7 +120,8 @@ def run():
             command = [sys.executable, '-B', '-m', 'openevent.chat_app', '--config', str(app_config),
                        '--host', '127.0.0.1', '--port', str(http_port)]
 
-            def request(method, path, body=None, *, auth=True, raw=None, content_type=None, request_origin=origin):
+            def request(method, path, body=None, *, auth=True, raw=None, content_type=None, request_origin=origin,
+                        decode_json=True):
                 headers = {}
                 if auth:
                     headers['Cookie'] = 'web_token=' + quote(web_token, safe='')
@@ -137,7 +138,7 @@ def run():
                     response = conn.getresponse()
                     data = response.read()
                     typ = response.getheader('Content-Type', '')
-                    value = json.loads(data) if typ.startswith('application/json') else data
+                    value = json.loads(data) if decode_json and typ.startswith('application/json') else data
                     return response.status, value, dict(response.getheaders())
                 finally:
                     conn.close()
@@ -180,6 +181,15 @@ def run():
                     config = json.loads((channels / f'{sid}.json').read_text())
                     channel_id = int(config['channel_id'])
                     agent = create_client(events, principal=9002, token=agent_token, channel_id=channel_id)
+                    # A newly created Channel already has a system event. Chat hides it while
+                    # retaining the raw cursor, so an empty business page can still advance.
+                    initial_raw = events.fetch(9001, user_token, from_seq=int(session['scan_start_seq']),
+                                               limit=1, channels=[channel_id])
+                    assert initial_raw.messages and initial_raw.messages[0].principal == 0
+                    initial_history = api('GET', base + f'/history?fetch_seq={session["scan_start_seq"]}&limit=1')
+                    assert initial_history == {'events': [], 'next_seq': str(initial_raw.next_seq),
+                                               'last_seq': str(initial_raw.last_seq)}
+                    assert int(initial_history['next_seq']) > int(session['scan_start_seq'])
                     assert upload(base, b'x', expected=409)['error']['code'] == 'session_not_initialized'
                     assert api('POST', base + '/cancellations', {'target_turn_id': 'not-started'},
                                expected=409)['error']['code'] == 'session_not_initialized'
@@ -264,6 +274,25 @@ def run():
                     second_base = f'/api/chat/sessions/{second["session_id"]}'
                     assert api('POST', second_base + '/submissions', {'count': '1'}, expected=201)['start'] == '1'
                     api('POST', second_base + '/turns', {'submission_id': '1', 'text': '', 'attachments': [oid]}, expected=409)
+                    # SDK reads, recovery and HTTP forwarding keep extension numbers
+                    # and nested JSON intact without decoding them into Python values.
+                    opaque_text = ('{ "large":1e400, "precise":0.12345678901234567890123456789, "deep":'
+                                   + '[' * 2000 + '0' + ']' * 2000 + ' }')
+                    second_config = json.loads((channels / f'{second["session_id"]}.json').read_text())
+                    with create_client(events, principal=9002, token=agent_token,
+                                       channel_id=int(second_config['channel_id'])) as opaque_chat:
+                        opaque_writer = opaque_chat.start_turn(turn_id='opaque', extensions=RawExtensions(opaque_text))
+                        opaque_seq = opaque_writer.creation_seq
+                        del opaque_writer
+                        parsed = opaque_chat.fetch_page(opaque_seq, limit=1).messages[0]
+                        assert parsed.payload['extensions'].json_text == opaque_text
+                        resumed_opaque = opaque_chat.resume_turn('opaque', state_start_seq=int(second['scan_start_seq']))
+                        resumed_opaque.complete()
+                        status, raw_page, _ = request('GET', second_base + f'/history?fetch_seq={opaque_seq}&limit=1',
+                                                     decode_json=False)
+                        assert status == 200
+                        assert b'"extensions":' + opaque_text.encode() in raw_page
+                        assert b'"publisher_role":"agent"' in raw_page
                     pending_request = new_ulid()
                     with ThreadPoolExecutor(max_workers=3) as pool:
                         creations = list(pool.map(lambda _: request('POST', '/api/chat/sessions',
@@ -288,6 +317,10 @@ def run():
                     assert pending_session in api('GET', '/api/chat/sessions')['sessions']
                     assert api('POST', '/api/chat/sessions', {'create_request_id': pending_request}) == pending_session
                     api('POST', base + '/turns', send_body, expected=409)
+                    # Previously committed attachments remain readable before allocating a
+                    # batch in this process; only operations that write require preparation.
+                    assert api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}')['nbytes'] == len(file_data)
+                    assert api('GET', base + f'/attachments/{oid}?event_seq={creation}') == file_data
                     fresh = api('POST', base + '/submissions', {'count': '1'}, expected=201)
                     assert fresh == {'start': expected_next, 'end': expected_next}
                     api('POST', base + '/turns', {'submission_id': fresh['start'], 'text': '', 'attachments': [oid]}, expected=409)

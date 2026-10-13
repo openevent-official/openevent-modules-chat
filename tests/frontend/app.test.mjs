@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {FileInfoStore} from '../../src/openevent/chat_app/static/state.mjs';
 
 // A small DOM boundary lets the real entry module exercise its HTTP and lifecycle
 // logic without a browser dependency. Projection and timer races have separate tests.
@@ -134,6 +135,87 @@ test('session titles and quoted replies retain their existing whitespace and len
   assert.equal(ui.get('session-title').textContent, expectedTitle);
   const quote = findElement(ui.get('messages'), element => element.className === 'quoted-reply');
   assert.equal(quote.textContent, `你：${fullText.slice(0, 80)}`);
+  ui.get('logout').click();
+});
+
+test('session titles inspect only new candidates across 1000 attachment-only pages', async () => {
+  const count = 1000;
+  let histories = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.includes('/history?')) {
+      const seq = ++histories;
+      return ok({events: [historyEvent(seq, {
+        kind: 'turn.single', turn_id: `title-candidate-${seq}`, reply_to_seqs: [],
+        content: seq > count ? [{type: 'text', text: '终于有正文'}] : seq % 2 ? [] : [{type: 'text', text: ' \t'}],
+      }, 'user', [{object_id: '42'}])], next_seq: String(seq + 1), last_seq: String(Math.max(count, seq))});
+    }
+    if (call.url.includes('/metadata?')) return ok({object_id: '42', name: '文件.txt', type: 'text/plain', description: '', nbytes: 4});
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  let turnReads = 0;
+  const get = Map.prototype.get;
+  Map.prototype.get = function(key) {
+    const value = get.call(this, key);
+    if (value?.role === 'user' && value.id?.startsWith('title-candidate-')) turnReads++;
+    return value;
+  };
+  try {
+    await load('incremental-title-candidates');
+    while (histories < count) { ui.runTimer(0); await flush(); }
+    await flush();
+    assert.equal(ui.get('session-title').textContent, `会话 ${SID.slice(-6)}`);
+    assert.ok(turnReads < count * 4, `expected linear history access, got ${turnReads} turn reads`);
+    const previousReads = turnReads;
+    ui.runTimer(1000); await until(() => ui.get('session-title').textContent === '终于有正文');
+    assert.ok(turnReads - previousReads < 4, 'the first text title must not revisit the 1000 empty candidates');
+    const beforeRender = turnReads;
+    findElement(ui.get('messages').children.at(-1), element => element.tagName === 'BUTTON' && element.textContent === '回复').click();
+    await flush();
+    assert.ok(turnReads - beforeRender < 4, 'a local control update must reuse the title');
+  } finally { Map.prototype.get = get; ui.get('logout').click(); }
+});
+
+test('titles follow the earliest nonempty user turn through resets and out-of-order changes', async () => {
+  const text = value => value ? [{type: 'text', text: value}] : [];
+  const creation = (seq, id, value, role = 'user') => historyEvent(seq, {
+    kind: 'turn.start', turn_id: id, content: text(value), reply_to_seqs: [],
+  }, role);
+  const change = (seq, id, pre, value, kind = 'turn.reset') => historyEvent(seq, {
+    kind, turn_id: id, pre_seq: String(pre), content: text(value),
+  }, 'user');
+  const pages = [
+    historyPage([creation(1, 'early', ''), creation(2, 'agent', '不作为标题', 'agent'),
+      creation(3, 'middle', '中间'), creation(4, 'late', '最后')], 5),
+    historyPage([change(5, 'middle', 3, '')], 6),
+    historyPage([change(6, 'early', 1, '最早', 'turn.append')], 7),
+    historyPage([change(7, 'early', 6, ' \t')], 8),
+    historyPage([change(8, 'late', 4, '')], 9),
+    historyPage([change(9, 'late', 8, '较晚恢复'), change(10, 'middle', 5, '中间恢复'), change(11, 'early', 7, '最早恢复')], 12),
+    historyPage([change(12, 'early', 11, ''), change(13, 'middle', 10, '')], 14),
+    historyPage([change(14, 'middle', 13, '中间再次恢复'), change(15, 'early', 12, '最早再次恢复')], 16),
+    historyPage([change(16, 'early', 15, '不能部分提交'), change(17, 'middle', 1, '错误前驱')], 18),
+  ];
+  let histories = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.includes('/history?')) return ok(pages[histories++]);
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('title-source-transfers');
+  assert.equal(ui.get('session-title').textContent, '中间');
+  const entry = ui.get('sessions').children[0];
+  for (const expected of ['最后', '最早', '最后', `会话 ${SID.slice(-6)}`, '最早恢复', '较晚恢复', '最早再次恢复']) {
+    ui.runTimer(1000); await until(() => ui.get('session-title').textContent === expected);
+    assert.equal(ui.get('sessions').children[0], entry);
+    assert.equal(entry.textContent, expected);
+  }
+  ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === '读取已停止');
+  assert.ok(ui.get('message-error').textContent.includes('消息链前驱不正确'));
+  assert.equal(ui.get('session-title').textContent, '最早再次恢复', 'a rejected page must not change the title');
+  assert.equal(entry.textContent, '最早再次恢复');
   ui.get('logout').click();
 });
 
@@ -744,7 +826,7 @@ test('hiding a page pauses the same-id POST until a back-forward-cache restore',
   ui.get('logout').click();
 });
 
-test('initialization waits 120 seconds, ignores a late allocation and only enables the current retry', async () => {
+test('initialization keeps local drafting available but only the current allocation enables sending', async () => {
   const allocations = [];
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
@@ -757,16 +839,20 @@ test('initialization waits 120 seconds, ignores a late allocation and only enabl
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('initialization-timeout');
-  assert.equal(ui.get('message-input').disabled, true); assert.equal(ui.get('choose-files').disabled, true);
+  assert.equal(ui.get('message-input').disabled, false); assert.equal(ui.get('choose-files').disabled, true);
   assert.equal(ui.get('send').disabled, true); assert.equal(allocations.length, 1);
+  typeAndSend(ui, '等待期间写好的草稿'); await flush();
+  assert.equal(ui.calls.some(call => call.url.endsWith('/turns')), false);
   ui.runTimer(120000); await flush();
   assert.match(ui.get('submission-status').textContent, /正在重试/);
   for (let index = 0; allocations.length < 2 && index < 4; index++) { ui.runTimer(1000); await flush(); }
   allocations[0](ok({start: '1', end: '100'}, 201)); await flush();
-  assert.equal(ui.get('message-input').disabled, true);
+  assert.equal(ui.get('message-input').disabled, false); assert.equal(ui.get('send').disabled, true);
+  assert.equal(ui.get('message-input').value, '等待期间写好的草稿');
   allocations[1](ok({start: '101', end: '200'}, 201)); await until(() => !ui.get('send').disabled);
-  typeAndSend(ui, '初始化后的消息'); await until(() => ui.get('submission-status').textContent === '消息已发送');
-  assert.equal(JSON.parse(ui.calls.find(call => call.url.endsWith('/turns')).body).submission_id, '101');
+  ui.get('composer').dispatch('submit'); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  const sent = JSON.parse(ui.calls.find(call => call.url.endsWith('/turns')).body);
+  assert.equal(sent.submission_id, '101'); assert.equal(sent.text, '等待期间写好的草稿');
   assert.ok(ui.calls.filter(call => call.url.endsWith('/submissions')).every(call => JSON.parse(call.body).count === '100'));
   ui.get('logout').click(); assert.equal(ui.timers.size, 0);
 });
@@ -787,9 +873,58 @@ test('recovery discards an earlier allocation and only the new preparation respo
   ui.runTimer(1000); await until(() => allocations.length === 2);
   assert.equal(allocations[0].signal.aborted, true);
   allocations[0].resolve(ok({start: '1', end: '100'}, 201)); await flush();
-  for (const id of ['message-input', 'choose-files', 'file-input', 'send']) assert.equal(ui.get(id).disabled, true);
+  assert.equal(ui.get('message-input').disabled, false);
+  for (const id of ['choose-files', 'file-input', 'send']) assert.equal(ui.get(id).disabled, true);
   allocations[1].resolve(ok({start: '10001', end: '10100'}, 201)); await until(() => !ui.get('send').disabled);
   assert.equal(ui.get('message-input').disabled, false);
+  ui.get('logout').click();
+});
+
+test('waiting or failed allocation permits reply edits and committed attachment reads, keeping writes gated', async () => {
+  let finishAllocation; let finishDownload; let metadataRequests = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) return ok(historyPage([historyEvent(1, {
+      kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '回答'}], reply_to_seqs: [],
+    }, 'agent', [{object_id: '42'}])], 2));
+    if (call.url.endsWith('/submissions')) return new Promise(resolve => { finishAllocation = resolve; });
+    if (call.url.includes('/metadata?')) {
+      if (++metadataRequests === 1) return err(503, 'temporarily_unavailable');
+      return ok({object_id: '42', name: '附件.txt', type: 'text/plain', description: '', nbytes: 4});
+    }
+    if (call.url.includes('/attachments/42?')) return new Promise(resolve => { finishDownload = resolve; });
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('read-during-preparation');
+  await until(() => ui.get('messages').textContent.includes('重试信息'));
+  const article = ui.get('messages').children[0];
+  const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '回复');
+  const cancel = findElement(article, element => element.textContent === '停止输出');
+  assert.equal(reply.disabled, false); assert.equal(cancel.disabled, true);
+  reply.click(); await flush(); assert.equal(ui.get('reply-selection').children.length, 1);
+  assert.equal(ui.get('reply-selection').children[0].disabled, false);
+  ui.get('reply-selection').children[0].click(); await flush();
+  assert.equal(ui.get('reply-selection').children.length, 0);
+  reply.click(); await flush();
+  typeAndSend(ui, '还没领到号也能写'); cancel.click();
+  ui.get('file-input').files = [new File(['data'], '待上传.txt')]; ui.get('file-input').dispatch('change');
+  await flush();
+  assert.equal(ui.calls.some(call => /\/(turns|cancellations|attachments)$/.test(call.url)), false);
+  assert.equal(ui.get('send').disabled, true); assert.equal(ui.get('choose-files').disabled, true);
+  const retry = findElement(article, element => element.textContent === '重试信息');
+  assert.equal(retry.disabled, false); retry.click();
+  await until(() => article.textContent.includes('附件.txt'));
+  const download = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '下载');
+  assert.equal(download.disabled, false); download.click(); await until(() => !!finishDownload);
+  assert.equal(download.disabled, true);
+  finishDownload(new Response('data', {headers: {'Content-Type': 'application/octet-stream',
+    'Content-Disposition': 'attachment; filename="attachment.txt"', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store'}}));
+  await until(() => !download.disabled);
+  finishAllocation(err(409, 'submission_id_exhausted'));
+  await until(() => ui.get('submission-status').textContent.includes('submission_id_exhausted'));
+  assert.equal(ui.get('message-input').disabled, false); assert.equal(ui.get('message-input').value, '还没领到号也能写');
+  assert.equal(reply.disabled, false); assert.equal(download.disabled, false);
+  assert.equal(ui.get('send').disabled, true); assert.equal(cancel.disabled, true);
   ui.get('logout').click();
 });
 
@@ -1091,6 +1226,55 @@ test('a long history leaves unrelated attachments untouched during local message
   await until(() => cancel.textContent === '等待取消结果'); assert.equal(unrelatedUpdates, 0);
   assert.equal(ui.calls.filter(call => call.url.includes('/metadata?')).length, 2);
   ui.get('logout').click();
+});
+
+test('one long turn touches only new or changed attachments during text, reply and metadata updates', async () => {
+  let histories = 0; let finishMetadata;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.includes('/history?')) {
+      if (++histories === 1) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '正文'}], reply_to_seqs: [],
+      }, 'agent', [...Array.from({length: 1000}, () => ({object_id: '42'})), {object_id: '43'}])], 2));
+      return ok(historyPage([historyEvent(histories, {
+        kind: histories === 4 ? 'turn.end' : 'turn.append', turn_id: 'answer', pre_seq: String(histories - 1),
+        ...(histories === 4 ? {} : {content: [{type: 'text', text: '追加'}]}),
+      }, 'agent', histories === 3 ? [{object_id: '44'}] : [])], histories + 1));
+    }
+    if (call.url.includes('/attachments/43/metadata?')) return new Promise(resolve => { finishMetadata = resolve; });
+    if (call.url.includes('/metadata?')) {
+      const id = /attachments\/(\d+)/.exec(call.url)[1];
+      return ok({object_id: id, name: `${id}.txt`, type: 'text/plain', description: '', nbytes: 4});
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('single-turn-attachment-increments');
+  await until(() => !!finishMetadata && ui.get('messages').textContent.includes('42.txt')); await flush();
+  const article = ui.get('messages').children[0];
+  const content = findElement(article, element => element.className === 'turn-content');
+  const text = content.children[0];
+  const attachments = article.children.filter(element => element.className === 'attachment');
+  let oldReads = 0;
+  const get = FileInfoStore.prototype.get;
+  FileInfoStore.prototype.get = function(id) { if (id === '42') oldReads++; return get.call(this, id); };
+  try {
+    ui.runTimer(1000); await until(() => text.textContent === '正文追加');
+    assert.equal(oldReads, 0, 'text append must not inspect the 1000 old attachments');
+    const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '回复');
+    reply.click(); await flush(); assert.equal(reply.textContent, '已选回复');
+    assert.equal(oldReads, 0, 'reply selection must not inspect the old attachments');
+    finishMetadata(ok({object_id: '43', name: '43.txt', type: 'text/plain', description: '', nbytes: 4}));
+    await until(() => attachments.at(-1).textContent.includes('43.txt'));
+    assert.equal(oldReads, 0, 'one metadata result must only update that object’s attachment views');
+    ui.runTimer(1000); await until(() => article.textContent.includes('44.txt'));
+    assert.equal(oldReads, 0, 'adding an attachment must not inspect older ones');
+    ui.runTimer(1000); await until(() => findElement(article, element => element.className === 'turn-state').hidden);
+    assert.equal(oldReads, 0, 'ending a turn must not inspect its old attachments');
+    assert.equal(ui.get('messages').children[0], article); assert.equal(content.children[0], text);
+    assert.deepEqual(article.children.filter(element => element.className === 'attachment').slice(0, 1001), attachments);
+    assert.equal(text.textContent, '正文追加追加');
+  } finally { FileInfoStore.prototype.get = get; ui.get('logout').click(); }
 });
 
 test('local append and reset refresh dependent quotes, draft previews and titles without touching unrelated files', async () => {

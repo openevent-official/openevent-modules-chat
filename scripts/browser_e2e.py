@@ -11,7 +11,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         from playwright.sync_api import sync_playwright, expect
     except ImportError:
         raise RuntimeError('Browser E2E requires an installed playwright package and Chromium') from None
-    from openevent.chat_sdk import ObjectKey, TextPart, create_client
+    from openevent.chat_sdk import ObjectKey, RawExtensions, TextPart, create_client
 
     with sync_playwright() as runtime:
         launch = {'headless': True}
@@ -37,14 +37,15 @@ def run_browser(origin, web_token, events, agent_token, channels):
                 page.locator('#new-session').click()
         session = created.value.json()
         sid = session['session_id']
-        expect(page.locator('#message-input')).to_be_disabled()
+        expect(page.locator('#message-input')).to_be_enabled()
         expect(page.locator('#file-input')).to_be_disabled()
         expect(page.locator('#send')).to_be_disabled()
+        page.locator('#message-input').fill('浏览器发出的消息 <b>按纯文本显示</b>')
         assert len(allocations) == 1
         allocations[0].continue_()
         page.unroute('**/submissions', hold_allocation)
         expect(page.locator('#message-input')).to_be_enabled()
-        page.locator('#message-input').fill('浏览器发出的消息 <b>按纯文本显示</b>')
+        expect(page.locator('#message-input')).to_have_value('浏览器发出的消息 <b>按纯文本显示</b>')
         page.locator('#file-input').set_input_files({'name': 'browser.txt', 'mimeType': 'text/plain', 'buffer': b'browser attachment'})
         expect(page.locator('#draft-files')).to_contain_text('已上传')
         metadata_requests = []
@@ -94,7 +95,10 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('.turn-replies')).to_have_count(1)
         config = json.loads((channels / f'{sid}.json').read_text())
         agent = create_client(events, principal=9002, token=agent_token, channel_id=int(config['channel_id']))
-        writer = agent.start_turn(turn_id='browser-stream')
+        # Extension values never participate in browser projection or rendering.
+        opaque = RawExtensions('{"large":1e400,"precise":0.12345678901234567890123456789,"deep":'
+                               + '[' * 2000 + '0' + ']' * 2000 + '}')
+        writer = agent.start_turn(turn_id='browser-stream', extensions=opaque)
         agent_turn = page.locator('.turn.agent')
         expect(agent_turn).to_have_count(1)
         expect(agent_turn.locator('.turn-content')).to_have_text('')
@@ -166,10 +170,43 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('.turn.user')).to_have_count(4)
 
         second = context.new_page()
+        second_allocations = []
+        second.route('**/submissions', lambda route: second_allocations.append(route))
+        metadata_attempts = []
+        def fail_first_metadata(route):
+            metadata_attempts.append(route.request.url)
+            if len(metadata_attempts) == 1:
+                route.fulfill(status=503, content_type='application/json', body=json.dumps({
+                    'error': {'code': 'request_failed', 'message': '文件信息暂时不可用'}}))
+            else:
+                route.continue_()
+        second.route('**/metadata?*', fail_first_metadata)
         second.goto(origin + '/api/chat/')
         expect(second.locator('#workspace')).to_be_visible()
         expect(second.locator('.turn.user')).to_have_count(4)
+        expect(second.locator('#message-input')).to_be_enabled()
+        expect(second.locator('#file-input')).to_be_disabled()
+        expect(second.locator('#send')).to_be_disabled()
+        second.locator('#message-input').fill('编号准备期间的草稿')
+        second.locator('.turn .reply-action').first.click()
+        expect(second.locator('#reply-selection .reply-chip')).to_have_count(1)
+        second.locator('#reply-selection .reply-chip').click()
+        expect(second.locator('#reply-selection')).to_be_empty()
+        second.get_by_role('button', name='重试信息').click()
         expect(second.locator('.attachment')).to_contain_text('browser.txt')
+        assert len(metadata_attempts) == 2, metadata_attempts
+        with second.expect_download() as downloading:
+            second.locator('.attachment button').filter(has_text='下载').click()
+        with tempfile.TemporaryDirectory() as target:
+            saved = Path(target) / 'download'
+            downloading.value.save_as(saved)
+            assert saved.read_bytes() == b'browser attachment'
+        expect(second.locator('#message-input')).to_have_value('编号准备期间的草稿')
+        assert len(second_allocations) == 1
+        second_allocations[0].continue_()
+        second.unroute('**/submissions')
+        second.unroute('**/metadata?*', fail_first_metadata)
+        expect(second.locator('#send')).to_be_enabled()
         expect(second.locator('.turn.agent')).to_contain_text('已取消')
         page.set_viewport_size({'width': 390, 'height': 844})
         expect(page.locator('#send')).to_be_visible()

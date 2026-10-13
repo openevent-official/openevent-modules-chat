@@ -329,6 +329,9 @@ class ChatProtocolClient:
             raise error_type(failure) from None
         messages = []
         for raw in raw_messages:
+            # System messages share the Channel and cursor, but not chat.v1 payloads.
+            if type(getattr(raw, "principal", None)) is int and raw.principal == 0:
+                continue
             try:
                 messages.append(parse_message(raw))
             except ChatProtocolError:

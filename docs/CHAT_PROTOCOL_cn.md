@@ -105,6 +105,7 @@ payload 中引用 OpenEvent seq 的位置包括 `pre_seq` 和 `reply_to_seqs` �
 
 未知 payload 顶层字段不属于 `chat.v1`。应用数据必须放在 `extensions` 中。扩展值可以是任意 JSON value，但必须仍是
 参与者可见的元数据，不得重新定义 `kind`、`turn_id`、`pre_seq`、`reply_to_seqs`、`reserved_through`、TurnRef、回复、内容、终态或编号预留语义。
+基础读取者只需确认扩展是合法 JSON object，不需要把其中的值转换成所在语言的数值或对象；转发时应保留扩展数据，具体解释由应用负责。
 
 payload 大小上限由 OpenEvent 部署控制，`chat.v1` 不定义第二套字节上限。
 

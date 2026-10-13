@@ -13,8 +13,25 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from multipart import MultipartError, MultipartSegment, PushMultipartParser, parse_options_header
 
+from openevent.chat_sdk import serialize_payload
+
 from .config import strict_json
 from .service import AppError, bad_request
+
+
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
+def _history_bytes(page):
+    # The event envelope contains only application fields. Its payload may carry
+    # opaque extension JSON, which must bypass the ordinary JSON encoder.
+    events = []
+    for event in page["events"]:
+        envelope = _json_bytes({key: value for key, value in event.items() if key != "payload"})
+        events.append(envelope[:-1] + b',"payload":' + serialize_payload(event["payload"]) + b'}')
+    cursors = _json_bytes({"next_seq": page["next_seq"], "last_seq": page["last_seq"]})
+    return cursors[:-1] + b',"events":[' + b','.join(events) + b']}'
 
 
 class ChatHTTPServer(ThreadingHTTPServer):
@@ -96,8 +113,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
 
     def _json(self, status, value):
-        content = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        self._bytes(status, content, "application/json; charset=utf-8")
+        self._bytes(status, _json_bytes(value), "application/json; charset=utf-8")
 
     def _static(self, name):
         if "/" in name or "\\" in name or name.startswith("."):
@@ -223,7 +239,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             limit_text = query.get("limit", "100")
             if not re.fullmatch(r"[1-9][0-9]*", limit_text):
                 raise bad_request("invalid history limit")
-            self._json(200, service.history(sid, query["fetch_seq"], int(limit_text)))
+            page = service.history(sid, query["fetch_seq"], int(limit_text))
+            self._bytes(200, _history_bytes(page), "application/json; charset=utf-8")
             return
         if self.command == "GET" and operation == "attachments" and (len(parts) == 4 or len(parts) == 5 and parts[4] == "metadata"):
             query = self._query(parsed.query, {"event_seq"})

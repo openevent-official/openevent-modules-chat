@@ -107,6 +107,8 @@ turn chain. Section 11 defines reply targets and reply semantics.
 Unknown top-level payload fields are not part of `chat.v1`. Application data must be placed in `extensions`. Extension values may be any JSON value, but must
 remain participant-visible metadata and must not redefine `kind`, `turn_id`, `pre_seq`, `reply_to_seqs`, `reserved_through`, TurnRef, reply, content, terminal-state,
 or number-reservation semantics.
+Base readers need only establish that extensions form a valid JSON object; they need not convert its values into their language's numbers or objects. Forwarding
+must preserve extension data, whose interpretation belongs to the application.
 
 The OpenEvent deployment controls the payload size limit; `chat.v1` does not define a second byte limit.
 

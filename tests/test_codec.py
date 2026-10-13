@@ -3,6 +3,7 @@ import unittest
 
 import grpc
 from openevent.sdk.proto import openevent_pb2 as pb
+from openevent.chat_sdk import RawExtensions, serialize_payload
 from openevent.chat_sdk.codec import encode_payload, parse_message, UINT64_MAX
 from openevent.chat_sdk.errors import ChatProtocolError, make_failure, ClientFailedError, ClientClosedError
 
@@ -18,7 +19,9 @@ class CodecTests(unittest.TestCase):
                    'reply_to_seqs': [UINT64_MAX, 1], 'extensions': {'nested': [None, True]}}
         message = parse_message(self.event(encode_payload(payload), recipients=[2, 2, 1],
             object_keys=[pb.ObjectKey(object_id=3, object_token='secret')] * 2))
-        self.assertEqual(message.payload, payload)
+        self.assertEqual(message.payload['extensions'].json_text, '{"nested":[null,true]}')
+        self.assertEqual({k: v for k, v in message.payload.items() if k != 'extensions'},
+                         {k: v for k, v in payload.items() if k != 'extensions'})
         self.assertEqual(message.recipients, (2, 2, 1))
         self.assertEqual(len(message.object_keys), 2)
         self.assertNotIn('secret', repr(message))
@@ -26,6 +29,84 @@ class CodecTests(unittest.TestCase):
     def test_no_reply_history_validation(self):
         payload = {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': [99]}
         self.assertEqual(parse_message(self.event(payload)).payload, payload)
+
+    def test_opaque_extensions_preserve_numbers_whitespace_and_escaped_values(self):
+        raw = ('{ "large": 1e400, "precise": 0.123456789012345678901234567890, '
+               '"integer": ' + '9' * 5000 + ', "negativeZero": -0, '
+               '"text": "} ] \\\" \\u4e2d", "nested": [null, true, false] }')
+        prefix = '"kind":"turn.single","turn_id":"t","content":[],"reply_to_seqs":[]'
+        for wire in ('{"extensions":' + raw + ',' + prefix + '}',
+                     '{' + prefix + ',"extens\\u0069ons":' + raw + '}',
+                     '{"kind":"turn.single","extensions":' + raw + ','
+                     '"turn_id":"t","content":[],"reply_to_seqs":[]}'):
+            with self.subTest(position=wire[:30]):
+                parsed = parse_message(self.event(wire.encode()))
+                extension = parsed.payload['extensions']
+                self.assertIsInstance(extension, RawExtensions)
+                self.assertEqual(extension.json_text, raw)
+                self.assertIn(('"extensions":' + raw).encode(), encode_payload(parsed.payload))
+
+    def test_raw_extensions_validate_object_syntax_and_are_immutable(self):
+        raw = RawExtensions(' \n{ "secret": 1e400 }\t')
+        self.assertEqual(raw.json_text, ' \n{ "secret": 1e400 }\t')
+        self.assertNotIn('secret', repr(raw))
+        with self.assertRaises(AttributeError):
+            raw.json_text = '{}'
+        invalid = [None, {}, b'{}', '', '[]', 'null', '{}{}', '{"x":NaN}',
+                   '{"x":Infinity}', '{"x":-Infinity}', '{"x":01}', '{"x":1e}',
+                   '{"x":1.}', '{"x":+1}', '{"x":.1}', '{"x":١}',
+                   '{"x":true false}', '{"x":undefined}', '{"x":1,}',
+                   '{"x":[1,]}', '{"x":[,1]}', '{"x":[1 2]}',
+                   '{"x" 1}', '{"x":}', '{"x":1 "y":2}', '{"x":"\\q"}',
+                   '{"x":"\\u12xz"}', '{"x":"\n"}', '{"x":"\ud800"}',
+                   '{\u00a0"x":1}', '{"x":[1}', '{"x":{"a":1]',
+                   '{"x":"unterminated}', '{"x":"\\', '{"x":truex}']
+        for text in invalid:
+            with self.subTest(text=repr(text)):
+                with self.assertRaises(ChatProtocolError):
+                    RawExtensions(text)
+
+    def test_extension_values_are_opaque_including_duplicate_keys_and_unicode_escapes(self):
+        raw = r'{"x":1,"x":2,"\u0078":3,"nested":{"a":1,"a":2},"text":"\ud800"}'
+        extension = RawExtensions(raw)
+        payload = {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1, 'extensions': extension}
+        parsed = parse_message(self.event(encode_payload(payload)))
+        self.assertEqual(parsed.payload['extensions'].json_text, raw)
+
+    def test_deep_extensions_do_not_depend_on_python_recursion_limit(self):
+        raw = '{"nested":' + '[{"x":' * 3000 + '1e400' + '}]' * 3000 + '}'
+        payload = {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1,
+                   'extensions': RawExtensions(raw)}
+        encoded = encode_payload(payload)
+        parsed = parse_message(self.event(encoded))
+        self.assertEqual(parsed.payload['extensions'].json_text, raw)
+        self.assertEqual(encode_payload(parsed.payload), encoded)
+
+    def test_necessary_fields_keep_strict_validation(self):
+        invalid = [
+            b'{"kind":"turn.end","turn_id":"t","pre_seq":1e400}',
+            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":[]}',
+            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":{},"extens\\u0069ons":{}}',
+            b'{"kind":"turn.cancel","target_turn":{"principal":1,"turn_id":"t","principal":2}}',
+            b'{"kind":"turn.single","turn_id":"t","reply_to_seqs":[],"content":[{"type":"text","text":"a","text":"b"}]}',
+            b'{"kind":"turn.end","turn_id":"\\ud800","pre_seq":1}',
+            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":{"x":1e}}',
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ChatProtocolError):
+                    parse_message(self.event(payload))
+
+    def test_serialize_payload_preserves_raw_extensions_after_public_field_conversion(self):
+        raw = RawExtensions('{ "x": 1e400, "x": -0 }')
+        payload = {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': str(UINT64_MAX),
+                   'extensions': raw}
+        encoded = serialize_payload(payload)
+        self.assertEqual(encoded, ('{"kind":"turn.end","turn_id":"t","pre_seq":"'
+                                  + str(UINT64_MAX) + '","extensions":'
+                                  + raw.json_text + '}').encode())
+        with self.assertRaises(ChatProtocolError):
+            encode_payload(payload)
 
     def test_seven_kinds_and_empty_content_rules(self):
         good = [
@@ -127,6 +208,13 @@ class CodecTests(unittest.TestCase):
             parse_message(message)
         with self.assertRaises(ChatProtocolError):
             encode_payload({'kind': 'turn.cancel', 'target_turn': {'principal': 0, 'turn_id': 't'}})
+
+    def test_parse_message_does_not_parse_or_hide_system_events(self):
+        message = self.event({'kind': 'system.member_added', 'data': {
+            'schema_version': 1, 'member': 2}})
+        message.principal = 0
+        with self.assertRaises(ChatProtocolError):
+            parse_message(message)
 
 
 if __name__ == '__main__':

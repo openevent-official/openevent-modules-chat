@@ -55,12 +55,13 @@ See the [application usage guide](docs/APP_USAGE.md) for configuration, usage, a
 - business-level idempotency, retries, or handling of invalid history.
 
 Applications may attach OpenEvent ObjectKeys to turn events and store user-visible application metadata in the protocol's `extensions` object.
+The Python SDK preserves extensions read from messages as source text; see the [extension API](docs/CHAT_SDK.md#22-raw-extensions-and-serialization) to interpret or forward them.
 The base protocol supports only text content parts and does not allow event kinds beyond the seven listed above.
 
 ## Runtime requirements
 
 - An OpenEvent server supporting Channels, event history, and Fetch.
-- The Python SDK requires `openevent-sdk>=0.11.1` installed in the current environment; the current reference SDK version is `0.11.1`.
+- The Python SDK requires `openevent-sdk>=0.11.1` installed in the current environment; the current reference SDK version is `0.12.0`.
 - An OpenEvent server supporting message UUIDs, as defined in the OpenEvent API documentation.
 - Direct SDK use requires a non-system Channel with `protocol="chat.v1"` created beforehand; the browser application creates Channels automatically.
 

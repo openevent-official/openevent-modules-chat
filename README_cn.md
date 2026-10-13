@@ -66,12 +66,13 @@ turn 的终态不会被后续事件改变，完整规则见[协议第 10 节](do
 - 业务级幂等、重试或非法历史处理策略。
 
 应用可以在 turn 事件上附加 OpenEvent ObjectKey，也可以在协议的 `extensions` 对象中保存用户可见的应用元数据。
+Python SDK 将读取到的扩展作为原文保留；需要解释或转发时见[扩展 API](docs/CHAT_SDK_cn.md#22-扩展原文与序列化)。
 基础协议只支持文本 content part，不允许增加上述七种之外的事件 kind。
 
 ## 运行前提
 
 - 支持 Channel、事件历史和 Fetch 的 OpenEvent server。
-- Python SDK 需要当前环境已安装 `openevent-sdk>=0.11.1`；当前参考 SDK 为 `0.11.1`。
+- Python SDK 需要当前环境已安装 `openevent-sdk>=0.11.1`；当前参考 SDK 为 `0.12.0`。
 - 支持消息 UUID 的 OpenEvent server，具体以 OpenEvent API 文档为准。
 - 直接使用 SDK 时，需提前创建 `protocol="chat.v1"` 的非系统 Channel；浏览器应用会自动创建。
 

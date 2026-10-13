@@ -11,7 +11,7 @@ The Chat Python SDK provides `chat.v1` publishing, one-page-at-a-time Fetch read
 
 The SDK requires Python 3.10 or later, `openevent-sdk>=0.11.1` installed in the current environment, and an existing Channel that the caller can read with `protocol="chat.v1"`. It uses an injected public OpenEvent client; it neither installs the SDK from source nor generates protobuf modules.
 
-`CHAT_PROTOCOL.md` defines payload fields and turn semantics. The OpenEvent API documentation defines authentication, ACL, Fetch, UUID, ObjectKey, and gRPC status semantics. The installed `0.11.1` SDK is the current reference; Python call shapes follow that version's public interfaces.
+`CHAT_PROTOCOL.md` defines payload fields and turn semantics. The OpenEvent API documentation defines authentication, ACL, Fetch, UUID, ObjectKey, and gRPC status semantics. SDK `0.12.0` is the current reference; Python call shapes follow that version's public interfaces.
 
 ## 2. Construction
 
@@ -37,7 +37,7 @@ The constructor and `create_client()` accept an optional `channel_validator`, de
 
 The SDK reads but does not modify the injected client's `timeout_ms`. It does not close that client or its gRPC channel.
 
-`parse_message(event_message)` is a public stateless parser. It strictly parses one OpenEvent `EventMessage` into `ParsedMessage`, validating its `chat.v1` JSON and basic fields. It does not maintain cross-event turn state, perform Fetch, or determine application roles. Applications that page through a bounded history range should reuse this function instead of implementing another payload parser.
+`parse_message(event_message)` is a public stateless parser. It strictly parses one nonsystem Chat `EventMessage` into `ParsedMessage`, validating its `chat.v1` JSON and basic fields. It does not maintain cross-event turn state, perform Fetch, or determine application roles. Applications reading OpenEvent history directly must first exclude system messages according to the [OpenEvent system protocol](../openevent-sdk/docs/SYSTEM_PROTOCOL.md), then reuse this function. Passing a system message still raises `ChatProtocolError`.
 
 `ParsedMessage.payload` also supports the `submission.reserve` control event. `kind` distinguishes event types, and `reserved_through` remains a Python `int`. Field validity follows the [public protocol](CHAT_PROTOCOL.md). This event has no turn identity, so callers must not assume every parsed message has `turn_id`.
 
@@ -52,11 +52,29 @@ for message in page.messages:
 print(page.next_seq, page.last_seq)
 ```
 
-`fetch_page()` reads the bound Channel with `only_my_recipient=false`. Each call performs one logical Fetch and does not read the next page automatically. Retries of the same RPC after temporary errors remain part of that logical call. The returned `FetchPage` contains `messages`, `next_seq`, and `last_seq`. The SDK validates Fetch pagination and ordering and parses every message, but does not save the page cursor or modify any writer. Callers continuing the read must use the returned `next_seq` as the next `from_seq`.
+`fetch_page()` reads the bound Channel with `only_my_recipient=false`. Each call performs one logical Fetch and does not read the next page automatically. Retries of the same RPC after temporary errors remain part of that logical call. The returned `FetchPage` contains `messages`, `next_seq`, and `last_seq`. The SDK first validates Fetch pagination, Channel, and ordering for the entire raw page, then skips OpenEvent system messages, parsing and returning only the remaining Chat messages. System payloads are not validated as `chat.v1`; nonsystem messages still undergo strict parsing. `next_seq` and `last_seq` retain their original response values and are not recalculated from filtered messages. A system-only page returns empty `messages`; callers must still continue from `next_seq` and must not treat an empty page as the tail. The SDK does not save the page cursor or modify any writer.
 
 `messages` includes parsed `submission.reserve` control events with their original seq values. The SDK does not remove them because they do not create turns.
 
 Applications needing continuous reads loop over `fetch_page()`, save `next_seq` after processing each page, and choose the wait and stopping policy at the tail. The SDK provides no subscription, message callback, scan-progress wait interface, or background polling task, and does not call OpenEvent `Subscribe`.
+
+### 2.2 Raw extensions and serialization
+
+The SDK parses only Chat base fields into Python values. When `ParsedMessage.payload` contains `extensions`, its value is the publicly exported
+`RawExtensions`, not a `dict`; other fields retain their existing types. `RawExtensions(json_text: str)` is an immutable wrapper for JSON object source text,
+available through its read-only `json_text` attribute. Construction checks valid JSON syntax and an outermost object, raising `ChatProtocolError` for invalid input.
+Extension values are not converted into numbers or nested Python objects and do not participate in Chat field, chain-tail, or terminal-state decisions.
+Valid JSON numbers such as `1e400` are therefore not rejected because of floating-point overflow.
+
+Parsing preserves the extension object's source text, including number notation, whitespace, and escapes; it does not promise to preserve the entire payload's
+source text. Applications that interpret extensions choose a JSON parsing method suitable for their data and apply it to `json_text`. Callers previously reading
+`payload["extensions"]` as a dictionary must adapt. Callers forwarding extensions use `RawExtensions` directly without decoding it.
+
+The public function `serialize_payload(payload: dict) -> bytes` encodes a payload as UTF-8 JSON, embedding a top-level `extensions` value of type
+`RawExtensions` as the original JSON object, not as a string. It only serializes; it does not validate Chat protocol fields, event validity, or turn state,
+so it also supports payloads whose fields have already been converted by Chat Server. `parse_message` and publishing methods retain their respective protocol
+validation responsibilities. Do not apply ordinary `json.dumps` directly to a payload containing `RawExtensions`, or decode and re-encode extensions to forward
+their original text.
 
 ## 3. Write API
 
@@ -97,7 +115,10 @@ A successful return from any publish method means OpenEvent has committed that e
 
 `start_turn` and `writer.append` both take `content: Iterable[TextPart] = ()`, supporting empty-content starts and attachment-only appends respectively. The SDK validates content and attachment combinations against [protocol section 4](CHAT_PROTOCOL.md#4-content-part). The requirement that each TextPart contain nonempty text remains unchanged; the SDK inserts no placeholder text.
 
-Every publish method accepts optional `recipients` and `extensions`. Recipients and ObjectKeys preserve caller order and duplicates; `extensions` must be a JSON object. The SDK rejects locally detectable invalid input before publishing.
+Every publish method accepts optional `recipients` and `extensions`. Recipients and ObjectKeys preserve caller order and duplicates. `extensions` accepts a `dict`
+representing an ordinary JSON object or the `RawExtensions` defined in section 2.2; `None` omits the field. Ordinary dictionaries use Python JSON encoding and
+cannot contain non-JSON values such as NaN or Infinity. Use `RawExtensions` to preserve original number notation or forward extensions already read.
+The SDK rejects locally detectable invalid input before publishing; parameter freezing and retries follow section 4.
 
 The SDK writes the caller's `reply_to_seqs` into the same-named JSON numeric array in input order, without sorting or automatic deduplication. Local checks cover field shape only: elements must be positive uint64 integers, excluding bool, with no duplicate seq values. Invalid input raises `ChatProtocolError`. The SDK does not call Fetch or GetStatus for reply references, verify target existence, Channel or event kind, or resolve seq values back into `TurnRef`. The caller selects valid targets: earlier `turn.single` or `turn.start` creation events in the same Channel; target turns may still be open. Complete target rules are defined in [protocol section 11](CHAT_PROTOCOL.md#11-reply-relationships).
 
@@ -137,7 +158,7 @@ The public signature is `resume_turn(turn_id: str, *, state_start_seq: int = 1) 
 
 Before recovery, callers must stop the old writer and confirm that all old requests for the turn have finished and cannot commit late. When a publish is uncertain, first confirm its original outcome or ensure that the original request cannot commit again. Dropping an unresolved writer and recovering does not bypass this requirement. The client does not register writers for a turn or coordinate their handoff.
 
-The SDK obtains one GetStatus watermark and pages through the fixed range from `state_start_seq`, using temporary state to recover only the target creation seq, tail, and terminal state. If the target remains writable, it returns a new `open` writer with `creation_seq` and `last_seq` set. Missing targets raise `TurnNotFoundError`; terminal targets raise `TurnWriterStateError`. Failure returns no writer and leaves no target state in the client. Recovery parses `submission.reserve` and advances its read position without treating it as a turn event.
+The SDK obtains one GetStatus watermark and pages through the fixed range from `state_start_seq`, using temporary state to recover only the target creation seq, tail, and terminal state. If the target remains writable, it returns a new `open` writer with `creation_seq` and `last_seq` set. Missing targets raise `TurnNotFoundError`; terminal targets raise `TurnWriterStateError`. Failure returns no writer and leaves no target state in the client. Recovery uses the same one-page reading rules in section 2.1, advancing past system messages and system-only pages. It parses `submission.reserve` and advances its read position without treating it as a turn event.
 
 Recovery recognizes effective `turn.reset` events according to the public protocol, advances the tail to their seq, and processes subsequent appends and terminal events. Reset neither changes the creation seq nor makes a terminal target writable. The recovered writer needs no body or attachment contents from before or after reset.
 

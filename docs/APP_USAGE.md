@@ -69,7 +69,8 @@ The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Co
 
 - Create, select, or switch sessions. Only the selected session updates messages automatically. Each tab works independently.
   On desktop and mobile, select Refresh to update the session list or retry a failed list request without clearing the current draft.
-- Text input, uploads, sends, and cancellation become available after session initialization. History can continue loading during initialization; failures display the cause and allow initialization to be retried.
+- During session initialization, edit draft text, select loaded messages as reply targets, download sent attachments, continue loading history, or manually retry file information.
+  Selecting files, uploading, starting a new send, requesting confirmation of a pending send again, and cancellation still require initialization to finish. Failures display the cause and allow initialization to be retried. An unconfirmed send keeps its draft locked, but loaded history can still confirm its success.
 - Enter text and optionally add files. Selected files upload immediately and must finish uploading before sending; each file must be between 1 byte and 4 MiB.
 - A file or its information failing validation rejects only that upload and does not stop the entire service.
 - Select existing messages as reply targets; multiple targets are supported. Streaming replies append in place. When retrying, the Agent can reset the same reply and replace its interrupted content with new output.

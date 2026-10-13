@@ -1172,3 +1172,30 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(restored, {"leaf": "完整保留"})
         for original, wire in zip(self.events.messages, snapshots):
             self.assertEqual(encode_payload(original.payload), wire)
+
+    def test_http_history_forwards_opaque_extensions_without_numeric_or_nesting_conversion(self):
+        sid = self.session()
+        raw = ('{ "large":1e400, "precise":0.12345678901234567890123456789, '
+               '"integer":' + '9' * 5000 + ', "zero":-0, "same":1, "same":2, '
+               '"escaped":"\\u4e2d", "deep":' + '[' * 3000 + 'true' + ']' * 3000 + ' }')
+        wire = ('{"kind":"turn.single","turn_id":"opaque","content":[],"reply_to_seqs":[],"extensions":'
+                + raw + '}').encode('utf-8')
+        message = parse_message(NS(seq=1, channel_id=1, principal=20, ts_ms=1, uuid=1,
+                                   recipients=[], object_keys=[], payload=wire))
+        self.events.messages.append(message)
+
+        status, headers, data = self.request('GET', f'/api/chat/sessions/{sid}/history?fetch_seq=1')
+        self.assertEqual(status, 200)
+        self.assertEqual(int(headers['Content-Length']), len(data))
+        self.assertEqual(data.count(b'"extensions":' + raw.encode('utf-8')), 1)
+        # Decode the application envelope separately: the extension is intentionally
+        # beyond the standard Python decoder's number and nesting limits.
+        page = json.loads(data.replace(raw.encode('utf-8'), b'{}', 1))
+        self.assertEqual(page['next_seq'], '2')
+        event = page['events'][0]
+        self.assertEqual(event['publisher_role'], 'agent')
+        self.assertEqual(event['event_seq'], '1')
+        self.assertEqual(event['payload']['turn_id'], 'opaque')
+        self.assertEqual(message.payload['extensions'].json_text, raw)
+        self.assertFalse(self.service.fatal.is_set())
+        self.assertEqual(self.request('GET', '/api/chat/sessions')[0], 200)

@@ -14,7 +14,7 @@ SDK 要求 Python 3.10 或更高版本、当前环境已安装
 `protocol="chat.v1"` 的 Channel。SDK 使用注入的 OpenEvent 公开 client，
 不会从源码安装 SDK，也不会生成 protobuf 模块。
 
-`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为已安装的 `0.11.1`，Python 调用形态以该版本的公开接口为准。
+`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为 `0.12.0`，Python 调用形态以该版本的公开接口为准。
 
 ## 2. 构造
 
@@ -46,9 +46,9 @@ SDK 完成基础校验后，把本次 GetChannel 返回的 `ChannelInfo` 传给�
 
 SDK 只读取、不修改注入 client 的 `timeout_ms`，也不关闭注入 client 或其 gRPC channel。
 
-`parse_message(event_message)` 是公开的无状态解析函数：它把一条 OpenEvent `EventMessage` 严格解析为 `ParsedMessage`，校验该条消息的
-`chat.v1` JSON 和基础字段，但不维护跨事件 turn 状态、不执行 Fetch，也不判断应用角色。需要自己做有限范围历史分页的应用应复用它，
-不要再写一套 payload 解析器。
+`parse_message(event_message)` 是公开的无状态解析函数：它把一条非系统的 Chat `EventMessage` 严格解析为 `ParsedMessage`，校验该条消息的
+`chat.v1` JSON 和基础字段，但不维护跨事件 turn 状态、不执行 Fetch，也不判断应用角色。直接读取 OpenEvent 历史的应用应先按
+[OpenEvent 系统协议](../openevent-sdk/docs/SYSTEM_PROTOCOL_cn.md)排除系统消息，再复用此函数；传入系统消息仍抛出 `ChatProtocolError`。
 
 `ParsedMessage.payload` 同样支持 `submission.reserve` 控制事件，以 `kind` 区分事件类型，`reserved_through` 保留为 Python `int`；
 字段合法性以[公开协议](CHAT_PROTOCOL_cn.md)为准。它不带 turn 身份，调用方不能假定每条解析消息都有 `turn_id`。
@@ -67,12 +67,30 @@ print(page.next_seq, page.last_seq)
 ```
 
 `fetch_page()` 固定读取绑定的 Channel，并设置 `only_my_recipient=false`。一次调用只执行一个逻辑 Fetch，不自动读取下一页；同一 RPC 因暂时性错误
-发生的重试仍属于这次逻辑调用。返回的 `FetchPage` 包含 `messages`、`next_seq` 和 `last_seq`。SDK 校验 Fetch 分页和顺序契约并解析每条消息，
-但不保存这个页面的游标，也不修改任何写入对象。调用方继续读取时必须把返回的 `next_seq` 作为下一次 `from_seq`。
+发生的重试仍属于这次逻辑调用。返回的 `FetchPage` 包含 `messages`、`next_seq` 和 `last_seq`。SDK 先对原始整页校验 Fetch 分页、Channel 和
+顺序契约，再跳过 OpenEvent 系统消息，只解析和返回其余 Chat 消息。系统 payload 不按 `chat.v1` 校验；非系统消息仍须通过严格解析。
+`next_seq` 和 `last_seq` 保留原始响应值，不按过滤后的消息重算。只含系统消息的页会返回空 `messages`，调用方仍必须使用 `next_seq` 继续读取，
+不能因空页认定已到尾部。SDK 不保存本页游标、不修改任何写入对象。
 `messages` 包含已解析的 `submission.reserve` 控制事件，保留其原始 seq；SDK 不因为它不创建 turn 而从页面中删除它。
 
 需要持续读取的应用自行循环调用 `fetch_page()`，在处理完本页后保存 `next_seq`，并决定到达尾部后的等待时间和停止条件。
 SDK 不提供订阅、消息回调、扫描进度等待接口或后台轮询任务，也不调用 OpenEvent `Subscribe`。
+
+### 2.2 扩展原文与序列化
+
+SDK 只把 Chat 基础字段解析成 Python 值。`ParsedMessage.payload` 含有 `extensions` 时，其值是公开导出的
+`RawExtensions`，不是 `dict`；其余字段仍使用原有类型。`RawExtensions(json_text: str)` 是不可变的 JSON object 原文包装，
+通过只读的 `json_text` 属性取得文本。构造时检查合法 JSON 语法和最外层 object，非法输入抛出 `ChatProtocolError`。
+扩展内部不转换数值、不构建嵌套 Python 对象，也不参与 Chat 字段、链尾或终态判断；`1e400` 等合法 JSON 数字不会因浮点溢出而被拒绝。
+
+解析保留扩展 object 的原文，包括数值写法、空白和转义；不会承诺整个 payload 的原文不变。应用若需要理解扩展，
+自行选择适合其数据的 JSON 解析方式处理 `json_text`。原先把 `payload["extensions"]` 当字典读取的调用方需要相应调整；
+只转发扩展时直接使用 `RawExtensions`，无需解码。
+
+公开函数 `serialize_payload(payload: dict) -> bytes` 将 payload 编码为 UTF-8 JSON，并把顶层 `extensions` 中的
+`RawExtensions` 原文作为 JSON object 嵌入，不编码成字符串。它只做序列化，不校验 Chat 协议字段、事件合法性或 turn 状态，
+因此也可用于 Chat Server 已完成字段转换的 payload。`parse_message` 和各发布方法仍负责各自的协议校验。
+不要对含 `RawExtensions` 的 payload 直接调用普通 `json.dumps`，也不要先解码扩展再编码来实现原文转发。
 
 ## 3. 写入 API
 
@@ -119,7 +137,10 @@ seq = chat.cancel_turn(target_turn=TurnRef(9002, "other-turn"))
 `start_turn` 和 `writer.append` 的 `content` 参数均为 `Iterable[TextPart] = ()`，分别支持空内容 start 和纯附件 append。
 SDK 按[协议第 4 节](CHAT_PROTOCOL_cn.md#4-content-part)校验内容与附件组合，已有 TextPart 的非空文本要求保持不变，不自动补占位文字。
 
-所有发布方法都可以传入可选的 `recipients` 和 `extensions`。recipients 与 ObjectKey 保留调用方的顺序和重复项；`extensions` 必须是 JSON object。SDK 会在发布前拒绝本地可判断的非法输入。
+所有发布方法都可以传入可选的 `recipients` 和 `extensions`。recipients 与 ObjectKey 保留调用方的顺序和重复项。
+`extensions` 接受普通 JSON object 对应的 `dict`，或第 2.2 节定义的 `RawExtensions`；`None` 表示不携带该字段。
+普通字典使用 Python JSON 编码，不能含 NaN、Infinity 等非 JSON 值；需要保留原始数字写法或直接转发已读取扩展时使用 `RawExtensions`。
+SDK 会在发布前拒绝本地可判断的非法输入，发布参数冻结与重试遵循第 4 节。
 
 SDK 将调用方提供的 `reply_to_seqs` 按原顺序写入 payload 的同名 JSON 数值数组，不排序或自动去重。本地检查只覆盖协议字段形状：
 元素必须是非 bool 的正 uint64 整数，不能有重复 seq；非法输入抛出 `ChatProtocolError`。
@@ -180,7 +201,8 @@ seq = writer.complete()
 
 SDK 取得一次 GetStatus 水位，从 `state_start_seq` 按页读完固定范围，用临时状态只恢复目标的创建 seq、链尾和终态。目标仍可续写时，
 返回 `open` 的新对象，并设置其 `creation_seq` 和 `last_seq`；目标不存在时抛出 `TurnNotFoundError`，已经终结时抛出 `TurnWriterStateError`。
-失败不返回对象，也不在 client 中留下目标状态。恢复过程解析 `submission.reserve` 并推进读取位置，不把它当作 turn 事件。
+失败不返回对象，也不在 client 中留下目标状态。恢复使用第 2.1 节的同一单页读取规则，跨过系统消息和只含系统消息的页。
+恢复过程解析 `submission.reserve` 并推进读取位置，不把它当作 turn 事件。
 
 恢复按公开协议识别有效 `turn.reset` 并把其 seq 作为新链尾，继续处理其后的追加和终态；
 reset 不改变目标的创建 seq，也不使已终结的目标恢复为可续写。恢复对象无需保存重置前后正文或附件。

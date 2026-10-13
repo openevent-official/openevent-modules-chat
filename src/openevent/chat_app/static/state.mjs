@@ -53,6 +53,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   if (next > last + 1n) throw new Error('消息页的读取位置不正确');
   const events = list(page.events, '消息页');
   const turns = new Map();
+  const additions = new Map();
   const order = [];
   const creationIndex = new Map();
   let previous = null;
@@ -81,6 +82,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
       const content = parts(payload.content);
       turns.set(key, {
         key, role: event.publisher_role, id: payload.turn_id, creationSeq: event.event_seq,
+        orderIndex: session.order.length + order.length,
         replies: replyTo, tailSeq: event.event_seq, contentVersion: 0,
         parts: content, attachments, state: payload.kind === 'turn.single' ? 'completed' : 'open',
       });
@@ -103,19 +105,34 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     let turn;
     if (payload.kind === 'turn.reset') {
       turn = {...original, parts: content, attachments, contentVersion: original.contentVersion + 1};
+      additions.delete(key);
     } else {
-      turn = turns.get(key) ?? {...original, parts: original.parts.slice(), attachments: original.attachments.slice()};
+      turn = turns.get(key);
+      if (!turn) {
+        turn = {...original};
+        additions.set(key, {parts: [], attachments: []});
+      }
+      // Grow shared arrays only after the whole page has passed validation.
+      // New and reset turns already own their arrays and can grow while staging.
+      const target = additions.get(key) ?? turn;
       if (payload.kind === 'turn.append') {
-        for (const part of content) turn.parts.push(part);
+        for (const part of content) target.parts.push(part);
       } else {
         turn.state = payload.kind === 'turn.cancel' ? 'cancelled' : 'completed';
       }
-      for (const attachment of attachments) turn.attachments.push(attachment);
+      for (const attachment of attachments) target.attachments.push(attachment);
     }
     if (payload.kind !== 'turn.cancel') turn.tailSeq = event.event_seq;
     turns.set(key, turn);
   }
-  for (const [key, turn] of turns) session.turns.set(key, turn);
+  for (const [key, turn] of turns) {
+    const added = additions.get(key);
+    if (added) {
+      for (const part of added.parts) turn.parts.push(part);
+      for (const attachment of added.attachments) turn.attachments.push(attachment);
+    }
+    session.turns.set(key, turn);
+  }
   for (const key of order) session.order.push(key);
   for (const [seq, key] of creationIndex) session.creationIndex.set(seq, key);
   session.fetchSeq = page.next_seq;

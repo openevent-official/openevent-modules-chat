@@ -169,8 +169,10 @@ function register(description) {
     session = candidate; session.canceling = new Map(); session.downloads = new Set();
     session.fileInfo.onChange = objectId => {
       if (renderedMessages?.session === session) {
-        const keys = objectId === undefined ? renderedMessages.views.keys() : renderedMessages.byObject.get(objectId) || [];
-        for (const key of keys) renderedMessages.dirty.add(key);
+        const groups = objectId === undefined ? renderedMessages.byObject.values() : [renderedMessages.byObject.get(objectId) || []];
+        for (const attachments of groups) {
+          for (const attachment of attachments) renderedMessages.dirtyAttachments.add(attachment);
+        }
       }
       scheduleRender();
     };
@@ -227,8 +229,8 @@ const historyLoop = new ActiveLoop({
   },
   apply: (session, page, serial) => {
     const changes = applyPage(session, page);
+    updateTitle(session, changes);
     for (const [key, turn] of changes) {
-      if (turn.role === 'user') session.title = null;
       if (renderedMessages?.session === session) {
         renderedMessages.dirty.add(key);
         for (const dependent of renderedMessages.byReply.get(turn.creationSeq) || []) renderedMessages.dirty.add(dependent);
@@ -409,7 +411,6 @@ async function upload(session, item) {
 }
 
 function metadata(session, reference, retry = false) {
-  if (retry && session.preparation !== 'ready') return;
   return session.fileInfo.ensure(reference, async ref => {
     const {data} = await request(endpoint(session, `/attachments/${ref.object_id}/metadata?event_seq=${ref.event_seq}`));
     return data;
@@ -417,7 +418,7 @@ function metadata(session, reference, retry = false) {
 }
 
 async function download(session, reference) {
-  if (session.preparation !== 'ready') return;
+  if (!valid(session)) return;
   const key = `${reference.object_id}:${reference.event_seq}`;
   if (session.downloads.has(key)) return;
   session.downloads.add(key); scheduleRender();
@@ -479,16 +480,31 @@ export function textPrefix(parts, limit, trim = false) {
   return trim ? prefix.trimEnd() : prefix;
 }
 
-function title(session) {
-  if (session.title) return session.title;
-  for (const key of session.order) {
-    const turn = session.turns.get(key);
-    if (turn.role === 'user') {
-      const text = textPrefix(turn.parts, 35, true);
-      if (text) return session.title = text;
+function updateTitle(session, changes) {
+  let source = session.titleSource;
+  let searchFrom = session.order.length;
+  for (const turn of changes.values()) {
+    if (turn.role !== 'user' || (source && turn.orderIndex > source.index)) continue;
+    const text = textPrefix(turn.parts, 35, true);
+    if (text) source = {index: turn.orderIndex, text};
+    else if (source?.index === turn.orderIndex) {
+      searchFrom = turn.orderIndex + 1;
+      source = null;
     }
   }
-  return session.title = `会话 ${session.id.slice(-6)}`;
+  // Only losing the current source requires looking for an unchanged successor.
+  // Earlier empty turns have already been checked, including this page's changes.
+  for (let index = searchFrom; index < (source?.index ?? session.order.length); index++) {
+    const turn = session.turns.get(session.order[index]);
+    if (turn.role !== 'user') continue;
+    const text = textPrefix(turn.parts, 35, true);
+    if (text) { source = {index, text}; break; }
+  }
+  session.titleSource = source;
+}
+
+function title(session) {
+  return session.titleSource?.text ?? `会话 ${session.id.slice(-6)}`;
 }
 
 function snippet(turn) {
@@ -504,8 +520,7 @@ function updateAttachment(session, view) {
   if (!info) { metadata(session, ref); info = session.fileInfo.get(ref.object_id); }
   const downloading = session.downloads.has(`${ref.object_id}:${ref.event_seq}`);
   if (view.info === info) {
-    if (view.retry) view.retry.disabled = session.preparation !== 'ready';
-    view.download.disabled = session.preparation !== 'ready' || downloading;
+    view.download.disabled = downloading;
     setText(view.download, downloading ? '正在下载…' : '下载');
     return;
   }
@@ -516,9 +531,9 @@ function updateAttachment(session, view) {
   if (info?.description) body.append(node('span', 'muted', info.description));
   view.element.replaceChildren(node('span', 'file-icon', '↧'), body);
   view.retry = info?.state === 'unavailable' ? button('重试信息', () => metadata(session, ref, true)) : null;
-  if (view.retry) { view.retry.disabled = session.preparation !== 'ready'; view.element.append(view.retry); }
+  if (view.retry) view.element.append(view.retry);
   view.download = button(downloading ? '正在下载…' : '下载', () => download(session, ref));
-  view.download.disabled = session.preparation !== 'ready' || downloading;
+  view.download.disabled = downloading;
   view.element.append(view.download);
 }
 
@@ -550,7 +565,7 @@ function createTurnView(session, turn) {
   const state = node('span', 'turn-state');
   header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? '你' : '↗'), node('strong', '', turn.role === 'user' ? '你' : 'Agent'), state);
   const reply = button('回复', () => {
-    if (session.preparation !== 'ready' || session.pending) return;
+    if (session.pending) return;
     if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
     else session.replies.push(turn.creationSeq);
     scheduleRender(); $('message-input').focus();
@@ -579,7 +594,8 @@ function updateTurnView(session, view, turn, selected) {
       view.text.data = ''; view.partCount = 0;
       for (const attachment of view.attachments) {
         attachment.element.remove();
-        removeReference(renderedMessages.byObject, attachment.ref.object_id, turn.key);
+        removeReference(renderedMessages.byObject, attachment.ref.object_id, attachment);
+        renderedMessages.dirtyAttachments.delete(attachment);
       }
       view.attachments = [];
     }
@@ -593,11 +609,12 @@ function updateTurnView(session, view, turn, selected) {
     while (view.attachments.length < turn.attachments.length) {
       const attachment = {ref: turn.attachments[view.attachments.length], element: node('div', 'attachment'), info: null};
       view.attachments.push(attachment); view.article.append(attachment.element);
-      addReference(renderedMessages.byObject, attachment.ref.object_id, turn.key);
+      addReference(renderedMessages.byObject, attachment.ref.object_id, attachment);
+      renderedMessages.dirtyAttachments.add(attachment);
     }
     view.turn = turn;
   }
-  const pending = !!session.pending || session.preparation !== 'ready';
+  const pending = !!session.pending;
   setText(view.reply, selected ? '已选回复' : '回复');
   view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
   view.reply.disabled = pending; view.reply.setAttribute('aria-pressed', String(selected));
@@ -611,7 +628,6 @@ function updateTurnView(session, view, turn, selected) {
     const target = session.turns.get(session.creationIndex.get(quote.seq));
     if (quote.target !== target) { quote.target = target; setText(quote.element, snippet(target)); }
   }
-  for (const attachment of view.attachments) updateAttachment(session, attachment);
 }
 
 function renderTurns(session) {
@@ -621,7 +637,7 @@ function renderTurns(session) {
   if (switching || !renderedMessages) {
     container.replaceChildren();
     renderedMessages = {session, views: new Map(), byReply: new Map(), byObject: new Map(), dirty: new Set(session?.order),
-      selected: new Set(), canceling: new Map(), downloads: new Set(), empty: false};
+      dirtyAttachments: new Set(), selected: new Set(), canceling: new Map(), downloads: new Set(), empty: false};
   }
   const viewState = renderedMessages;
   const selected = new Set(session?.replies);
@@ -638,13 +654,15 @@ function renderTurns(session) {
     }
     for (const key of new Set([...viewState.downloads, ...session.downloads])) {
       if (viewState.downloads.has(key) !== session.downloads.has(key)) {
-        for (const owner of viewState.byObject.get(key.split(':')[0]) || []) viewState.dirty.add(owner);
+        for (const attachment of viewState.byObject.get(key.split(':')[0]) || []) {
+          if (`${attachment.ref.object_id}:${attachment.ref.event_seq}` === key) viewState.dirtyAttachments.add(attachment);
+        }
       }
     }
     viewState.pending = !!session.pending; viewState.preparation = session.preparation;
     viewState.selected = selected; viewState.canceling = new Map(session.canceling); viewState.downloads = new Set(session.downloads);
   }
-  if (!switching && !viewState.dirty.size && (viewState.empty || viewState.views.size)) return;
+  if (!switching && !viewState.dirty.size && !viewState.dirtyAttachments.size && (viewState.empty || viewState.views.size)) return;
   const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
   const oldTop = container.scrollTop;
   if (!session || !session.order.length) {
@@ -666,6 +684,8 @@ function renderTurns(session) {
       updateTurnView(session, view, turn, selected.has(turn.creationSeq));
     }
   }
+  for (const attachment of viewState.dirtyAttachments) updateAttachment(session, attachment);
+  viewState.dirtyAttachments.clear();
   viewState.dirty.clear();
   if (switching) container.scrollTop = session?.scrollTop ?? container.scrollHeight;
   else if (atBottom) container.scrollTop = container.scrollHeight;
@@ -673,8 +693,9 @@ function renderTurns(session) {
 }
 
 function renderComposer(session) {
-  const disabled = !session || session.preparation !== 'ready' || !!session.pending;
-  $('message-input').disabled = disabled; $('choose-files').disabled = disabled;
+  const draftLocked = !session || !!session.pending;
+  const disabled = draftLocked || session.preparation !== 'ready';
+  $('message-input').disabled = draftLocked; $('choose-files').disabled = disabled;
   $('file-input').disabled = disabled;
   $('send').disabled = disabled || session.files.some(file => file.status !== 'ready');
   const value = session?.text || ''; if ($('message-input').value !== value) $('message-input').value = value;
@@ -682,8 +703,11 @@ function renderComposer(session) {
   renderedComposer = {session, replies: new Map(), files: new Map()};
   for (const seq of session?.replies || []) {
     const target = session.turns.get(session.creationIndex.get(seq));
-    const chip = previous?.replies.get(seq) || button('', () => { session.replies = session.replies.filter(value => value !== seq); scheduleRender(); }, 'reply-chip');
-    setText(chip, `${snippet(target)} ×`); chip.disabled = disabled;
+    const chip = previous?.replies.get(seq) || button('', () => {
+      if (session.pending) return;
+      session.replies = session.replies.filter(value => value !== seq); scheduleRender();
+    }, 'reply-chip');
+    setText(chip, `${snippet(target)} ×`); chip.disabled = draftLocked;
     renderedComposer.replies.set(seq, chip);
   }
   updateChildren($('reply-selection'), [...renderedComposer.replies.values()]);
@@ -769,7 +793,7 @@ $('refresh-sessions').addEventListener('click', loadSessions);
 $('composer').addEventListener('submit', event => { event.preventDefault(); sendMessage(); });
 $('message-input').addEventListener('input', event => {
   const session = current();
-  if (session?.preparation === 'ready' && !session.pending) session.text = event.target.value;
+  if (session && !session.pending) session.text = event.target.value;
 });
 $('message-input').addEventListener('keydown', event => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); sendMessage(); }

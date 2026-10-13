@@ -61,7 +61,8 @@ while True:
 ```
 
 写入方法成功返回表示 OpenEvent 已经提交消息。示例中的应用循环从历史起点逐页读取，
-处理完本页再保存 `next_seq`，读过回复结束事件的位置后结束。持续读取也由应用组织读取和处理循环；
+处理完本页再保存 `next_seq`，读过回复结束事件的位置后结束。SDK 已排除 OpenEvent 系统消息；即使本页没有 Chat 消息，也要按返回的游标继续。
+持续读取也由应用组织读取和处理循环；
 到达尾部后的等待和停止条件见[单页读取契约](CHAT_SDK_cn.md#21-一次读取一页)。
 
 保存 `single_turn` 返回的 seq，或 `start_turn` 返回对象的 `creation_seq`，回复时传入 `reply_to_seqs`。
@@ -72,6 +73,30 @@ SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议�
 调用方停止续写并释放对应对象，释放本身不发布事件或撤销在途请求。
 继续旧 turn 必须显式调用 `resume_turn()`；前提和失败处理见[写入 API](CHAT_SDK_cn.md#3-写入-api)。
 输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#3-写入-api)。
+
+## 原样携带扩展
+
+需要转发扩展时使用 `RawExtensions`；普通应用生成的扩展仍可传字典。接口与解析结果类型见
+[扩展原文与序列化契约](CHAT_SDK_cn.md#22-扩展原文与序列化)。
+
+```python
+from openevent.chat_sdk import RawExtensions, serialize_payload
+
+chat.single_turn(
+    turn_id="with-metadata-1",
+    content=(TextPart("带应用元数据的消息"),),
+    extensions=RawExtensions('{"value":1e400}'),
+)
+
+# message 是 fetch_page 返回的一条 ParsedMessage。
+payload_bytes = serialize_payload(message.payload)
+raw_extensions = message.payload.get("extensions")
+if raw_extensions is not None:
+    extension_json = raw_extensions.json_text
+```
+
+`payload_bytes` 保留扩展原文；不要为转发先用普通 JSON 解析器解码 `extension_json`。
+只有应用需要读取扩展内容时，才自行选择相应的解析方式。
 
 ## 重置未结束的输出
 

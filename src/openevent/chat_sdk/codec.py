@@ -3,7 +3,8 @@ import json
 import math
 
 from .errors import ChatProtocolError
-from .model import ObjectKey, ParsedMessage, TextPart
+from ._json_spans import object_fields
+from .model import ObjectKey, ParsedMessage, RawExtensions, TextPart
 
 UINT64_MAX = (1 << 64) - 1
 
@@ -106,6 +107,8 @@ def validate_payload(payload, *, object_keys=()):
     if kind == 'submission.reserve' and object_keys:
         raise ChatProtocolError('submission.reserve cannot contain object_keys')
     if 'extensions' in payload:
+        if isinstance(payload['extensions'], RawExtensions):
+            return payload
         if not isinstance(payload['extensions'], dict):
             raise ChatProtocolError('extensions must be object')
         try:
@@ -129,9 +132,26 @@ def make_content(parts):
 
 def encode_payload(payload, *, object_keys=()):
     validate_payload(payload, object_keys=object_keys)
+    return serialize_payload(payload)
+
+
+def serialize_payload(payload):
+    """Encode a payload object, preserving RawExtensions without Chat field validation."""
+    if not isinstance(payload, dict):
+        raise ChatProtocolError('payload must be JSON object')
     try:
-        return json.dumps(payload, ensure_ascii=False, allow_nan=False,
-                          separators=(',', ':')).encode('utf-8')
+        fields = []
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                raise ChatProtocolError('payload fields must be strings')
+            encoded_key = json.dumps(key, ensure_ascii=False)
+            if key == 'extensions' and isinstance(value, RawExtensions):
+                encoded_value = value.json_text
+            else:
+                encoded_value = json.dumps(value, ensure_ascii=False, allow_nan=False,
+                                           separators=(',', ':'))
+            fields.append(encoded_key + ':' + encoded_value)
+        return ('{' + ','.join(fields) + '}').encode('utf-8')
     except (ValueError, TypeError, UnicodeError, RecursionError):
         raise ChatProtocolError('payload cannot be encoded as UTF-8 JSON') from None
 
@@ -145,11 +165,8 @@ def _unique_object(pairs):
     return result
 
 
-def _invalid_constant(value):
-    raise ChatProtocolError('JSON contains non-finite number')
-
-
 def parse_message(event_message):
+    """Parse one business chat event; callers must exclude OpenEvent system messages."""
     try:
         seq = validate_uint64(event_message.seq, 'seq')
         channel = validate_uint64(event_message.channel_id, 'channel_id')
@@ -165,8 +182,20 @@ def parse_message(event_message):
             raise ChatProtocolError('object_keys exceeds 1024 entries')
         if not isinstance(event_message.payload, bytes):
             raise ChatProtocolError('payload must be UTF-8 bytes')
-        payload = json.loads(event_message.payload.decode('utf-8'),
-                             object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+        text = event_message.payload.decode('utf-8')
+        spans = object_fields(text)
+        payload = {}
+        known_fields = {'kind', 'turn_id', 'reply_to_seqs', 'content', 'pre_seq',
+                        'target_turn', 'reserved_through', 'extensions'}
+        if spans.keys() - known_fields:
+            raise ChatProtocolError('payload has unknown fields')
+        for key, (start, end) in spans.items():
+            if key == 'extensions':
+                if text[start] != '{':
+                    raise ChatProtocolError('extensions must be object')
+                payload[key] = RawExtensions._from_validated(text[start:end])
+            else:
+                payload[key] = json.loads(text[start:end], object_pairs_hook=_unique_object)
         validate_payload(payload, object_keys=objects)
         return ParsedMessage(seq, channel, principal, timestamp, uuid, recipients, objects, payload)
     except ChatProtocolError:

@@ -14,7 +14,7 @@ from openevent.sdk.proto import openevent_pb2 as pb
 
 from openevent.chat_sdk import (
     ChannelInitializationError, ChatProtocolError, ClientClosedError, ClientFailedError,
-    FetchPageError, ObjectKey, PublishFailedError, SyncReadError, TextPart,
+    FetchPageError, ObjectKey, PublishFailedError, RawExtensions, SyncReadError, TextPart,
     TurnNotFoundError, TurnRef, TurnWriterStateError, UuidAllocationError, create_client,
 )
 
@@ -330,6 +330,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(json.loads(first["payload"])["reply_to_seqs"], [9, 2])
         self.assertEqual(len(self.events.calls["get_uuid"]), 1)
 
+    def test_raw_extensions_can_be_read_forwarded_and_retried_without_changes(self):
+        raw = '{ "n": 1e400, "n": -0, "nested":' + '[' * 1500 + '0' + ']' * 1500 + ' }'
+        self.chat.single_turn(turn_id='source', extensions=RawExtensions(raw))
+        message = self.chat.fetch_page(1).messages[0]
+        self.assertEqual(message.payload['extensions'].json_text, raw)
+        self.events.inject('publish_auto_seq', RpcError(grpc.StatusCode.UNAVAILABLE))
+        self.chat.single_turn(turn_id='forwarded', extensions=message.payload['extensions'])
+        first, second = self.events.calls['publish_auto_seq'][-2:]
+        self.assertEqual(first, second)
+        self.assertIn(('"extensions":' + raw).encode(), second['payload'])
+        self.assertEqual(self.chat.fetch_page(2).messages[0].payload['extensions'].json_text, raw)
+        self.assertEqual(len(self.events.messages), 2)
+
     def test_lost_publish_reply_is_reconciled_by_same_uuid(self):
         writer = self.writer()
 
@@ -441,6 +454,72 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(all(call["channels"] == (10,) and not call["only_my_recipient"]
                             for call in self.events.calls["fetch"]))
 
+    def test_mixed_page_skips_system_events_and_keeps_chat_and_raw_cursor(self):
+        self.events.add({"kind": "system.channel_initialized", "data": {
+            "schema_version": 1, "name": "chat", "protocol": "chat.v1", "description": "",
+            "visibility": "private", "creator": 1, "members": [1]}}, principal=0)
+        writer = self.writer()
+        self.events.add({"kind": "system.member_added", "data": {
+            "schema_version": 1, "member": 2}}, principal=0)
+        self.chat.reserve_submissions(10000)
+        self.events.add({"kind": "system.member_removed", "data": {
+            "schema_version": 1, "member": 2}}, principal=0)
+
+        page = self.chat.fetch_page(1)
+        self.assertEqual([message.seq for message in page.messages], [2, 4])
+        self.assertEqual([message.payload["kind"] for message in page.messages],
+                         ["turn.start", "submission.reserve"])
+        self.assertEqual((page.next_seq, page.last_seq), (6, 5))
+        self.assertEqual(writer.complete(), 6)
+        self.assertEqual(len(self.events.calls["fetch"]), 1)
+
+    def test_system_only_page_returns_empty_without_losing_read_progress(self):
+        for member in (2, 3):
+            self.events.add({"kind": "system.member_added", "data": {
+                "schema_version": 1, "member": member}}, principal=0)
+        writer = self.writer()
+        page = self.chat.fetch_page(1, limit=2)
+        self.assertEqual(page.messages, ())
+        self.assertEqual((page.next_seq, page.last_seq), (3, 3))
+        self.assertEqual(len(self.events.calls["fetch"]), 1)
+        following = self.chat.fetch_page(page.next_seq, limit=2)
+        self.assertEqual([message.seq for message in following.messages], [writer.creation_seq])
+        self.assertEqual((following.next_seq, following.last_seq), (4, 3))
+
+    def test_system_filter_does_not_bypass_raw_page_contract_checks(self):
+        system = pb.EventMessage(seq=2, channel_id=10, principal=0, uuid=1001)
+        earlier = pb.EventMessage(seq=1, channel_id=10, principal=0, uuid=1002)
+        other_channel = pb.EventMessage(seq=1, channel_id=11, principal=0, uuid=1003)
+        cases = [
+            (1, 2, SimpleNamespace(messages=[system, earlier], next_seq=3, last_seq=2)),
+            (1, 2, SimpleNamespace(messages=[earlier, earlier], next_seq=3, last_seq=2)),
+            (1, 2, SimpleNamespace(messages=[other_channel], next_seq=3, last_seq=2)),
+            (1, 2, SimpleNamespace(messages=[system], next_seq=2, last_seq=2)),
+            (1, 2, SimpleNamespace(messages=[system], next_seq=3, last_seq=1)),
+            (1, 1, SimpleNamespace(messages=[earlier, system], next_seq=3, last_seq=2)),
+            (2, 2, SimpleNamespace(messages=[earlier], next_seq=3, last_seq=2)),
+        ]
+        for from_seq, limit, response in cases:
+            with self.subTest(response=response):
+                events = Events()
+                chat = create_client(events, principal=1, token="credential", channel_id=10)
+                events.inject("fetch", response)
+                with self.assertRaises(FetchPageError) as caught:
+                    chat.fetch_page(from_seq, limit)
+                self.assertEqual(caught.exception.failure.category, "contract")
+                with self.assertRaises(ClientFailedError):
+                    chat.fetch_page(1)
+                chat.close()
+
+    def test_system_kind_from_business_principal_still_fails_chat_validation(self):
+        self.events.add({"kind": "system.member_added", "data": {
+            "schema_version": 1, "member": 2}}, principal=1)
+        with self.assertRaises(FetchPageError) as caught:
+            self.chat.fetch_page(1)
+        self.assertEqual(caught.exception.failure.category, "protocol")
+        with self.assertRaises(ClientFailedError):
+            self.chat.fetch_page(1)
+
     def test_page_seq_gaps_are_valid_and_last_seq_is_not_cross_compared(self):
         for index in range(4):
             self.events.add(start_payload(str(index)), channel_id=10 if index in {0, 3} else 11)
@@ -492,6 +571,23 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"], tail)
         self.assertEqual(len(self.events.calls["get_status"]), 1)
         self.assertEqual(len(self.events.calls["fetch"]), 1)
+
+    def test_resume_crosses_system_only_pages_and_keeps_chat_tail(self):
+        for member in range(2, 103):
+            self.events.add({"kind": "system.member_added", "data": {
+                "schema_version": 1, "member": member}}, principal=0)
+        creation = self.events.add(start_payload("old"))
+        self.events.add({"kind": "system.member_removed", "data": {
+            "schema_version": 1, "member": 2}}, principal=0)
+        tail = self.events.add(append_payload("old", creation))
+        self.events.add({"kind": "system.member_removed", "data": {
+            "schema_version": 1, "member": 3}}, principal=0)
+
+        writer = self.chat.resume_turn("old")
+        self.assertEqual(writer.creation_seq, creation)
+        self.assertEqual([call["from_seq"] for call in self.events.calls["fetch"]], [1, 101])
+        writer.complete()
+        self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"], tail)
 
     def test_resuming_another_turn_does_not_rewind_existing_writer(self):
         first = self.writer("first")

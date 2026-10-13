@@ -37,7 +37,7 @@ test('canonical decimal identifiers retain all uint64 bits', () => {
   assert.equal(decimal('0', {zero: true}), '0');
 });
 
-test('one page commits records and cursor atomically, keeping previous objects untouched', () => {
+test('one page commits records and cursor atomically, sharing arrays only after successful validation', () => {
   const state = apply(session(), page([create(1)], 2));
   const original = state.turns.get(turnKey('agent', 'a'));
   const oldMap = state.turns;
@@ -50,7 +50,44 @@ test('one page commits records and cursor atomically, keeping previous objects u
   assert.equal(original.parts.map(part => part.text).join(''), '开头');
   apply(state, page(response.events.slice(0, 1), 4));
   assert.equal(state.fetchSeq, '4'); assert.notEqual(state.turns.get(original.key), original);
-  assert.equal(original.parts.length, 1);
+  assert.equal(original.parts, state.turns.get(original.key).parts);
+  assert.equal(original.parts.length, 2);
+  assert.equal(original.tailSeq, '1');
+});
+
+test('1000 pages append to one turn without reading any existing content or attachment entries', () => {
+  const state = apply(session(), page([create(1)], 2));
+  const initial = state.turns.get(turnKey('agent', 'a'));
+  let oldEntryReads = 0;
+  const observe = values => new Proxy(values, {get(target, key, receiver) {
+    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) oldEntryReads++;
+    return Reflect.get(target, key, receiver);
+  }});
+  initial.parts = observe(initial.parts); initial.attachments = observe(initial.attachments);
+  for (let seq = 2; seq <= 1001; seq++) {
+    apply(state, page([event(seq, 'turn.append', {
+      turn_id: 'a', pre_seq: String(seq - 1), content: [{type: 'text', text: '增量'}],
+    }, 'agent', [{object_id: String(seq)}])], seq + 1));
+  }
+  const appended = state.turns.get(initial.key);
+  assert.equal(appended.parts, initial.parts); assert.equal(appended.attachments, initial.attachments);
+  assert.equal(appended.parts.length, 1001); assert.equal(appended.attachments.length, 1000);
+  assert.equal(oldEntryReads, 0, 'old entries must never be scanned or copied when applying an append');
+  apply(state, page([event(1002, 'turn.end', {turn_id: 'a', pre_seq: '1001'})], 1003));
+  assert.equal(state.turns.get(initial.key).parts, initial.parts);
+  assert.equal(state.turns.get(initial.key).attachments, initial.attachments);
+  assert.equal(oldEntryReads, 0, 'ending a turn must not copy its old arrays');
+});
+
+test('cancel shares existing lists without inspecting their entries', () => {
+  const state = apply(session(), page([create(1)], 2));
+  const initial = state.turns.get(turnKey('agent', 'a'));
+  const unreadable = {get() { throw new Error('cancel must not read existing lists'); }};
+  initial.parts = new Proxy(initial.parts, unreadable); initial.attachments = new Proxy(initial.attachments, unreadable);
+  apply(state, page([event(2, 'turn.cancel', {target_turn: {role: 'agent', turn_id: 'a'}}, 'user')], 3));
+  const cancelled = state.turns.get(initial.key);
+  assert.equal(cancelled.state, 'cancelled'); assert.equal(cancelled.parts, initial.parts);
+  assert.equal(cancelled.attachments, initial.attachments);
 });
 
 test('global sequence gaps, control-only pages, and unchanged empty tail are legal', () => {
