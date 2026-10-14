@@ -3,7 +3,7 @@ from .client import ChatProtocolClient, TurnWriter, create_client
 from .codec import parse_message, serialize_payload
 from .errors import (ChannelInitializationError, ChatProtocolError, ClientClosedError,
                      ClientFailedError, FailureInfo, FetchPageError,
-                     PublishFailedError, SyncReadError, TurnNotFoundError,
+                     PublishFailedError,
                      TurnWriterStateError, UuidAllocationError)
 from .model import FetchPage, ObjectKey, ParsedMessage, RawExtensions, TextPart, TurnRef
 
@@ -12,6 +12,6 @@ __all__ = [
     'RawExtensions',
     'TextPart', 'TurnRef', 'ObjectKey', 'ParsedMessage', 'FetchPage', 'FailureInfo',
     'ChatProtocolError', 'ChannelInitializationError', 'FetchPageError',
-    'TurnNotFoundError', 'TurnWriterStateError', 'SyncReadError', 'UuidAllocationError',
+    'TurnWriterStateError', 'UuidAllocationError',
     'PublishFailedError', 'ClientFailedError', 'ClientClosedError',
 ]

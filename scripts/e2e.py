@@ -84,7 +84,7 @@ def run():
     binary = str(Path(binary).resolve())
     import grpc
     from openevent.sdk import AdminClient, OpenEventClient
-    from openevent.chat_sdk import ObjectKey, RawExtensions, TextPart, create_client
+    from openevent.chat_sdk import TurnWriter, ObjectKey, RawExtensions, TextPart, create_client
     from openevent.chat_app.config import new_ulid
 
     with fixture_directory() as root:
@@ -240,9 +240,9 @@ def run():
                     writer.complete()
                     resumable = agent.start_turn(turn_id='resume', content=(TextPart('一'),))
                     resume_seq = resumable.creation_seq
-                    resumable.reset(content=(TextPart('重置后'),))
+                    resume_tail = resumable.reset(content=(TextPart('重置后'),))
                     del resumable
-                    resumed = agent.resume_turn('resume', state_start_seq=int(session['scan_start_seq']))
+                    resumed = TurnWriter(agent, 'resume', resume_seq, resume_tail)
                     assert resumed.creation_seq == resume_seq
                     resumed.append(content=(TextPart('二'),))
                     api('POST', base + '/cancellations', {'target_turn_id': 'resume'}, expected=201)
@@ -274,7 +274,7 @@ def run():
                     second_base = f'/api/chat/sessions/{second["session_id"]}'
                     assert api('POST', second_base + '/submissions', {'count': '1'}, expected=201)['start'] == '1'
                     api('POST', second_base + '/turns', {'submission_id': '1', 'text': '', 'attachments': [oid]}, expected=409)
-                    # SDK reads, recovery and HTTP forwarding keep extension numbers
+                    # SDK reads, writer handoff and HTTP forwarding keep extension numbers
                     # and nested JSON intact without decoding them into Python values.
                     opaque_text = ('{ "large":1e400, "precise":0.12345678901234567890123456789, "deep":'
                                    + '[' * 2000 + '0' + ']' * 2000 + ' }')
@@ -286,7 +286,7 @@ def run():
                         del opaque_writer
                         parsed = opaque_chat.fetch_page(opaque_seq, limit=1).messages[0]
                         assert parsed.payload['extensions'].json_text == opaque_text
-                        resumed_opaque = opaque_chat.resume_turn('opaque', state_start_seq=int(second['scan_start_seq']))
+                        resumed_opaque = TurnWriter(opaque_chat, 'opaque', opaque_seq, opaque_seq)
                         resumed_opaque.complete()
                         status, raw_page, _ = request('GET', second_base + f'/history?fetch_seq={opaque_seq}&limit=1',
                                                      decode_json=False)

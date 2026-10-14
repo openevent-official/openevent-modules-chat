@@ -14,8 +14,8 @@ from openevent.sdk.proto import openevent_pb2 as pb
 
 from openevent.chat_sdk import (
     ChannelInitializationError, ChatProtocolError, ClientClosedError, ClientFailedError,
-    FetchPageError, ObjectKey, PublishFailedError, RawExtensions, SyncReadError, TextPart,
-    TurnNotFoundError, TurnRef, TurnWriterStateError, UuidAllocationError, create_client,
+    FetchPageError, ObjectKey, PublishFailedError, RawExtensions, TextPart,
+    TurnRef, TurnWriter, TurnWriterStateError, UuidAllocationError, create_client,
 )
 
 
@@ -190,6 +190,15 @@ class ClientTests(unittest.TestCase):
                           channel_validator=reject)
         self.assertEqual(len(validated), 1)
 
+    def test_client_accepts_transport_without_history_watermark_method(self):
+        self.events.get_status = None
+        chat = create_client(self.events, principal=1, token="credential", channel_id=10)
+        writer = chat.start_turn(turn_id="new")
+        writer.complete()
+        self.assertEqual([message.payload["kind"] for message in chat.fetch_page(1).messages],
+                         ["turn.start", "turn.end"])
+        chat.close()
+
     def test_stream_uses_its_own_tail_without_history(self):
         creation = self.chat.single_turn(turn_id="input", content=())
         writer = self.chat.start_turn(turn_id="reply", reply_to_seqs=(creation,), content=(TextPart("A"),))
@@ -218,6 +227,89 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(ref())
         self.assertEqual(len(self.events.calls["publish_auto_seq"]), count)
         self.assertFalse(self.events.calls["fetch"])
+
+    def test_writer_constructor_continues_known_start_without_history_or_new_start(self):
+        creation = self.events.add(start_payload("old"))
+        self.events.calls.clear()
+        writer = TurnWriter(self.chat, "old", creation, creation)
+        self.assertEqual(dict(self.events.calls), {})
+        self.assertEqual((writer.turn_id, writer.creation_seq), ("old", creation))
+
+        appended = writer.append(content=(TextPart("continued"),))
+        reset = writer.reset(content=(TextPart("replacement"),))
+        writer.complete()
+        calls = self.events.calls["publish_auto_seq"]
+        payloads = [json.loads(call["payload"]) for call in calls]
+        self.assertEqual([payload["kind"] for payload in payloads],
+                         ["turn.append", "turn.reset", "turn.end"])
+        self.assertEqual([payload["pre_seq"] for payload in payloads],
+                         [creation, appended, reset])
+        self.assertTrue(all(payload["turn_id"] == "old" for payload in payloads))
+        self.assertTrue(all(call["channel_id"] == 10 and call["principal"] == 1 for call in calls))
+        self.assertEqual(writer.creation_seq, creation)
+        self.assertEqual(set(self.events.calls), {"get_uuid", "publish_auto_seq"})
+        with self.assertRaises(TurnWriterStateError):
+            writer.complete()
+
+    def test_writer_constructor_uses_known_append_or_reset_tail(self):
+        for kind in ("turn.append", "turn.reset"):
+            with self.subTest(kind=kind):
+                creation = self.events.add(start_payload(kind))
+                payload = append_payload(kind, creation)
+                payload["kind"] = kind
+                tail = self.events.add(payload)
+                self.events.add(start_payload("unrelated"), principal=2)
+                self.events.calls.clear()
+                writer = TurnWriter(client=self.chat, turn_id=kind,
+                                    creation_seq=creation, last_seq=tail)
+                self.assertEqual(dict(self.events.calls), {})
+                writer.complete()
+                self.assertEqual(writer.creation_seq, creation)
+                published = json.loads(self.events.calls["publish_auto_seq"][0]["payload"])
+                self.assertEqual(published, {"kind": "turn.end", "turn_id": kind, "pre_seq": tail})
+                self.assertEqual(set(self.events.calls), {"get_uuid", "publish_auto_seq"})
+
+    def test_writer_constructor_rejects_invalid_arguments_without_rpc_or_client_failure(self):
+        active = self.writer()
+        invalid = [{"client": None}, {"client": self.events}, {"turn_id": ""},
+                   {"turn_id": 1}, {"turn_id": "中" * 43}, {"turn_id": "\ud800"},
+                   {"creation_seq": 2, "last_seq": 1}]
+        invalid.extend({field: value} for field in ("creation_seq", "last_seq")
+                       for value in (0, -1, True, 1.0, 1 << 64))
+        self.events.calls.clear()
+        for override in invalid:
+            with self.subTest(override=override):
+                arguments = dict(client=self.chat, turn_id="old", creation_seq=1, last_seq=1)
+                arguments.update(override)
+                with self.assertRaises(ChatProtocolError):
+                    TurnWriter(**arguments)
+                self.assertEqual(dict(self.events.calls), {})
+        self.assertEqual(active.complete(), 2)
+
+    def test_writer_constructor_does_not_revive_closed_or_failed_client(self):
+        for state in ("closed", "failed"):
+            with self.subTest(state=state):
+                events = Events()
+                chat = create_client(events, principal=1, token="credential", channel_id=10)
+                creation = events.add(start_payload("old"))
+                if state == "closed":
+                    chat.close()
+                    expected = ClientClosedError
+                else:
+                    events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
+                    with self.assertRaises(FetchPageError) as failure:
+                        chat.fetch_page(1)
+                    expected = ClientFailedError
+                events.calls.clear()
+                writer = TurnWriter(chat, "old", creation, creation)
+                for write in (lambda: writer.append(content=(TextPart("late"),)),
+                              writer.reset, writer.complete):
+                    with self.assertRaises(expected) as caught:
+                        write()
+                    if state == "failed":
+                        self.assertIs(caught.exception.failure, failure.exception.failure)
+                self.assertEqual(dict(events.calls), {})
+                chat.close()
 
     def test_empty_start_attachment_append_and_reset_share_one_chain(self):
         writer = self.chat.start_turn(turn_id="reply")
@@ -558,120 +650,16 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ClientFailedError):
             self.chat.fetch_page(1)
 
-    def test_resume_uses_fixed_watermark_and_only_target_state(self):
-        self.events.add({"kind": "submission.reserve", "reserved_through": 10000})
-        creation = self.events.add(start_payload("old"))
-        tail = self.events.add(append_payload("old", creation))
-        self.events.add(start_payload("other"))
-        self.events.add({"kind": "turn.cancel", "target_turn": {"principal": 1, "turn_id": "old"}}, principal=2)
-        self.events.inject("get_status", pb.GetStatusResponse(max_seq=4))
-        writer = self.chat.resume_turn("old")
-        self.assertEqual(writer.creation_seq, creation)
-        writer.append(content=(TextPart("from known tail"),))
-        self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"], tail)
-        self.assertEqual(len(self.events.calls["get_status"]), 1)
-        self.assertEqual(len(self.events.calls["fetch"]), 1)
-
-    def test_resume_crosses_system_only_pages_and_keeps_chat_tail(self):
-        for member in range(2, 103):
-            self.events.add({"kind": "system.member_added", "data": {
-                "schema_version": 1, "member": member}}, principal=0)
-        creation = self.events.add(start_payload("old"))
-        self.events.add({"kind": "system.member_removed", "data": {
-            "schema_version": 1, "member": 2}}, principal=0)
-        tail = self.events.add(append_payload("old", creation))
-        self.events.add({"kind": "system.member_removed", "data": {
-            "schema_version": 1, "member": 3}}, principal=0)
-
-        writer = self.chat.resume_turn("old")
-        self.assertEqual(writer.creation_seq, creation)
-        self.assertEqual([call["from_seq"] for call in self.events.calls["fetch"]], [1, 101])
-        writer.complete()
-        self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"], tail)
-
-    def test_resuming_another_turn_does_not_rewind_existing_writer(self):
+    def test_constructing_another_writer_does_not_rewind_existing_writer(self):
         first = self.writer("first")
         old_creation = self.events.add(start_payload("old"))
         old_tail = self.events.add(append_payload("old", old_creation))
-        second = self.chat.resume_turn("old")
+        second = TurnWriter(self.chat, "old", old_creation, old_tail)
         first.append(content=(TextPart("first next"),))
         second.append(content=(TextPart("old next"),))
         writes = self.events.calls["publish_auto_seq"]
         self.assertEqual(json.loads(writes[-2]["payload"])["pre_seq"], first.creation_seq)
         self.assertEqual(json.loads(writes[-1]["payload"])["pre_seq"], old_tail)
-
-    def test_recovery_resumes_at_reset_without_rebuilding_old_content(self):
-        creation = self.events.add(start_payload("old"))
-        previous = self.events.add(append_payload("old", creation))
-        reset = self.events.add({"kind": "turn.reset", "turn_id": "old", "pre_seq": previous,
-                                 "content": []})
-        writer = self.chat.resume_turn("old", state_start_seq=creation)
-        self.assertEqual(writer.creation_seq, creation)
-        writer.append(object_keys=(ObjectKey(7, "new-cap"),))
-        self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"], reset)
-
-    def test_recovery_does_not_reopen_cancelled_turn_after_reset(self):
-        creation = self.events.add(start_payload("old"))
-        self.events.add({"kind": "turn.cancel", "target_turn": {"principal": 1, "turn_id": "old"}}, principal=2)
-        reset = self.events.add({"kind": "turn.reset", "turn_id": "old", "pre_seq": creation,
-                                 "content": []})
-        self.events.add(append_payload("old", reset))
-        with self.assertRaises(TurnWriterStateError):
-            self.chat.resume_turn("old")
-        self.assertEqual(len(self.chat.fetch_page(1).messages), 4)
-
-    def test_invalid_target_history_fails_recovery_and_other_writers(self):
-        histories = [
-            [start_payload("old"), start_payload("old")],
-            [start_payload("old"), append_payload("old", 90)],
-            [start_payload("old"), {"kind": "turn.reset", "turn_id": "old", "pre_seq": 90, "content": []}],
-            [{"kind": "turn.cancel", "target_turn": {"principal": 1, "turn_id": "old"}}],
-        ]
-        for history in histories:
-            with self.subTest(history=history):
-                events = Events()
-                chat = create_client(events, principal=1, token="credential", channel_id=10)
-                active = chat.start_turn(turn_id="active")
-                for payload in history:
-                    events.add(payload)
-                with self.assertRaises(SyncReadError) as caught:
-                    chat.resume_turn("old")
-                self.assertEqual(caught.exception.failure.category, "protocol")
-                with self.assertRaises(ClientFailedError) as subsequent:
-                    active.reset()
-                self.assertIs(subsequent.exception.failure, caught.exception.failure)
-
-    def test_resume_handles_empty_page_without_inventing_progress_requirement(self):
-        creation = self.events.add(start_payload("old"))
-        self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=1, last_seq=creation))
-        writer = self.chat.resume_turn("old")
-        self.assertEqual(writer.creation_seq, creation)
-        self.assertEqual([call["from_seq"] for call in self.events.calls["fetch"]], [1, 1])
-
-    def test_missing_and_terminal_recovery_targets_do_not_fail_client(self):
-        with self.assertRaises(TurnNotFoundError):
-            self.chat.resume_turn("missing")
-        self.chat.single_turn(turn_id="single", content=())
-        with self.assertRaises(TurnWriterStateError):
-            self.chat.resume_turn("single")
-        writer = self.writer("cancelled")
-        self.chat.cancel_turn(target_turn=TurnRef(1, writer.turn_id))
-        with self.assertRaises(TurnWriterStateError):
-            self.chat.resume_turn("cancelled")
-        self.assertGreater(self.writer("still ready").creation_seq, 0)
-
-    def test_recovery_get_status_and_fetch_fail_the_entire_client(self):
-        for method in ("get_status", "fetch"):
-            with self.subTest(method=method):
-                events = Events()
-                chat = create_client(events, principal=1, token="credential", channel_id=10, max_retries=0)
-                writer = chat.start_turn(turn_id="active", content=(TextPart("hello"),))
-                events.inject(method, RpcError(grpc.StatusCode.UNAVAILABLE))
-                with self.assertRaises(SyncReadError) as caught:
-                    chat.resume_turn("old")
-                with self.assertRaises(ClientFailedError) as subsequent:
-                    writer.complete()
-                self.assertIs(caught.exception.failure, subsequent.exception.failure)
 
     def test_same_object_serializes_writes_while_other_objects_continue(self):
         first = self.writer("first")
@@ -732,6 +720,35 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ClientClosedError):
             writer.append(content=(TextPart("late"),))
 
+    def test_close_during_start_returns_writer_for_committed_turn(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_publish(**kwargs):
+            result = self.events.persist(**kwargs)
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release committed start")
+            return result
+
+        self.events.inject("publish_auto_seq", blocked_publish)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            start = pool.submit(self.chat.start_turn, turn_id="starting")
+            self.assertTrue(entered.wait(1))
+            close = pool.submit(self.chat.close)
+            try:
+                with self.chat._condition:
+                    self.assertTrue(self.chat._condition.wait_for(lambda: self.chat._state == "CLOSING", 1))
+                self.assertFalse(close.done())
+            finally:
+                release.set()
+            writer = start.result(timeout=1)
+            close.result(timeout=1)
+        self.assertEqual((writer.turn_id, writer.creation_seq), ("starting", 1))
+        self.assertEqual(len(self.events.messages), 1)
+        with self.assertRaises(ClientClosedError):
+            writer.complete()
+
     def test_invalid_committed_response_fails_client_and_preserves_uuid(self):
         writer = self.writer()
         self.events.inject("publish_auto_seq", SimpleNamespace(seq=0))
@@ -744,9 +761,9 @@ class ClientTests(unittest.TestCase):
 
     def test_close_after_failure_reports_closed_for_new_calls(self):
         writer = self.writer()
-        self.events.inject("get_status", RpcError(grpc.StatusCode.PERMISSION_DENIED))
-        with self.assertRaises(SyncReadError):
-            self.chat.resume_turn("old")
+        self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
+        with self.assertRaises(FetchPageError):
+            self.chat.fetch_page(1)
         self.chat.close()
         with self.assertRaises(ClientClosedError):
             writer.complete()
@@ -793,10 +810,10 @@ class ClientTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             write = pool.submit(writer.complete)
             self.assertTrue(entered.wait(1))
-            self.events.inject("get_status", RpcError(grpc.StatusCode.PERMISSION_DENIED))
+            self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
             try:
-                with self.assertRaises(SyncReadError):
-                    self.chat.resume_turn("old")
+                with self.assertRaises(FetchPageError):
+                    self.chat.fetch_page(1)
             finally:
                 release.set()
             self.assertEqual(write.result(timeout=1), 2)

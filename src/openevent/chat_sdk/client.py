@@ -10,8 +10,8 @@ from openevent.sdk.proto import openevent_pb2
 from .codec import encode_payload, make_content, parse_message, validate_turn_id, validate_uint64
 from .errors import (
     ChannelInitializationError, ChatProtocolError, ClientClosedError,
-    ClientFailedError, FetchPageError, PublishFailedError, SyncReadError,
-    TurnNotFoundError, TurnWriterStateError, UuidAllocationError, make_failure,
+    ClientFailedError, FetchPageError, PublishFailedError,
+    TurnWriterStateError, UuidAllocationError, make_failure,
 )
 from .model import FetchPage, ObjectKey, TurnRef
 
@@ -82,7 +82,7 @@ class ChatProtocolClient:
         if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (float, int))
                 or not math.isfinite(timeout_ms) or timeout_ms <= 0):
             raise ChatProtocolError("injected client timeout_ms must be positive and finite")
-        for method in ("get_channel", "get_status", "fetch", "get_uuid",
+        for method in ("get_channel", "fetch", "get_uuid",
                        "get_seq_by_uuid", "publish_auto_seq"):
             if not callable(getattr(events, method, None)):
                 raise ChatProtocolError(f"injected client must provide {method}")
@@ -284,7 +284,7 @@ class ChatProtocolClient:
     def fetch_page(self, from_seq, limit=100):
         with self._operation():
             self._validate_fetch(from_seq, limit)
-            return self._fetch_page(from_seq, limit, recovery=False)
+            return self._fetch_page(from_seq, limit)
 
     @staticmethod
     def _validate_fetch(from_seq, limit):
@@ -292,16 +292,15 @@ class ChatProtocolClient:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ChatProtocolError("limit must be an integer in 1..1000")
 
-    def _fetch_page(self, from_seq, limit, *, recovery):
-        error_type = SyncReadError if recovery else FetchPageError
+    def _fetch_page(self, from_seq, limit):
         try:
             response = self._rpc("Fetch", lambda: self._events.fetch(
                 principal=self._principal, token=self._token, from_seq=from_seq, limit=limit,
                 channels=(self._channel_id,), only_my_recipient=False))
         except _RpcFailure as error:
-            if recovery or error.failure.category in {"protocol", "contract"}:
+            if error.failure.category in {"protocol", "contract"}:
                 self._fail(error.failure)
-            raise error_type(error.failure) from None
+            raise FetchPageError(error.failure) from None
         try:
             last_seq = validate_uint64(response.last_seq, "last_seq", positive=False)
             next_seq = validate_uint64(response.next_seq, "next_seq", positive=False)
@@ -326,7 +325,7 @@ class ChatProtocolClient:
             detail = str(exc) if type(exc) is ValueError else "Fetch returned invalid envelope or cursor fields"
             failure = make_failure("Fetch", category="contract", detail=detail)
             self._fail(failure)
-            raise error_type(failure) from None
+            raise FetchPageError(failure) from None
         messages = []
         for raw in raw_messages:
             # System messages share the Channel and cursor, but not chat.v1 payloads.
@@ -338,86 +337,28 @@ class ChatProtocolClient:
                 failure = make_failure("Fetch", category="protocol",
                                        detail=f"Fetch returned invalid chat.v1 data at seq {raw.seq}")
                 self._fail(failure)
-                raise error_type(failure) from None
+                raise FetchPageError(failure) from None
         return FetchPage(tuple(messages), next_seq, last_seq)
-
-    def resume_turn(self, turn_id, *, state_start_seq=1):
-        with self._operation():
-            validate_turn_id(turn_id)
-            validate_uint64(state_start_seq, "state_start_seq")
-            try:
-                status = self._rpc("GetStatus", lambda: self._events.get_status(
-                    principal=self._principal, token=self._token))
-            except _RpcFailure as error:
-                self._fail(error.failure)
-                raise SyncReadError(error.failure) from None
-            try:
-                watermark = validate_uint64(status.max_seq, "max_seq", positive=False)
-            except (AttributeError, ChatProtocolError):
-                failure = make_failure("GetStatus", category="contract",
-                                       detail="GetStatus returned an invalid message range")
-                self._fail(failure)
-                raise SyncReadError(failure) from None
-            cursor = state_start_seq
-            creation_seq = None
-            last_seq = None
-            terminal = False
-            while cursor <= watermark:
-                page = self._fetch_page(cursor, 100, recovery=True)
-                for message in page.messages:
-                    if message.seq > watermark:
-                        break
-                    payload = message.payload
-                    kind = payload["kind"]
-                    if kind == "submission.reserve":
-                        continue
-                    if kind == "turn.cancel":
-                        target = payload["target_turn"]
-                        if target["principal"] == self._principal and target["turn_id"] == turn_id:
-                            if creation_seq is None:
-                                self._invalid_recovery(message.seq, "cancel precedes target creation")
-                            terminal = True
-                        continue
-                    if message.principal != self._principal or payload["turn_id"] != turn_id:
-                        continue
-                    if kind in {"turn.start", "turn.single"}:
-                        if creation_seq is not None:
-                            self._invalid_recovery(message.seq, "target has multiple creation events")
-                        creation_seq = message.seq
-                        last_seq = message.seq
-                        terminal = kind == "turn.single"
-                    elif not terminal:
-                        if creation_seq is None or payload["pre_seq"] != last_seq:
-                            self._invalid_recovery(message.seq, "target has a broken or forked chain")
-                        if kind in {"turn.append", "turn.reset"}:
-                            last_seq = message.seq
-                        elif kind == "turn.end":
-                            terminal = True
-                if page.next_seq == cursor:
-                    with self._condition:
-                        self._condition.wait_for(lambda: self._state != "READY", _RETRY_SECONDS)
-                cursor = page.next_seq
-            if creation_seq is None:
-                raise TurnNotFoundError("Target turn does not exist in the recovery range")
-            if terminal:
-                raise TurnWriterStateError("Target turn has already ended")
-            return TurnWriter(self, turn_id, creation_seq, last_seq)
-
-    def _invalid_recovery(self, seq, reason):
-        failure = make_failure("Fetch", category="protocol",
-                               detail=f"Invalid target turn history at seq {seq}: {reason}")
-        self._fail(failure)
-        raise SyncReadError(failure)
 
 
 class TurnWriter:
-    """State for one streaming turn, held only by its caller."""
+    """Continue a known open turn without reading or publishing any history.
+
+    The caller supplies the confirmed start and current tail in the client's
+    Channel, owned by its principal, after completing any previous writes.
+    Construction validates local arguments only; each write checks the client's
+    lifecycle. The caller remains responsible for observing end/cancel events.
+    """
 
     def __init__(self, client, turn_id, creation_seq, last_seq):
+        if not isinstance(client, ChatProtocolClient):
+            raise ChatProtocolError("client must be ChatProtocolClient")
         self._client = client
-        self._turn_id = turn_id
-        self._creation_seq = creation_seq
-        self._last_seq = last_seq
+        self._turn_id = validate_turn_id(turn_id)
+        self._creation_seq = validate_uint64(creation_seq, "creation_seq")
+        self._last_seq = validate_uint64(last_seq, "last_seq")
+        if self._last_seq < self._creation_seq:
+            raise ChatProtocolError("last_seq must not precede creation_seq")
         self._state = "open"
         self._lock = threading.Lock()
 

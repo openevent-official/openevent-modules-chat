@@ -4,7 +4,7 @@
 
 This page provides minimal examples only. See [CHAT_SDK.md](CHAT_SDK.md) for the complete public API, retry, and lifecycle rules.
 
-The examples use replies by creation event seq, independent writers, explicit recovery, empty-content starts, and resets.
+The examples use replies by creation event seq, independent writers, continuing turns from known state, empty-content starts, and resets.
 
 ## Prerequisites
 
@@ -60,7 +60,22 @@ A successful write return means OpenEvent committed the message. The example app
 
 Save the seq returned by `single_turn`, or the `creation_seq` of a writer returned by `start_turn`, and pass it in `reply_to_seqs` when replying. The SDK validates field shape only; it does not read history to validate targets. Select valid targets according to [protocol section 11](CHAT_PROTOCOL.md#11-reply-relationships).
 
-For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn` to record cancellation of an existing TurnRef. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. Continuing an old turn requires explicit `resume_turn()`; see the [write API](CHAT_SDK.md#3-write-api) for preconditions and failure handling. For files generated during output, see the [attachment append example](CHAT_SDK.md#3-write-api).
+For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn` to record cancellation of an existing TurnRef. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. For files generated during output, see the [attachment append example](CHAT_SDK.md#3-write-api).
+
+## Continuing an unfinished turn
+
+When an application's own reader has confirmed that a turn is unfinished and knows its creation position and current tail, it can construct a writer directly:
+
+```python
+from openevent.chat_sdk import TurnWriter
+
+# The application projection confirmed this turn's state, and the old-write handoff is complete.
+writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+writer.append(content=(TextPart("Continuing the previous reply."),))
+writer.complete()
+```
+
+Construction does not reread history or publish another `turn.start`. See the [writer contract](CHAT_SDK.md#31-independent-writers) for parameter semantics. Applications reconstruct the current state. Old requests must finish before continuation; see the [old-write handoff contract](CHAT_SDK.md#32-old-write-handoff).
 
 ## Carrying extensions unchanged
 

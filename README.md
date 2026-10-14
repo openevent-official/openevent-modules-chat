@@ -6,7 +6,7 @@ OpenEvent Chat defines `chat.v1`, a compact event protocol for permanent convers
 
 > The Chat SDK, Chat Server, browser, and Agent must all support the current `chat.v1`, including streaming resets, empty-content starts, and attachment-only appends. Older reading rules are not supported.
 
-The project includes a Python SDK for `chat.v1` writes, one-page-at-a-time Fetch reads, and stateless message parsing. Streaming messages are appended, reset, and ended through writer objects held by the caller; continuing an existing message requires explicit writer recovery. SDK construction does not recover history automatically. Callers that need continuous reads run their own Fetch loop and retain their read position.
+The project includes a Python SDK for `chat.v1` writes, one-page-at-a-time Fetch reads, and stateless message parsing. Streaming messages are appended, reset, and ended through writer objects held by the caller. To continue an existing message, construct `TurnWriter` directly from known state reconstructed by the caller; see the [public write API](docs/CHAT_SDK.md#3-write-api). SDK construction does not recover history automatically. Callers that need continuous reads run their own Fetch loop and retain their read position.
 The project also provides a chat backend and browser page with sessions, files, and active message polling; it does not include an Agent runtime or model integration.
 
 ## Protocol

@@ -33,7 +33,7 @@ A `ChatProtocolClient` is permanently bound to one nonzero `principal`, one toke
 
 The constructor and `create_client()` accept an optional `channel_validator`, defaulting to `None`. An application can supply a synchronous, read-only validation function. After basic validation, the SDK passes the `ChannelInfo` from the same GetChannel response to it exactly once, without another Channel read. Returning normally means validation passed. An exception causes construction to raise `ChannelInitializationError` with `failure.category="contract"`; validation is not retried, and the original exception text is not included in the failure. Application rules such as membership and naming belong to that function, not to the SDK. Without it, only basic validation runs.
 
-`max_retries` must be a nonnegative integer; `0` means one attempt. The history recovery start is supplied to an explicit `resume_turn()` call, not to construction. The injected client must expose a positive, finite `timeout_ms` in milliseconds and thread-safe `get_channel`, `get_status`, `fetch`, `get_uuid`, `get_seq_by_uuid`, and `publish_auto_seq` methods.
+`max_retries` must be a nonnegative integer; `0` means one attempt. The SDK provides no history-scanning recovery entry point; applications reconstruct state and directly construct a writer. The injected client must expose a positive, finite `timeout_ms` in milliseconds and thread-safe `get_channel`, `fetch`, `get_uuid`, `get_seq_by_uuid`, and `publish_auto_seq` methods.
 
 The SDK reads but does not modify the injected client's `timeout_ms`. It does not close that client or its gRPC channel.
 
@@ -124,15 +124,30 @@ The SDK writes the caller's `reply_to_seqs` into the same-named JSON numeric arr
 
 ### 3.1 Independent writers
 
-`TurnWriter` is returned by `start_turn()` or `resume_turn()` and is bound to the creating client, its principal, and its Channel. It exposes read-only `turn_id` and `creation_seq`, and internally retains the last confirmed committed `last_seq` and the state `open`, `completed`, or `unresolved`. It keeps neither the full content nor conversation history and cannot switch clients.
+`TurnWriter` can be returned by `start_turn()`, or constructed directly from state the caller has already confirmed. It is bound to the supplied client, its principal, and its Channel. It exposes read-only `turn_id` and `creation_seq`, and internally retains the last confirmed committed `last_seq` and the state `open`, `completed`, or `unresolved`. It keeps neither the full content nor conversation history and cannot switch clients.
 
-Public write signatures:
+Public constructor and write signatures:
 
 ```text
+TurnWriter(client: ChatProtocolClient, turn_id: str, creation_seq: int, last_seq: int)
 writer.append(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
 writer.reset(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
 writer.complete(*, recipients=(), extensions=None) -> int
 ```
+
+Constructor arguments can be positional or keyword arguments. `client` must be a `ChatProtocolClient`, and `turn_id` follows the existing public protocol rules. `creation_seq` and `last_seq` must be positive uint64 integers, excluding bool, with `last_seq >= creation_seq`. Invalid arguments raise `ChatProtocolError` without failing the client.
+
+The caller must supply the actual state of a turn owned by the current client principal in the bound Channel that has started and has no effective end/cancel. `creation_seq` is its `turn.start` seq; `last_seq` is its confirmed current chain tail, the seq of a valid start, append, or reset. They are equal for a turn containing only its start. The old-write handoff conditions are in section 3.2. The SDK reads no history to verify this state and does not check whether the remote turn exists or is terminal.
+
+```python
+from openevent.chat_sdk import TurnWriter
+
+# The application confirmed this unfinished turn's creation seq 210 and current tail 217, and completed the old-write handoff.
+writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+seq = writer.append(content=(TextPart("Continuing."),))
+```
+
+Construction is entirely local and only creates an `open` writer: it makes no RPC, allocates no UUID, publishes no `turn.start` or other message, and reads no history. The caller supplies no existing body, attachments, or reply relationships; later writes continue from the original turn's tail. Construction does not check the client lifecycle or make a failed or closed client usable again. Every write still checks the lifecycle under section 5.
 
 A new writer's internal `last_seq` points to the turn's confirmed chain tail. Each append, reset, or complete uses the current `last_seq` for `pre_seq`. Successful append and reset calls update `last_seq` before returning. Successful complete updates `last_seq` and enters `completed` before returning. State checks, publishing, retries, and result registration are serialized within each writer; writers for different turns can write independently. Writer state describes local publishing, not the conversation projection: `completed` means only that this writer's end was committed and does not change the protocol's earliest-terminal-event rule.
 
@@ -144,25 +159,11 @@ If the outcome of append, reset, or complete is uncertain, the writer enters `un
 
 Reset is not a remedy for an unknown publish outcome. Before retrying the model, the application must stop old model output from entering this writer and wait for old Chat writes to finish. Old output must not append after reset. Reset cannot make an `unresolved` writer `open`, and a Fetch that does not find the old write does not remove the handoff precondition.
 
-### 3.2 Explicitly recovering an existing streaming turn
+### 3.2 Old-write handoff
 
-This example recovers an unfinished turn whose old writes satisfy the handoff conditions below:
+To continue an existing turn, the caller must first stop the old writer and confirm that all old requests for that turn have finished and cannot commit late. If a publish is uncertain, first establish its original outcome or ensure that the original request can no longer commit. Then construct `TurnWriter` directly from the current state reconstructed and confirmed by the application, as described in section 3.1. The SDK provides no history-scanning recovery entry point.
 
-```python
-writer = chat.resume_turn("unfinished-1", state_start_seq=1)
-seq = writer.append(content=(TextPart("Continuing."),))
-seq = writer.complete()
-```
-
-The public signature is `resume_turn(turn_id: str, *, state_start_seq: int = 1) -> TurnWriter`. It recovers only the target turn owned by the current client principal in the bound Channel and publishes nothing. `state_start_seq` must be a positive uint64 integer, excluding bool, and cannot be later than the target creation event.
-
-Before recovery, callers must stop the old writer and confirm that all old requests for the turn have finished and cannot commit late. When a publish is uncertain, first confirm its original outcome or ensure that the original request cannot commit again. Dropping an unresolved writer and recovering does not bypass this requirement. The client does not register writers for a turn or coordinate their handoff.
-
-The SDK obtains one GetStatus watermark and pages through the fixed range from `state_start_seq`, using temporary state to recover only the target creation seq, tail, and terminal state. If the target remains writable, it returns a new `open` writer with `creation_seq` and `last_seq` set. Missing targets raise `TurnNotFoundError`; terminal targets raise `TurnWriterStateError`. Failure returns no writer and leaves no target state in the client. Recovery uses the same one-page reading rules in section 2.1, advancing past system messages and system-only pages. It parses `submission.reserve` and advances its read position without treating it as a turn event.
-
-Recovery recognizes effective `turn.reset` events according to the public protocol, advances the tail to their seq, and processes subsequent appends and terminal events. Reset neither changes the creation seq nor makes a terminal target writable. The recovered writer needs no body or attachment contents from before or after reset.
-
-Only explicit `resume_turn()` scans history for recovery. Construction, ordinary `fetch_page()`, creation, cancellation, and writer append/reset/complete do not trigger recovery automatically. Recovery errors and their client-wide effects follow sections 4–5.
+Discarding an unresolved writer and constructing another one cannot bypass this precondition. Two writers cannot concurrently continue the same turn. The client keeps no per-turn writer registry and does not coordinate handoff for the caller.
 
 ### 3.3 Publishing a submission reservation control event
 
@@ -186,7 +187,7 @@ Each logical publish internally obtains exactly one UUID through `get_uuid()`. B
 
 If a Publish retry with the same UUID returns `ALREADY_EXISTS`, the SDK calls `get_seq_by_uuid(uuid)` and returns the previously committed seq. It neither scans historical UUIDs nor obtains a second UUID for the same logical publish.
 
-Section 3.1 defines unresolved writer handling. GetStatus and Fetch failures during explicit recovery follow section 5. `PublishFailedError` can still describe a publish that committed without successful reconciliation. Its `uuid` is always the nonzero UUID obtained for this logical publish and can be recorded with structured failure information in redacted logs. It is not an argument for the next Chat write and provides no cross-process recovery or resend capability. Applications choose their own business recovery policy.
+Section 3.1 defines unresolved writer handling. One-page Fetch failures follow section 5. `PublishFailedError` can still describe a publish that committed without successful reconciliation. Its `uuid` is always the nonzero UUID obtained for this logical publish and can be recorded with structured failure information in redacted logs. It is not an argument for the next Chat write and provides no cross-process recovery or resend capability. Applications choose their own business recovery policy.
 
 Public errors needing a root cause expose the same read-only `failure: FailureInfo` structure. `FailureInfo` is publicly exported from `openevent.chat_sdk`. Its structure is:
 
@@ -202,7 +203,7 @@ class FailureInfo:
     detail: str
 ```
 
-- `stage` identifies the failed step, such as `GetChannel`, `GetStatus`, `Fetch`, `get_uuid`, `PublishAutoSeq`, or `GetSeqByUuid`.
+- `stage` identifies the failed step, such as `GetChannel`, `Fetch`, `get_uuid`, `PublishAutoSeq`, or `GetSeqByUuid`.
 - `category` is the stable application branching key; do not parse `detail`.
 - `grpc_code` retains the last received gRPC status, or `None` if the failure is not a gRPC result or no status was received.
 - `detail` must describe the specific cause, such as `Fetch failed after 4 attempts` or `Fetch returned seq 119 followed by seq 118`, rather than only `operation failed`. It may be used in redacted logs but must not contain tokens, ObjectKeys, payloads, or full message bodies.
@@ -232,22 +233,21 @@ Classification uses only the RPC stage, public semantics, and established facts,
 
 A final remote rejection does not prove that earlier uncertain attempts with the same UUID did not commit. Commit determination for the complete logical publish, unresolved writer state, and resend restrictions continue to follow this section and section 3.1.
 
-`ChannelInitializationError`, `FetchPageError`, `SyncReadError`, `UuidAllocationError`, `PublishFailedError`, and `ClientFailedError` all expose `failure`. Wrappers must preserve the original `FailureInfo`, rather than reducing it to a generic “client failed” in `ClientFailedError`. `PublishFailedError` also exposes `uuid`. Normal `chat.close()` and local turn precondition errors use their specific returns, exception types, and messages without fabricating remote failure information.
+`ChannelInitializationError`, `FetchPageError`, `UuidAllocationError`, `PublishFailedError`, and `ClientFailedError` all expose `failure`. Wrappers must preserve the original `FailureInfo`, rather than reducing it to a generic “client failed” in `ClientFailedError`. `PublishFailedError` also exposes `uuid`. Normal `chat.close()` and local turn precondition errors use their specific returns, exception types, and messages without fabricating remote failure information.
 
 Public API errors:
 
 - `ChatProtocolError`: invalid SDK input or individual payload.
 - `ChannelInitializationError`: the client could not become ready; `failure` provides the Channel validation stage and cause.
 - `FetchPageError`: one-page Fetch or message parsing failed; `failure` provides the actual stage and cause.
-- `TurnNotFoundError`: explicit recovery did not find the target turn.
-- `TurnWriterStateError`: the writer is completed or unresolved, or the explicit recovery target is terminal.
-- `SyncReadError` and `UuidAllocationError`: Publish has not been sent; `failure` identifies the failed RPC or lifecycle cause.
+- `TurnWriterStateError`: the writer is completed or unresolved.
+- `UuidAllocationError`: Publish has not been sent; `failure` identifies the failed RPC or lifecycle cause.
 - `PublishFailedError`: after obtaining the UUID, PublishAutoSeq or UUID lookup failed, or an initiated Publish was interrupted by the client lifecycle. Its `uuid` and `failure` can be logged. Regardless of the error category, this does not authorize automatically sending a new Chat message.
 - `ClientFailedError` and `ClientClosedError`: the client has permanently failed or closed.
 
 ## 5. Client lifecycle
 
-After construction the client is ready and can only permanently fail or close. Failed or closed clients cannot recover or be reused. `resume_turn()` is a complete recovery operation: exhausted retries or nonretryable remote errors from GetStatus or recovery Fetch permanently fail the entire client. Invalid arguments, a missing target, or a terminal target reject only that recovery call. Invalid protocol history, an invalid Fetch response, or corrupted derived local state also permanently fail the client. Errors are reported through the current synchronous method's exception. Later client calls and bound writer writes raise `ClientFailedError` preserving the original `FailureInfo`. Ordinary one-page Fetch call errors end only that call; the caller decides whether to retry or exit.
+After construction the client is ready and can only permanently fail or close. Failed or closed clients cannot recover or be reused. Invalid protocol messages, an invalid Fetch response, or corrupted derived local state permanently fail the client. Errors are reported through the current synchronous method's exception. Later client calls and bound writer writes raise `ClientFailedError` preserving the original `FailureInfo`. Ordinary remote errors from one-page Fetch end only that call; the caller decides whether to retry or exit.
 
 ```python
 chat.close()
@@ -261,6 +261,6 @@ The underlying connection is managed by its owner. To interrupt its in-flight RP
 
 Deploy at most one active Chat writing process per `(principal, channel_id)`. One process may hold writers for different turns. The SDK provides no cross-process lock, lease, persistent cursor, checkpoint, or application projection. Applications coordinate writers, persist the read positions and business recovery state they need, and arrange reads and processing after restart.
 
-SDK construction and writer operations do not reconstruct history. Explicit `resume_turn()` cost grows with the scanned range; it neither maintains allocation state nor validates historical reservation capacity. Each message accepts at most 1024 ObjectKeys. SDK errors never log ObjectKey tokens, principal tokens, payloads, or full bodies.
+The SDK does not reconstruct history, maintain allocation state, or validate historical reservation capacity. Each message accepts at most 1024 ObjectKeys. SDK errors never log ObjectKey tokens, principal tokens, payloads, or full bodies.
 
 The reset, empty-content start, and attachment-only append extensions still use `chat.v1`. Before publishing these events, all readers in the deployment—including SDKs, Agents, Chat Server, and browsers—must support the corresponding parsing, content rules, and projection behavior. Older readers may not recognize reset or may reject empty-content events allowed by the new rules, so they are not compatible. Reset changes only the currently visible body and attachment collection; it deletes neither historical ObjectKeys nor ObjectStorage objects.

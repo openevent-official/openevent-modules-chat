@@ -5,7 +5,7 @@
 本文只给出最小调用示例。完整的公开 API、重试和生命周期规则见
 [CHAT_SDK_cn.md](CHAT_SDK_cn.md)。
 
-以下示例使用按创建事件 seq 回复、独立写入对象、显式恢复、空内容 start 与 reset 接口。
+以下示例使用按创建事件 seq 回复、独立写入对象、从已知状态继续 turn、空内容 start 与 reset 接口。
 
 ## 运行前提
 
@@ -71,8 +71,23 @@ SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议�
 流式 turn 使用 `start_turn` 取得写入对象，然后零次或多次调用它的 `append()`，最后调用 `complete()`。
 写入对象保存自己的链尾，client 不保存 turn 状态；完成后可释放对象。使用 `cancel_turn` 记录对既有 TurnRef 的取消；正常读取观察到有效取消后，
 调用方停止续写并释放对应对象，释放本身不发布事件或撤销在途请求。
-继续旧 turn 必须显式调用 `resume_turn()`；前提和失败处理见[写入 API](CHAT_SDK_cn.md#3-写入-api)。
 输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#3-写入-api)。
+
+## 继续未结束的 turn
+
+应用已经通过自己的读取器确认 turn 尚未结束，并知道创建位置和当前链尾时，可以直接构造写入对象：
+
+```python
+from openevent.chat_sdk import TurnWriter
+
+# 已从应用投影确认该 turn 的状态，并完成旧写入交接。
+writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+writer.append(content=(TextPart("继续之前的回复。"),))
+writer.complete()
+```
+
+构造不重新读取历史，也不再发一条 `turn.start`。参数语义见[写入对象契约](CHAT_SDK_cn.md#31-独立写入对象)。
+应用负责恢复当前状态；旧请求必须完成后才能续写，详见[旧写入交接](CHAT_SDK_cn.md#32-旧写入交接)。
 
 ## 原样携带扩展
 

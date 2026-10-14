@@ -36,10 +36,6 @@ class FetchPageError(_FailureError):
     pass
 
 
-class SyncReadError(_FailureError):
-    pass
-
-
 class UuidAllocationError(_FailureError):
     pass
 
@@ -56,10 +52,6 @@ class ClientFailedError(_FailureError):
 
 
 class ClientClosedError(Exception):
-    pass
-
-
-class TurnNotFoundError(Exception):
     pass
 
 

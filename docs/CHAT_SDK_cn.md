@@ -41,8 +41,8 @@ SDK 完成基础校验后，把本次 GetChannel 返回的 `ChannelInfo` 传给�
 正常返回表示通过；抛出异常则构造失败，SDK 抛出 `ChannelInitializationError`，其 `failure.category="contract"`，不重试校验，
 也不把原始异常文本放入 failure。成员、名称等应用规则由该函数定义，SDK 不内置这些规则。不提供函数时只执行基础校验。
 
-`max_retries` 必须是非负整数，`0` 表示只尝试一次。历史恢复起点由显式 `resume_turn()` 调用传入，不是构造参数。
-注入 client 必须提供正的有限 `timeout_ms`（单位毫秒），以及线程安全的 `get_channel`、`get_status`、`fetch`、`get_uuid`、`get_seq_by_uuid` 和 `publish_auto_seq` 方法。
+`max_retries` 必须是非负整数，`0` 表示只尝试一次。SDK 不提供历史扫描恢复入口；应用恢复状态后直接构造写入对象。
+注入 client 必须提供正的有限 `timeout_ms`（单位毫秒），以及线程安全的 `get_channel`、`fetch`、`get_uuid`、`get_seq_by_uuid` 和 `publish_auto_seq` 方法。
 
 SDK 只读取、不修改注入 client 的 `timeout_ms`，也不关闭注入 client 或其 gRPC channel。
 
@@ -150,17 +150,38 @@ SDK 不为回复引用调用 Fetch 或 GetStatus，不核验目标是否存在�
 
 ### 3.1 独立写入对象
 
-`TurnWriter` 由 `start_turn()` 或 `resume_turn()` 返回，绑定创建它的 client 及其 principal、Channel。对象公开只读的
+`TurnWriter` 可由 `start_turn()` 返回，也可根据调用方已经确认的状态直接构造；它绑定传入的 client 及其 principal、Channel。对象公开只读的
 `turn_id` 和 `creation_seq`；内部保存最后确认提交的 `last_seq`，以及 `open`、`completed` 或 `unresolved` 状态。
 它不保存完整消息内容或会话历史，也不支持切换到另一个 client。
 
-公开写入签名为：
+公开构造和写入签名为：
 
 ```text
+TurnWriter(client: ChatProtocolClient, turn_id: str, creation_seq: int, last_seq: int)
 writer.append(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
 writer.reset(*, content=(), recipients=(), object_keys=(), extensions=None) -> int
 writer.complete(*, recipients=(), extensions=None) -> int
 ```
+
+构造参数可以按位置或关键字传入。`client` 必须是 `ChatProtocolClient`，`turn_id` 遵守公开协议的既有规则；
+`creation_seq` 和 `last_seq` 必须是非 bool 的正 uint64 整数，且 `last_seq >= creation_seq`。
+非法参数抛出 `ChatProtocolError`，不使 client 失败。
+
+调用方必须提供当前 client principal 在绑定 Channel 中一条已开始、尚未有效 end/cancel 的 turn 的真实状态：
+`creation_seq` 是其 `turn.start` 的 seq，`last_seq` 是已经确认的当前链尾，即有效的 start、append 或 reset 的 seq。
+若 turn 只有 start，两者相等。交接旧写入的前提见第 3.2 节；SDK 不读取历史核验这些状态，也不检查远端 turn 是否存在或已结束。
+
+```python
+from openevent.chat_sdk import TurnWriter
+
+# 应用已确认该 turn 未结束，创建位置为 210，当前链尾为 217，并已完成旧写入交接。
+writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+seq = writer.append(content=(TextPart("继续。"),))
+```
+
+构造是纯本地操作，只创建 `open` 对象：不发起 RPC、不分配 UUID、不发布 `turn.start` 或其它消息，也不读取历史。
+调用方无需传入已有正文、附件或回复关系；后续写入沿原 turn 的链尾继续。构造不检查 client 生命周期，
+也不会使失败或关闭的 client 恢复可用；每次写入仍按第 5 节检查生命周期。
 
 新建对象的内部 `last_seq` 指向该 turn 已确认的链尾。每次 append、reset 或 complete 用当前 `last_seq` 填写 `pre_seq`；append 或 reset 成功后在返回前
 更新 `last_seq`，complete 成功后在返回前更新 `last_seq` 并进入 `completed`。同一个对象内的状态判断、发布、重试和结果登记串行执行；不同 turn
@@ -183,32 +204,11 @@ append、reset 或 complete 的发布结果不确定时，对象进入 `unresolv
 reset 不是未知发布结果的补救操作。重试模型之前，应用必须停止旧模型输出进入此 writer，并等旧的 Chat 写入完成；
 不能让旧输出在 reset 后继续 append。`unresolved` 对象不能靠 reset 恢复为 `open`，一次 Fetch 未看到旧写入也不解除交接前提。
 
-### 3.2 显式恢复已有流式 turn
+### 3.2 旧写入交接
 
-以下示例恢复一条尚未结束的旧 turn，原写入已满足下文的交接条件：
-
-```python
-writer = chat.resume_turn("unfinished-1", state_start_seq=1)
-seq = writer.append(content=(TextPart("继续。"),))
-seq = writer.complete()
-```
-
-公开签名为 `resume_turn(turn_id: str, *, state_start_seq: int = 1) -> TurnWriter`。它只恢复当前 client principal 在绑定 Channel 中的
-目标 turn，不发布消息。`state_start_seq` 必须是非 bool 的正 uint64 整数，且不得晚于目标创建事件。
-
-恢复前，调用方必须停止旧对象的写入，确认该 turn 的旧请求都已结束、不会再有迟到的提交；有不确定发布时，先确认原结果或保证原请求不会再提交。
-不能通过丢弃未决对象再调用恢复来绕过这个前提。client 不登记同一 turn 的对象，也不代替调用方协调交接。
-
-SDK 取得一次 GetStatus 水位，从 `state_start_seq` 按页读完固定范围，用临时状态只恢复目标的创建 seq、链尾和终态。目标仍可续写时，
-返回 `open` 的新对象，并设置其 `creation_seq` 和 `last_seq`；目标不存在时抛出 `TurnNotFoundError`，已经终结时抛出 `TurnWriterStateError`。
-失败不返回对象，也不在 client 中留下目标状态。恢复使用第 2.1 节的同一单页读取规则，跨过系统消息和只含系统消息的页。
-恢复过程解析 `submission.reserve` 并推进读取位置，不把它当作 turn 事件。
-
-恢复按公开协议识别有效 `turn.reset` 并把其 seq 作为新链尾，继续处理其后的追加和终态；
-reset 不改变目标的创建 seq，也不使已终结的目标恢复为可续写。恢复对象无需保存重置前后正文或附件。
-
-只有显式 `resume_turn()` 扫描恢复历史；构造、普通 `fetch_page()`、创建、取消和对象的 append/reset/complete 都不自动触发恢复。
-恢复期间的错误和整个 client 的失败范围遵循第 4～5 节。
+继续已有 turn 时，调用方先停止旧对象的写入，确认该 turn 的旧请求都已结束、不会再有迟到的提交；有不确定发布时，先确认原结果或保证原请求不会再提交。
+然后根据应用恢复并确认的当前状态，按第 3.1 节直接构造 `TurnWriter`。SDK 不提供历史扫描恢复入口。
+不能通过丢弃未决对象再构造来绕过这个前提。同一 turn 不能由两个对象同时续写；client 不登记同一 turn 的对象，也不代替调用方协调交接。
 
 ### 3.3 发布编号预留控制事件
 
@@ -240,7 +240,7 @@ SDK 不计算批大小、不比较历史预留上限，也不分配 `submission_
 `get_seq_by_uuid(uuid)` 并返回此前已经提交的 seq。它不扫描历史 UUID，也不会为同一次逻辑发布领取第二个 UUID。
 
 写入对象的未决处理见第 3.1 节。
-显式恢复中的 GetStatus 和 Fetch 错误按第 5 节统一处理。`PublishFailedError` 仍可能对应一次未完成对账但实际已提交的发布。
+单页 Fetch 错误按第 5 节处理。`PublishFailedError` 仍可能对应一次未完成对账但实际已提交的发布。
 它的 `uuid` 属性始终是本次逻辑发布取得的非零 UUID，调用方可以把它连同结构化失败信息写入脱敏错误日志；它不是下一次 Chat 写入的参数，
 也不提供跨进程恢复或重发能力。应用必须自行决定业务恢复策略。
 
@@ -259,7 +259,7 @@ class FailureInfo:
     detail: str
 ```
 
-- `stage` 指出失败发生在哪一步，例如 `GetChannel`、`GetStatus`、`Fetch`、`get_uuid`、`PublishAutoSeq` 或 `GetSeqByUuid`。
+- `stage` 指出失败发生在哪一步，例如 `GetChannel`、`Fetch`、`get_uuid`、`PublishAutoSeq` 或 `GetSeqByUuid`。
 - `category` 是应用应当用于分支判断的稳定分类；不要解析 `detail`。
 - `grpc_code` 保留最后一次收到的 gRPC status；失败不是 gRPC 返回或尚未收到 status 时为 `None`。
 - `detail` 必须说清具体原因，例如 `Fetch failed after 4 attempts` 或 `Fetch returned seq 119 followed by seq 118`，不能只写
@@ -297,7 +297,7 @@ gRPC status 需要结合操作阶段解释，稳定映射如下：
 `PublishAutoSeq` 的大小限制不是等待即可消失的暂时资源故障。调用方按 `category` 和操作阶段处理错误；分类本身不表示写入可以安全重发。
 最后一次远端拒绝不能证明此前同一 UUID 的不确定尝试没有提交；整次逻辑发布的提交判断、writer 未决状态和重发限制保持本节及第 3.1 节的规则。
 
-`ChannelInitializationError`、`FetchPageError`、`SyncReadError`、`UuidAllocationError`、`PublishFailedError` 和 `ClientFailedError`
+`ChannelInitializationError`、`FetchPageError`、`UuidAllocationError`、`PublishFailedError` 和 `ClientFailedError`
 都公开 `failure`。包装错误必须保留最初的 `FailureInfo`，不能在 `ClientFailedError` 中丢成笼统的“client failed”。
 `PublishFailedError` 另外公开 `uuid`。正常的 `chat.close()` 和本地 turn 前提错误通过各自明确的返回、异常类型及消息表达，
 不伪造远程失败信息。
@@ -307,19 +307,17 @@ gRPC status 需要结合操作阶段解释，稳定映射如下：
 - `ChatProtocolError`：SDK 输入或单条 payload 非法。
 - `ChannelInitializationError`：client 未能进入 ready；`failure` 给出 Channel 校验阶段和根因。
 - `FetchPageError`：单页 Fetch 或单页消息解析失败；`failure` 给出实际阶段和根因。
-- `TurnNotFoundError`：显式恢复没有找到目标 turn。
-- `TurnWriterStateError`：写入对象已完成或未决，或者显式恢复的目标已终结。
-- `SyncReadError` 和 `UuidAllocationError`：尚未发出 Publish；`failure` 给出失败的 RPC 或生命周期根因。
+- `TurnWriterStateError`：写入对象已完成或未决。
+- `UuidAllocationError`：尚未发出 Publish；`failure` 给出失败的 RPC 或生命周期根因。
 - `PublishFailedError`：取得 UUID 后，PublishAutoSeq 或 UUID 查询失败，或已经开始的 Publish 被 client 生命周期中断。其 `uuid` 和
   `failure` 可用于记录错误；无论错误分类为何，都不能据此自动重发一条新的 Chat 消息。
 - `ClientFailedError` 和 `ClientClosedError`：client 永久失败或已关闭。
 
 ## 5. Client 生命周期
 
-构造完成后 client 是 ready，随后只能永久失败或关闭。失败或关闭的 client 都不能恢复或继续使用。`resume_turn()` 是一次完整恢复操作：
-GetStatus 或恢复 Fetch 的远端错误重试耗尽，或返回不可重试的远端错误，均使整个 client 永久失败；参数非法、目标不存在或已终结只拒绝本次恢复。
-协议历史非法、Fetch 响应非法或本地派生状态损坏也会让 client 永久失败。错误通过当前同步方法抛出的异常通知调用方；
-之后的 client 调用及绑定对象的写入均抛出保留原始 `FailureInfo` 的 `ClientFailedError`。单页 Fetch 的普通调用错误只结束本次调用；调用方自行决定是否重试或退出。
+构造完成后 client 是 ready，随后只能永久失败或关闭。失败或关闭的 client 都不能恢复或继续使用。
+读取到非法协议消息、Fetch 响应非法或本地派生状态损坏会让 client 永久失败。错误通过当前同步方法抛出的异常通知调用方；
+之后的 client 调用及绑定对象的写入均抛出保留原始 `FailureInfo` 的 `ClientFailedError`。单页 Fetch 的普通远端调用错误只结束本次调用；调用方自行决定是否重试或退出。
 
 ```python
 chat.close()
@@ -336,7 +334,7 @@ chat.close()
 每个 `(principal, channel_id)` 最多部署一个活跃 Chat 写入进程；同一进程可以持有不同 turn 的多个写入对象。SDK 不提供跨进程锁、租约、持久化游标、checkpoint 或应用投影。
 应用必须协调写入者、保存自身需要的读取位置和业务恢复状态，并自行安排重启后的读取与处理。
 
-SDK 构造和对象写入不重建历史。显式 `resume_turn()` 的耗时随读取范围增长，不维护编号分配状态或核验历史预留额度。
+SDK 不重建历史，也不维护编号分配状态或核验历史预留额度。
 每条消息最多接受 1024 个 ObjectKey，SDK 错误不会记录 ObjectKey token、principal token、payload 或完整正文。
 
 reset、空内容 start 和纯附件 append 扩展仍使用 `chat.v1`。开始发布这些事件前，部署中的 SDK、Agent、Chat Server 和浏览器等所有读取方必须同时支持对应的解析、内容规则及投影行为；
