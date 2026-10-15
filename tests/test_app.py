@@ -187,6 +187,7 @@ class AppTests(unittest.TestCase):
         status, first = self.service.create_session(request)
         self.assertEqual(status, 201)
         self.assertEqual(first["scan_start_seq"], "1")
+        self.assertEqual(first["channel_id"], "1")
         self.assertEqual(self.service.create_session(request), (200, first))
         self.assertEqual(self.events.calls.count("CreateChannel"), 1)
         self.service.close()
@@ -196,6 +197,54 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("GetStatus", self.events.calls)
         self.assertEqual(self.events.calls.count("GetChannel"), 1)
         self.assertEqual(self.service.create_session(request), (200, first))
+
+    def test_rename_persists_without_changing_channel_or_live_session(self):
+        request_id = new_ulid()
+        sid = self.session(request_id)
+        worker = self.service.sessions[sid]
+        self.assertEqual(worker.config.name, "Session " + sid[-6:])
+        original = json.loads((self.path / (sid + ".json")).read_text())
+        self.service.allocate(sid, {"count": "2"})
+        self.events.calls.clear()
+        result = self.service.rename_session(sid, {"name": "项目讨论 🌱"})
+        self.assertEqual(result, {"session_id": sid, "scan_start_seq": original["scan_start_seq"],
+                                  "name": "项目讨论 🌱", "channel_id": original["channel_id"]})
+        self.assertIs(self.service.sessions[sid], worker)
+        self.assertEqual(worker.next_to_issue, 3)
+        self.assertEqual(self.events.calls, [])
+        self.assertEqual(self.events.channels[1].name, "chat-" + sid)
+        self.assertEqual(json.loads((self.path / (sid + ".json")).read_text()), dict(original, name="项目讨论 🌱"))
+        self.assertEqual(self.service.list_sessions(), {"sessions": [result]})
+        self.assertEqual(self.service.create_session({"create_request_id": request_id}), (200, result))
+        self.service.close()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        self.assertEqual(self.service.list_sessions(), {"sessions": [result]})
+
+    def test_rename_rejects_invalid_names_without_writing_or_calling_openevent(self):
+        sid = self.session()
+        path = self.path / (sid + ".json")
+        original = path.read_bytes()
+        self.events.calls.clear()
+        for body in ({}, {"name": ""}, {"name": " \t\n"}, {"name": None}, {"name": 7},
+                     {"name": "\ud800"}, {"name": "valid", "channel_id": "9"}):
+            with self.subTest(body=repr(body)):
+                self.assert_error("invalid_request", lambda: self.service.rename_session(sid, body))
+        self.assert_error("session_not_found", lambda: self.service.rename_session(new_ulid(), {"name": "missing"}))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.events.calls, [])
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_rename_write_failure_keeps_previous_name_and_stops_service(self):
+        sid = self.session()
+        original = (self.path / (sid + ".json")).read_bytes()
+        old_name = self.service.sessions[sid].config.name
+        with patch("openevent.chat_app.config.os.replace", side_effect=OSError("file-secret")):
+            log = self.assert_fatal_log(lambda: self.service.rename_session(sid, {"name": "new name"}),
+                                        session_id=sid, channel_id="1", filename=sid + ".json")
+        self.assertEqual(log["failure"]["stage"], "RenameSession")
+        self.assertEqual((self.path / (sid + ".json")).read_bytes(), original)
+        self.assertEqual(self.service.sessions[sid].config.name, old_name)
+        self.assertFalse((self.path / ".rename.tmp").exists())
 
     def test_sdk_construction_checks_session_channel_before_startup_succeeds(self):
         sid = self.session()
@@ -789,7 +838,8 @@ class AppTests(unittest.TestCase):
         formal = self.path / pending_path.name
         self.assertEqual(json.loads(formal.read_text()), pending)
         self.assertEqual(self.service.create_session(request), (200, {
-            "session_id": pending["session_id"], "scan_start_seq": pending["scan_start_seq"]}))
+            "session_id": pending["session_id"], "scan_start_seq": pending["scan_start_seq"],
+            "name": pending["name"], "channel_id": pending["channel_id"]}))
         self.assertEqual(self.service.sessions[pending["session_id"]].chat.channel_id, int(pending["channel_id"]))
 
     def test_pending_recovery_preserves_file_when_original_channel_does_not_match(self):
@@ -1018,6 +1068,18 @@ class HTTPTests(unittest.TestCase):
         status, _, data = self.request("POST", f"/api/chat/sessions/{sid}/submissions", '{"count":"1","count":"2"}', headers={"Content-Type": "application/json"})
         self.assertEqual(status, 400)
         self.assertFalse(self.service.fatal.is_set())
+
+    def test_http_rename_requires_auth_and_origin_and_returns_updated_session(self):
+        sid = self.session()
+        path = f"/api/chat/sessions/{sid}/rename"
+        self.assertEqual(self.request("POST", path, {"name": "renamed"}, token=False)[0], 401)
+        self.assertEqual(self.request("POST", path, {"name": "renamed"}, origin=False)[0], 403)
+        self.assertEqual(self.request("POST", path, {"name": " \t"})[0], 400)
+        status, headers, data = self.request("POST", path, {"name": "工作计划"})
+        self.assertEqual(status, 200)
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertEqual(json.loads(data), {"session_id": sid, "scan_start_seq": "1", "name": "工作计划", "channel_id": "1"})
+        self.assertEqual(json.loads(self.request("GET", "/api/chat/sessions")[2])["sessions"], [json.loads(data)])
 
     def test_http_send_reports_processing_and_replays_success_without_a_query_route(self):
         sid = self.session()

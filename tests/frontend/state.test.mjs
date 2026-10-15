@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ActiveLoop, FileInfoStore, MAX_UINT64, applyPage, beginOldBatchCheck, createSession,
-  decimal, inspectSubmission, setInventory, takeSubmission, turnKey,
+  decimal, inspectSubmission, sessionName, setInventory, takeSubmission, turnKey,
 } from '../../src/openevent/chat_app/static/state.mjs';
 
 const SESSION = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
-function session(start = '1') { return createSession({session_id: SESSION, scan_start_seq: start}); }
+function session(start = '1') { return createSession({session_id: SESSION, name: '会话测试', channel_id: '7', scan_start_seq: start}); }
 function event(seq, kind, fields = {}, role = 'agent', attachments = []) {
   return {event_seq: String(seq), ts_ms: '1788336000000', publisher_role: role, recipients: [], attachments,
     payload: {kind, ...fields}};
@@ -35,6 +35,23 @@ test('canonical decimal identifiers retain all uint64 bits', () => {
   assert.equal(decimal(MAX_UINT64.toString()), MAX_UINT64.toString());
   for (const bad of [1, '', '01', '-1', '0', '1.0', (MAX_UINT64 + 1n).toString()]) assert.throws(() => decimal(bad));
   assert.equal(decimal('0', {zero: true}), '0');
+});
+
+test('session names preserve valid Unicode and whitespace without a length limit', () => {
+  for (const name of [' 会话名称 ', '😀', '\ufeff', '长名称'.repeat(1000)]) {
+    assert.equal(sessionName(name), name);
+    assert.equal(createSession({session_id: SESSION, scan_start_seq: '1', channel_id: '7', name}).name, name);
+  }
+  for (const name of [undefined, null, 1, '', ' \t\n', '\u0085\u001c', '\ud83d', '\ude00']) {
+    assert.throws(() => sessionName(name));
+    assert.throws(() => createSession({session_id: SESSION, scan_start_seq: '1', channel_id: '7', name}));
+  }
+});
+
+test('session Channel IDs retain every decimal digit and require a canonical string', () => {
+  const description = {session_id: SESSION, scan_start_seq: '1', name: '会话名称'};
+  assert.equal(createSession({...description, channel_id: '9007199254740993'}).channelId, '9007199254740993');
+  for (const channel_id of [undefined, 7, '', '07', '0', '-1']) assert.throws(() => createSession({...description, channel_id}));
 });
 
 test('one page commits records and cursor atomically, sharing arrays only after successful validation', () => {

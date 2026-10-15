@@ -180,6 +180,14 @@ def run():
                     base = f'/api/chat/sessions/{sid}'
                     config = json.loads((channels / f'{sid}.json').read_text())
                     channel_id = int(config['channel_id'])
+                    assert session == {'session_id': sid, 'scan_start_seq': config['scan_start_seq'],
+                                       'name': config['name'], 'channel_id': str(channel_id)}
+                    session = dict(session, name='项目讨论 🌱')
+                    assert api('POST', base + '/rename', {'name': session['name']}) == session
+                    config = dict(config, name=session['name'])
+                    assert json.loads((channels / f'{sid}.json').read_text()) == config
+                    assert api('GET', '/api/chat/sessions') == {'sessions': [session]}
+                    assert api('POST', '/api/chat/sessions', {'create_request_id': request_id}) == session
                     agent = create_client(events, principal=9002, token=agent_token, channel_id=channel_id)
                     # A newly created Channel already has a system event. Chat hides it while
                     # retaining the raw cursor, so an empty business page can still advance.
@@ -314,6 +322,8 @@ def run():
                 with process(command, root / 'chat-restart.log') as child:
                     wait_http(child, http_port)
                     assert session in api('GET', '/api/chat/sessions')['sessions']
+                    assert api('POST', '/api/chat/sessions', {'create_request_id': request_id}) == session
+                    assert json.loads((channels / f'{sid}.json').read_text()) == config
                     assert pending_session in api('GET', '/api/chat/sessions')['sessions']
                     assert api('POST', '/api/chat/sessions', {'create_request_id': pending_request}) == pending_session
                     api('POST', base + '/turns', send_body, expected=409)
@@ -335,7 +345,7 @@ def run():
                     except (OSError, http.client.HTTPException):
                         pass  # Shutdown may close the HTTP connection before an error is returned.
                     assert child.wait(timeout=15) != 0, 'RPC exhaustion must exit the Chat process unsuccessfully'
-    print('PASS: real OpenEvent + built Chat wheel: initialization, duplicate sends, reset, files, allocation, pending recovery, fatal RPC exhaustion')
+    print('PASS: real OpenEvent + built Chat wheel: initialization, persistent session names, duplicate sends, reset, files, allocation, pending recovery, fatal RPC exhaustion')
 
 
 if __name__ == '__main__':

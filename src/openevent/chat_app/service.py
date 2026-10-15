@@ -13,7 +13,7 @@ from openevent.chat_sdk import ObjectKey, TextPart, TurnRef, create_client
 from openevent.chat_sdk.errors import make_failure
 from openevent.sdk import OpenEventClient
 
-from .config import ConfigStore, MAX_UINT64, ServerConfig, SessionConfig, new_ulid, uint64_string, valid_ulid
+from .config import ConfigStore, MAX_UINT64, ServerConfig, SessionConfig, new_ulid, session_name, uint64_string, valid_ulid
 
 LOG = logging.getLogger(__name__)
 MAX_OBJECT_BYTES = 4 * 1024 * 1024
@@ -85,7 +85,8 @@ class SessionWorker:
         return self.batch_start != 0 and self.batch_start <= value <= self.batch_end
 
     def public_config(self):
-        return {"session_id": self.config.session_id, "scan_start_seq": str(self.config.scan_start_seq)}
+        return {"session_id": self.config.session_id, "scan_start_seq": str(self.config.scan_start_seq),
+                "name": self.config.name, "channel_id": str(self.config.channel_id)}
 
 
 class ChatService:
@@ -249,6 +250,19 @@ class ChatService:
         self._accepting()
         with self._index_lock:
             return {"sessions": [self.sessions[key].public_config() for key in sorted(self.sessions)]}
+
+    def rename_session(self, session_id, body):
+        fields(body, {"name"})
+        try:
+            name = session_name(body["name"])
+        except (ValueError, UnicodeError):
+            raise bad_request("session name must contain non-whitespace UTF-8 text") from None
+        with self._index_lock:
+            worker = self._session(session_id)
+            worker.config = self._call("RenameSession", lambda: self.store.rename(session_id, name),
+                                       session_id=session_id, channel_id=worker.config.channel_id,
+                                       filename=session_id + ".json")
+            return worker.public_config()
 
     def create_session(self, body):
         fields(body, {"create_request_id"})

@@ -1,8 +1,8 @@
-"""Portable configuration and append-only session registration."""
+"""Portable configuration, session registration, and display names."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import os
@@ -61,6 +61,17 @@ def new_ulid() -> str:
     alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     number = (int(time.time() * 1000) << 80) | secrets.randbits(80)
     return "".join(alphabet[(number >> (5 * i)) & 31] for i in range(25, -1, -1))
+
+
+def default_session_name(session_id: str) -> str:
+    return "Session " + session_id[-6:]
+
+
+def session_name(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("session name must contain non-whitespace text")
+    value.encode("utf-8")
+    return value
 
 
 def regular_file(path: Path):
@@ -123,15 +134,17 @@ class SessionConfig:
     create_request_id: str
     channel_id: int
     scan_start_seq: int
+    name: str
 
     def as_json(self):
         return {"format_version": 1, "session_id": self.session_id,
                 "create_request_id": self.create_request_id, "channel_id": str(self.channel_id),
-                "scan_start_seq": str(self.scan_start_seq)}
+                "scan_start_seq": str(self.scan_start_seq), "name": self.name}
 
     @classmethod
     def parse(cls, data, filename):
-        if set(data) != {"format_version", "session_id", "create_request_id", "channel_id", "scan_start_seq"}:
+        required = {"format_version", "session_id", "create_request_id", "channel_id", "scan_start_seq"}
+        if set(data) not in (required, required | {"name"}):
             raise ValueError("invalid session fields")
         if type(data["format_version"]) is not int or data["format_version"] != 1:
             raise ValueError("unsupported session format")
@@ -139,7 +152,7 @@ class SessionConfig:
         if filename != sid + ".json":
             raise ValueError("session filename mismatch")
         return cls(sid, valid_ulid(data["create_request_id"]), uint64_string(data["channel_id"]),
-                   uint64_string(data["scan_start_seq"]))
+                   uint64_string(data["scan_start_seq"]), session_name(data.get("name", default_session_name(sid))))
 
 
 class ConfigStore:
@@ -183,6 +196,8 @@ class ConfigStore:
                 if path.name in (".lock", ".pending"):
                     continue
                 regular_file(path)
+                if path.name == ".rename.tmp":
+                    continue
                 self._register(SessionConfig.parse(strict_json(path.read_bytes().decode("utf-8")), path.name))
             seen_sessions = set(self.sessions)
             seen_requests = set(self.requests)
@@ -194,7 +209,8 @@ class ConfigStore:
                 sid = valid_ulid(path.stem)
                 data = strict_json(path.read_bytes().decode("utf-8"))
                 required = {"format_version", "create_request_id", "session_id", "scan_start_seq"}
-                if set(data) not in (required, required | {"channel_id"}):
+                if set(data) not in (required, required | {"name"}, required | {"channel_id"},
+                                    required | {"channel_id", "name"}):
                     raise ValueError("invalid pending fields")
                 if type(data["format_version"]) is not int or data["format_version"] != 1 or data["session_id"] != sid:
                     raise ValueError("invalid pending identity")
@@ -209,6 +225,8 @@ class ConfigStore:
                 seen_requests.add(request)
                 seen_channels.add(record.channel_id)
                 self.recoverable[sid] = record
+            # The formal JSON remains authoritative if a rename was interrupted.
+            (self.directory / ".rename.tmp").unlink(missing_ok=True)
         except (OSError, ValueError, TypeError) as exc:
             if isinstance(exc, ConfigurationError):
                 raise
@@ -227,7 +245,7 @@ class ConfigStore:
 
     def begin(self, session_id, request_id, scan_start_seq):
         data = {"format_version": 1, "session_id": session_id, "create_request_id": request_id,
-                "scan_start_seq": str(scan_start_seq)}
+                "scan_start_seq": str(scan_start_seq), "name": default_session_name(session_id)}
         with self.lock:
             write_json(self.pending / (session_id + ".json"), data, exclusive=True)
         return data
@@ -243,9 +261,9 @@ class ConfigStore:
             source = self.pending / (pending["session_id"] + ".json")
             regular_file(source)
             data = strict_json(source.read_bytes().decode("utf-8"))
-            if data != pending:
-                raise ConfigurationError("pending configuration mismatch")
             session = SessionConfig.parse(data, source.name)
+            if session != SessionConfig.parse(pending, source.name):
+                raise ConfigurationError("pending configuration mismatch")
             self._check_unique(session)
             final = self.directory / (session.session_id + ".json")
             if final.exists() or final.is_symlink():
@@ -258,6 +276,21 @@ class ConfigStore:
             self._register(confirmed)
             self.recoverable.pop(session.session_id, None)
         return session
+
+    def rename(self, session_id, name):
+        name = session_name(name)
+        with self.lock:
+            session = replace(self.sessions[session_id], name=name)
+            final = self.directory / (session_id + ".json")
+            temporary = self.directory / ".rename.tmp"
+            regular_file(final)
+            try:
+                write_json(temporary, session.as_json(), exclusive=True)
+                os.replace(temporary, final)
+            finally:
+                temporary.unlink(missing_ok=True)
+            self.sessions[session_id] = session
+            return session
 
     def close(self):
         if self._directory_lock is not None:

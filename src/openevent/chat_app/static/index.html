@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -13,37 +13,60 @@
     <form id="login-form" class="login-card">
       <div class="brand-mark" aria-hidden="true">↗</div>
       <p class="eyebrow">OPENEVENT CHAT</p>
-      <h1>继续你的对话</h1>
-      <p class="muted">输入访问口令，打开你的会话。</p>
-      <label for="token">访问口令</label>
+      <h1>Continue your conversation</h1>
+      <p class="muted">Enter your access token to open your sessions.</p>
+      <label for="token">Access token</label>
       <input id="token" name="token" type="password" autocomplete="current-password" required>
       <p id="login-error" class="error" role="alert"></p>
-      <button type="submit" class="primary">进入会话 <span aria-hidden="true">→</span></button>
+      <button type="submit" class="primary">Open chat <span aria-hidden="true">→</span></button>
     </form>
   </section>
   <div id="workspace" class="workspace" hidden>
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark" aria-hidden="true">↗</span><span>OpenEvent <strong>Chat</strong></span></div>
-      <button id="new-session" class="primary">＋ 新建会话</button>
-      <div class="sidebar-heading"><span>我的会话</span><button id="refresh-sessions" class="quiet" aria-label="刷新会话列表">刷新</button></div>
+      <button id="new-session" class="primary">＋ New session</button>
+      <div class="sidebar-heading"><span>My sessions</span><button id="refresh-sessions" class="quiet" aria-label="Refresh sessions">Refresh</button></div>
       <p id="directory-error" class="error" role="alert"></p>
-      <nav id="sessions" aria-label="会话列表"></nav>
-      <div class="sidebar-footer"><span>文字、文件与实时回复</span><button id="logout" class="quiet">移除访问口令</button></div>
+      <nav id="sessions" aria-label="Sessions"></nav>
+      <div class="sidebar-footer"><span>Messages, files, and live replies</span><button id="logout" class="quiet">Sign out</button></div>
     </aside>
     <main class="conversation">
-      <header class="conversation-header"><div><p class="eyebrow">你的工作空间</p><h1 id="session-title">选择一个会话</h1></div><span id="sync-status" class="sync-status" role="status"></span></header>
+      <header class="conversation-header">
+        <div class="conversation-heading">
+          <p class="eyebrow">Your workspace</p>
+          <div id="session-heading" class="session-heading">
+            <h1 id="session-title">Select a session</h1>
+            <button id="rename-session" type="button" class="quiet icon-button" aria-label="Rename session" title="Rename session" hidden>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m16 4 4 4-12 12H4v-4L16 4Z"/><path d="m14 6 4 4"/></svg>
+            </button>
+          </div>
+          <form id="rename-form" class="rename-form" hidden>
+            <label class="sr-only" for="session-name">Session name</label>
+            <div class="rename-controls"><input id="session-name" name="name" type="text" autocomplete="off" required aria-describedby="rename-error"><button id="save-session-name" type="submit" class="quiet">Save</button><button id="cancel-rename" type="button" class="quiet">Cancel</button></div>
+            <p id="rename-error" class="error" role="alert"></p>
+          </form>
+          <p id="session-channel" class="session-channel muted" hidden></p>
+        </div>
+        <span id="sync-status" class="sync-status" role="status"></span>
+      </header>
       <div id="message-error" class="notice error" role="alert" hidden></div>
-      <div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite"></div>
+      <div id="messages" class="messages" role="log" aria-label="Chat history" aria-live="polite"></div>
       <div class="composer-area">
         <div id="submission-status" class="notice" role="status" hidden></div>
         <form id="composer" class="composer">
-          <div id="reply-selection" class="reply-selection" aria-label="选中的回复"></div>
-          <div id="draft-files" class="draft-files" aria-label="待发送文件"></div>
-          <label class="sr-only" for="message-input">消息</label>
-          <textarea id="message-input" rows="3" placeholder="写下你的消息…"></textarea>
-          <div class="composer-actions"><div><button id="choose-files" type="button" class="quiet">＋ 添加文件</button><input id="file-input" type="file" multiple hidden></div><span class="keyboard-hint">Ctrl / ⌘ + Enter 发送</span><button id="send" class="primary" type="submit">发送 <span aria-hidden="true">↑</span></button></div>
+          <div id="reply-selection" class="reply-selection" aria-label="Selected replies"></div>
+          <div id="draft-files" class="draft-files" aria-label="Files to send"></div>
+          <label class="sr-only" for="message-input">Message</label>
+          <textarea id="message-input" rows="3" placeholder="Write a message…"></textarea>
+          <div class="composer-actions">
+            <div><button id="choose-files" type="button" class="quiet">＋ Add files</button><input id="file-input" type="file" multiple hidden></div>
+            <span class="keyboard-hint">Ctrl / ⌘ + Enter to send</span>
+            <button id="send" class="send-button" type="submit" aria-label="Send message" title="Send message">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>
+            </button>
+          </div>
         </form>
-        <p class="composer-note">消息发送后会显示在对话中。文件仅供下载。</p>
+        <p class="composer-note">Sent messages appear in the conversation. Files are available to download.</p>
       </div>
     </main>
   </div>

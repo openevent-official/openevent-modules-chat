@@ -55,6 +55,8 @@ A relative `channels_dir` is resolved from the configuration file's directory an
 openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080
 ```
 
+After startup, the log prints the actual listening address and port.
+
 Open `http://127.0.0.1:8080/api/chat/`, enter `web_token`, and create a session. Each session automatically creates its private Channel; no manual session file is needed. The browser access token, OpenEvent user credentials, and Agent credentials serve three distinct purposes and must not be substituted for one another.
 
 In production, access the application through an HTTPS reverse proxy and explicitly configure the external origin, for example:
@@ -63,25 +65,32 @@ In production, access the application through an HTTPS reverse proxy and explici
 openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080 --origin https://chat.example.com
 ```
 
-The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Cookie over HTTPS; local HTTP is for development only. The token does not appear in URLs. “Remove access token” clears the chat records, drafts, and Cookie saved by the current page.
+The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Cookie over HTTPS; local HTTP is for development only. The token does not appear in URLs. “Sign out” clears the chat records, drafts, and Cookie saved by the current page.
 
 ## Using the page
 
+Buttons, prompts, and statuses are in English; chat content, filenames, and saved session names appear as written.
+History uses pale blue cards for user messages and pale green cards for Agent replies, with matching borders, avatars, and subtle shadows.
+
 - Create, select, or switch sessions. Only the selected session updates messages automatically. Each tab works independently.
   On desktop and mobile, select Refresh to update the session list or retry a failed list request without clearing the current draft.
+- Select the pencil icon beside the session title (labelled “Rename session”), enter a name, and select Save; Cancel keeps the original name.
+  The name is stored in the `name` field of `channels_dir/<session_id>.json` and survives page refreshes and server restarts.
+  A new session defaults to “Session ” followed by the last six characters of its session ID. Renaming does not change the session ID, Channel, or chat history.
+- The current session's Channel ID appears below its title and continues to reflect the actual binding after renaming or switching sessions.
 - During session initialization, edit draft text, select loaded messages as reply targets, download sent attachments, continue loading history, or manually retry file information.
   Selecting files, uploading, starting a new send, requesting confirmation of a pending send again, and cancellation still require initialization to finish. Failures display the cause and allow initialization to be retried. An unconfirmed send keeps its draft locked, but loaded history can still confirm its success.
 - Enter text and optionally add files. Selected files upload immediately and must finish uploading before sending; each file must be between 1 byte and 4 MiB.
 - A file or its information failing validation rejects only that upload and does not stop the entire service.
 - Select existing messages as reply targets; multiple targets are supported. Streaming replies append in place. When retrying, the Agent can reset the same reply and replace its interrupted content with new output.
 - A reply still being generated remains visibly in progress and cancellable even with no text or after being reset to empty. Resetting does not change its position or existing references; reply previews update with the new content.
-- Select Cancel while the Agent is producing output. If cancellation is unconfirmed, retry manually; the page does not resend automatically. Stopping the actual work requires support from the Agent service.
+- Select Stop generating while the Agent is producing output. If cancellation is unconfirmed, retry manually; the page does not resend automatically. Stopping the actual work requires support from the Agent service.
 - Retry failed file-information loads manually. Files open through downloads and are neither executed nor previewed in the chat page.
 - Ordinary requests wait at most 30 seconds; session preparation, uploads, and downloads wait at most 120 seconds. Message synchronization and session preparation retry temporary network failures and timeouts automatically.
-  Session lists, session creation, file information, uploads, downloads, and cancellation require manual retries. If session creation fails, use the page's retry action to continue. A download is handed to the browser for saving only after it finishes completely; failures do not save a partial file.
-- Selecting Send immediately locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
+  Session lists, session creation, renaming, file information, uploads, downloads, and cancellation require manual retries. If session creation fails, use the page's retry action to continue. A download is handed to the browser for saving only after it finishes completely; failures do not save a partial file.
+- Select the circular up-arrow button at the bottom right of the composer (labelled “Send message”) to send. This immediately locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
   If a send times out or is still processing, the page automatically checks the original message's outcome. A timeout does not mean the message was not sent. The content stays locked while the outcome is unknown; follow any prompt to confirm it manually.
-  Confirmed success clears the submitted content and restores editing. Confirmation that nothing was sent preserves the content and restores editing; use the ordinary Send button to send it again.
+  Confirmed success clears the submitted content and restores editing. Confirmation that nothing was sent preserves the content and restores editing; use the same send button to send it again.
   If the backend explicitly reports that an attachment is unavailable, the page ends that send, preserves the content, and restores editing even if an earlier request timed out. Upload the attachment again before sending again.
   Switching away pauses automatic confirmation; switching back resumes it. If the page has reported an error and stopped automatic confirmation, follow its instructions.
 

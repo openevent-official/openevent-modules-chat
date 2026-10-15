@@ -22,6 +22,69 @@ def hold_store(directory, connection):
 
 
 class DirectoryTests(unittest.TestCase):
+    def test_missing_name_uses_default_and_rename_persists_it_without_changing_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "channels"
+            store = config.ConfigStore(directory)
+            pending = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 123), 456)
+            session = store.commit(pending)
+            store.close()
+            path = directory / (session.session_id + ".json")
+            original = json.loads(path.read_text())
+            del original["name"]
+            path.write_text(json.dumps(original))
+            before = path.read_bytes()
+            reopened = config.ConfigStore(directory)
+            try:
+                self.assertEqual(reopened.sessions[session.session_id].name, "Session " + session.session_id[-6:])
+                self.assertEqual(path.read_bytes(), before)
+                renamed = reopened.rename(session.session_id, "自定义名称")
+                self.assertEqual(json.loads(path.read_text()), dict(original, name="自定义名称"))
+            finally:
+                reopened.close()
+            reopened = config.ConfigStore(directory)
+            try:
+                self.assertEqual(reopened.sessions[session.session_id], renamed)
+                self.assertEqual(reopened.requests[session.create_request_id], session.session_id)
+                self.assertEqual(reopened.channels, {456})
+            finally:
+                reopened.close()
+
+    def test_interrupted_rename_temp_is_discarded_and_formal_config_stays_authoritative(self):
+        for leftover in ('{"name":', '{"name":"uncommitted"}'):
+            with self.subTest(leftover=leftover), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "channels"
+                store = config.ConfigStore(directory)
+                pending = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 123), 456)
+                session = store.commit(pending)
+                store.close()
+                (directory / ".rename.tmp").write_text(leftover)
+                reopened = config.ConfigStore(directory)
+                try:
+                    self.assertEqual(reopened.sessions[session.session_id], session)
+                    self.assertFalse((directory / ".rename.tmp").exists())
+                finally:
+                    reopened.close()
+
+    def test_complete_pending_without_name_can_still_commit_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "channels"
+            store = config.ConfigStore(directory)
+            pending = store.record_channel(store.begin(config.new_ulid(), config.new_ulid(), 123), 456)
+            store.close()
+            del pending["name"]
+            source = directory / ".pending" / (pending["session_id"] + ".json")
+            source.write_text(json.dumps(pending))
+            reopened = config.ConfigStore(directory)
+            try:
+                recovered = reopened.recoverable[pending["session_id"]]
+                committed = reopened.commit(recovered.as_json())
+                self.assertEqual(committed.name, "Session " + pending["session_id"][-6:])
+                self.assertEqual(json.loads((directory / source.name).read_text()), pending)
+                self.assertFalse(source.exists())
+            finally:
+                reopened.close()
+
     def test_nested_directory_and_committed_session_survive_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "new/nested/channels"

@@ -2,25 +2,25 @@ export const MAX_UINT64 = (1n << 64n) - 1n;
 export const MAX_FILE_BYTES = 4 * 1024 * 1024;
 
 export function decimal(value, {zero = false} = {}) {
-  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error('编号格式不正确');
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error('Invalid ID format');
   const number = BigInt(value);
-  if ((!zero && number === 0n) || number > MAX_UINT64) throw new Error('编号超出范围');
+  if ((!zero && number === 0n) || number > MAX_UINT64) throw new Error('ID is out of range');
   return value;
 }
 
 export function turnKey(role, turnId) {
-  if (!['user', 'agent'].includes(role) || typeof turnId !== 'string' || !turnId) throw new Error('消息身份不正确');
+  if (!['user', 'agent'].includes(role) || typeof turnId !== 'string' || !turnId) throw new Error('Invalid message identity');
   return JSON.stringify([role, turnId]);
 }
 
 function list(value, name) {
-  if (!Array.isArray(value)) throw new Error(`${name}格式不正确`);
+  if (!Array.isArray(value)) throw new Error(`Invalid ${name} format`);
   return value;
 }
 
 function parts(value) {
-  return list(value, '消息正文').map(part => {
-    if (!part || part.type !== 'text' || typeof part.text !== 'string' || !part.text) throw new Error('消息正文格式不正确');
+  return list(value, 'message content').map(part => {
+    if (!part || part.type !== 'text' || typeof part.text !== 'string' || !part.text) throw new Error('Invalid message content format');
     return {type: 'text', text: part.text};
   });
 }
@@ -29,17 +29,25 @@ export function fileInfo(value, expectedId = value?.object_id) {
   decimal(value?.object_id);
   if (value.object_id !== expectedId || typeof value.name !== 'string' || typeof value.type !== 'string' ||
       typeof value.description !== 'string' || !Number.isInteger(value.nbytes) || value.nbytes < 1 || value.nbytes > MAX_FILE_BYTES) {
-    throw new Error('文件信息格式不正确');
+    throw new Error('Invalid file info');
   }
   return {name: value.name, type: value.type, description: value.description, nbytes: value.nbytes, state: 'ready'};
 }
 
+export function sessionName(value) {
+  // Match the server's Unicode whitespace rules, including the four separators.
+  if (typeof value !== 'string' || /^[\p{White_Space}\u001c-\u001f]*$/u.test(value)) throw new Error('Session name cannot be blank');
+  if (/[\uD800-\uDFFF]/u.test(value)) throw new Error('Session name contains invalid characters');
+  return value;
+}
+
 export function createSession(description) {
   if (!description || typeof description.session_id !== 'string' || !/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(description.session_id)) {
-    throw new Error('会话编号格式不正确');
+    throw new Error('Invalid session ID');
   }
   return {
-    id: description.session_id, start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
+    id: description.session_id, name: sessionName(description.name), channelId: decimal(description.channel_id),
+    start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
     turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new FileInfoStore(), historySerial: 0,
     inventory: null, pending: null, preparation: 'waiting', preparationError: '', text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
   };
@@ -50,8 +58,8 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   const next = BigInt(decimal(page?.next_seq));
   const last = BigInt(decimal(page?.last_seq, {zero: true}));
   const from = BigInt(decimal(requestedSeq));
-  if (next > last + 1n) throw new Error('消息页的读取位置不正确');
-  const events = list(page.events, '消息页');
+  if (next > last + 1n) throw new Error('Invalid message page cursor');
+  const events = list(page.events, 'message page');
   const turns = new Map();
   const additions = new Map();
   const order = [];
@@ -60,29 +68,28 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   for (const event of events) {
     const seq = BigInt(decimal(event?.event_seq));
     decimal(event.ts_ms, {zero: true});
-    if (seq < from || seq > last || seq >= next || (previous !== null && seq <= previous)) throw new Error('消息页的顺序或范围不正确');
+    if (seq < from || seq > last || seq >= next || (previous !== null && seq <= previous)) throw new Error('Invalid message page order or range');
     previous = seq;
-    if (!['user', 'agent'].includes(event.publisher_role)) throw new Error('消息身份不正确');
-    for (const recipient of list(event.recipients, '消息收件人')) {
-      if (!['user', 'agent'].includes(recipient)) throw new Error('消息收件人不正确');
+    if (!['user', 'agent'].includes(event.publisher_role)) throw new Error('Invalid message identity');
+    for (const recipient of list(event.recipients, 'message recipients')) {
+      if (!['user', 'agent'].includes(recipient)) throw new Error('Invalid message recipient');
     }
-    const attachments = list(event.attachments, '附件').map(item => ({object_id: decimal(item?.object_id), event_seq: event.event_seq}));
+    const attachments = list(event.attachments, 'attachments').map(item => ({object_id: decimal(item?.object_id), event_seq: event.event_seq}));
     const payload = event.payload;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('消息内容格式不正确');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid message payload');
     if (payload.kind === 'submission.reserve') {
       decimal(payload.reserved_through);
-      if (attachments.length) throw new Error('编号预留事件不能携带附件');
+      if (attachments.length) throw new Error('Submission reservations cannot contain attachments');
       continue;
     }
     if (payload.kind === 'turn.single' || payload.kind === 'turn.start') {
       const key = turnKey(event.publisher_role, payload.turn_id);
-      if (turns.has(key) || session.turns.has(key) || creationIndex.has(event.event_seq) || session.creationIndex.has(event.event_seq)) throw new Error('消息创建事件重复');
-      const replyTo = list(payload.reply_to_seqs, '回复引用').map(seq => decimal(seq));
-      if (new Set(replyTo).size !== replyTo.length) throw new Error('回复引用重复');
+      if (turns.has(key) || session.turns.has(key) || creationIndex.has(event.event_seq) || session.creationIndex.has(event.event_seq)) throw new Error('Duplicate message creation event');
+      const replyTo = list(payload.reply_to_seqs, 'reply references').map(seq => decimal(seq));
+      if (new Set(replyTo).size !== replyTo.length) throw new Error('Duplicate reply reference');
       const content = parts(payload.content);
       turns.set(key, {
         key, role: event.publisher_role, id: payload.turn_id, creationSeq: event.event_seq,
-        orderIndex: session.order.length + order.length,
         replies: replyTo, tailSeq: event.event_seq, contentVersion: 0,
         parts: content, attachments, state: payload.kind === 'turn.single' ? 'completed' : 'open',
       });
@@ -95,13 +102,13 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     else if (['turn.append', 'turn.reset', 'turn.end'].includes(payload.kind)) {
       key = turnKey(event.publisher_role, payload.turn_id);
       decimal(payload.pre_seq);
-    } else throw new Error('无法识别的消息类型');
+    } else throw new Error('Unknown message type');
     const original = turns.get(key) ?? session.turns.get(key);
-    if (!original) throw new Error('消息缺少创建事件');
+    if (!original) throw new Error('Missing message creation event');
     const content = ['turn.append', 'turn.reset'].includes(payload.kind) ? parts(payload.content) : [];
-    if (payload.kind === 'turn.append' && !content.length && !attachments.length) throw new Error('追加消息缺少正文和附件');
+    if (payload.kind === 'turn.append' && !content.length && !attachments.length) throw new Error('Message append has no content or attachments');
     if (original.state !== 'open') continue;
-    if (payload.kind !== 'turn.cancel' && payload.pre_seq !== original.tailSeq) throw new Error('消息链前驱不正确');
+    if (payload.kind !== 'turn.cancel' && payload.pre_seq !== original.tailSeq) throw new Error('Invalid previous message reference');
     let turn;
     if (payload.kind === 'turn.reset') {
       turn = {...original, parts: content, attachments, contentVersion: original.contentVersion + 1};
@@ -142,7 +149,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
 export function setInventory(session, result, count = '100') {
   const start = BigInt(decimal(result?.start));
   const end = BigInt(decimal(result?.end));
-  if (end - start + 1n !== BigInt(decimal(count))) throw new Error('领号数量不正确');
+  if (end - start + 1n !== BigInt(decimal(count))) throw new Error('Incorrect submission ID allocation size');
   session.inventory = {next: start, end};
 }
 

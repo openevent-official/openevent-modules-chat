@@ -1,6 +1,6 @@
 import {
   ActiveLoop, MAX_FILE_BYTES, applyPage, beginOldBatchCheck, createSession, decimal, fileInfo,
-  inspectSubmission, setInventory, takeSubmission,
+  inspectSubmission, sessionName, setInventory, takeSubmission,
 } from './state.mjs';
 
 const $ = id => document.getElementById(id);
@@ -19,6 +19,8 @@ let preparationGeneration = 0;
 let renderQueued = false;
 let listing = false;
 let creating = false;
+let renameEditor = null;
+let nameVersion = 0;
 let pendingCreate = readCreateId();
 let renderedMessages = null;
 let renderedComposer = null;
@@ -48,9 +50,9 @@ function endpoint(session, suffix) { return `${API}/sessions/${encodeURIComponen
 function valid(session, generation = epoch) { return loggedIn && epoch === generation && sessions.get(session.id) === session; }
 function current() { return sessions.get(activeId); }
 function message(error) {
-  const summary = error?.message || '请求未完成，请稍后再试。';
+  const summary = error?.message || 'The request failed. Please try again.';
   const detail = error?.failure?.detail;
-  return typeof detail === 'string' && detail && detail !== summary ? `${summary}：${detail}` : summary;
+  return typeof detail === 'string' && detail && detail !== summary ? `${summary}: ${detail}` : summary;
 }
 function temporary(error) {
   return error instanceof TypeError || error?.status === 0 || [502, 504].includes(error?.status) ||
@@ -86,7 +88,7 @@ export async function request(url, {method = 'GET', body, signal, binary = false
         if (response.headers.get('Content-Type')?.toLowerCase() !== 'application/octet-stream' ||
             !/^attachment(?:;|$)/i.test(disposition) || response.headers.get('X-Content-Type-Options')?.toLowerCase() !== 'nosniff' ||
             !/(?:^|,)\s*private\s*(?:,|$)/i.test(cache) || !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(cache)) {
-          throw new Error('下载响应格式不正确');
+          throw new Error('Invalid download response');
         }
         return {data: await response.blob(), response};
       }
@@ -95,19 +97,19 @@ export async function request(url, {method = 'GET', body, signal, binary = false
     const result = await Promise.race([operation(), cancelled]);
     const {response} = result;
     if (response.status === 401) {
-      if (epoch === generation && loggedIn) logout('访问口令无效，请重新输入。');
-      throw new ApiError(401, 'unauthenticated', '访问口令无效，请重新输入。');
+      if (epoch === generation && loggedIn) logout('Invalid access token. Please enter it again.');
+      throw new ApiError(401, 'unauthenticated', 'Invalid access token. Please enter it again.');
     }
     if (!response.ok) {
       let data;
       try { data = JSON.parse(result.text); } catch { /* A proxy may return a non-JSON failure. */ }
-      throw new ApiError(response.status, data?.error?.code || 'request_failed', data?.error?.message || `请求未完成（${response.status}）`, data?.error?.failure);
+      throw new ApiError(response.status, data?.error?.code || 'request_failed', data?.error?.message || `Request failed (${response.status})`, data?.error?.failure);
     }
     if (binary) return result;
     const data = JSON.parse(result.text);
     return {data, status: response.status};
   } catch (error) {
-    if (timedOut) throw new ApiError(0, 'timeout', '请求超时，请稍后再试。');
+    if (timedOut) throw new ApiError(0, 'timeout', 'The request timed out. Please try again.');
     throw error;
   } finally {
     clearTimeout(timer); requests.delete(controller); signal?.removeEventListener('abort', cancel);
@@ -126,6 +128,7 @@ function writeToken(value) {
 
 function logout(reason = '') {
   epoch++; loggedIn = false; activeId = null; listing = false; creating = false;
+  renameEditor = null;
   historyLoop.stop(); stopQuery(); stopPreparation();
   for (const controller of requests) controller.abort();
   requests.clear();
@@ -160,11 +163,13 @@ function ulid() {
   return result;
 }
 
-function register(description) {
+function register(description, updateName = true) {
   const candidate = createSession(description);
   let session = sessions.get(candidate.id);
   if (session) {
-    if (session.start !== candidate.start) throw new Error('会话读取起点发生变化');
+    if (session.start !== candidate.start) throw new Error('The session history start has changed');
+    if (session.channelId !== candidate.channelId) throw new Error('The session Channel has changed');
+    if (updateName) session.name = candidate.name;
   } else {
     session = candidate; session.canceling = new Map(); session.downloads = new Set();
     session.fileInfo.onChange = objectId => {
@@ -183,14 +188,16 @@ function register(description) {
 
 async function loadSessions() {
   if (listing || !loggedIn) return;
+  const version = nameVersion;
   listing = true; const generation = epoch; $('directory-error').textContent = ''; scheduleRender();
   try {
     const {data} = await request(`${API}/sessions`);
     if (!loggedIn || epoch !== generation) return;
-    if (!Array.isArray(data.sessions)) throw new Error('会话列表格式不正确');
+    if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
     // Validate the full list before registering any of it.
     data.sessions.forEach(createSession);
-    for (const description of data.sessions) register(description);
+    // A list requested before a rename must not overwrite the saved name.
+    for (const description of data.sessions) register(description, version === nameVersion);
     if (!activeId && sessions.size) activate([...sessions.keys()].sort().at(-1));
   } catch (error) {
     if (loggedIn && epoch === generation) $('directory-error').textContent = message(error);
@@ -207,9 +214,9 @@ async function createConversation() {
   try {
     const {data} = await request(`${API}/sessions`, {method: 'POST', body: {create_request_id: requestId}});
     if (!loggedIn || epoch !== generation) return;
-    const session = register(data); setCreateId(null); activate(session.id);
+    const session = register(data, false); setCreateId(null); activate(session.id);
   } catch (error) {
-    if (loggedIn && epoch === generation) $('directory-error').textContent = `${message(error)} 可以使用“重试创建”继续确认同一次创建。`;
+    if (loggedIn && epoch === generation) $('directory-error').textContent = `${message(error)} Use “Retry create” to finish creating this session.`;
   } finally {
     if (epoch === generation) { creating = false; scheduleRender(); }
   }
@@ -217,9 +224,52 @@ async function createConversation() {
 
 function activate(id) {
   if (!loggedIn || !sessions.has(id)) return;
+  if (renameEditor?.session.id !== id) renameEditor = null;
   stopQuery(); stopPreparation(); activeId = id;
   const session = current(); session.sync = 'loading'; session.error = '';
   render(); historyLoop.activate(session); prepareSession(); startQuery();
+}
+
+function editSessionName() {
+  const session = current();
+  if (!loggedIn || !session || session.renaming) return;
+  $('session-name').value = session.name;
+  renameEditor = {session, originalName: session.name, initialValue: $('session-name').value, error: ''};
+  render(); $('session-name').focus(); $('session-name').select();
+}
+
+function cancelRename() {
+  if (!renameEditor || renameEditor.session.renaming) return;
+  renameEditor = null; render(); $('rename-session').focus();
+}
+
+async function saveSessionName() {
+  const editor = renameEditor;
+  if (!editor || !valid(editor.session) || editor.session.renaming) return;
+  const session = editor.session; const generation = epoch;
+  let name; let saved = false;
+  const input = $('session-name').value;
+  try { name = sessionName(input === editor.initialValue ? editor.originalName : input); }
+  catch (error) { editor.error = message(error); scheduleRender(); return; }
+  session.renaming = true; editor.error = ''; scheduleRender();
+  try {
+    const {data} = await request(endpoint(session, '/rename'), {method: 'POST', body: {name}});
+    if (!valid(session, generation)) return;
+    const renamed = createSession(data);
+    if (renamed.id !== session.id || renamed.start !== session.start || renamed.channelId !== session.channelId) throw new Error('Session details do not match');
+    session.name = renamed.name; nameVersion++; saved = true;
+    if (renameEditor === editor) renameEditor = null;
+  } catch (error) {
+    if (valid(session, generation)) {
+      if (renameEditor === editor) editor.error = message(error);
+      else $('directory-error').textContent = `Rename failed: ${message(error)}`;
+    }
+  } finally {
+    if (valid(session, generation)) {
+      session.renaming = false; render();
+      if (saved && current() === session && !renameEditor) $('rename-session').focus();
+    }
+  }
 }
 
 const historyLoop = new ActiveLoop({
@@ -229,7 +279,6 @@ const historyLoop = new ActiveLoop({
   },
   apply: (session, page, serial) => {
     const changes = applyPage(session, page);
-    updateTitle(session, changes);
     for (const [key, turn] of changes) {
       if (renderedMessages?.session === session) {
         renderedMessages.dirty.add(key);
@@ -242,7 +291,7 @@ const historyLoop = new ActiveLoop({
     if (recovered) requirePreparation(session);
     const result = inspectSubmission(session, session.pending, page, serial);
     if (result === 'committed') confirmSend(session, session.pending);
-    else if (result === 'absent') rejectSend(session, session.pending, '已确认这条消息没有发送成功。');
+    else if (result === 'absent') rejectSend(session, session.pending, 'This message was not sent.');
     scheduleRender();
   },
   error: (session, error) => {
@@ -280,28 +329,28 @@ async function querySubmission(session, pending, generation) {
     }});
     if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
     pending.uncertain = true;
-    if (data?.submission_id !== pending.submissionId) throw new Error('发送结果的编号不匹配');
+    if (data?.submission_id !== pending.submissionId) throw new Error('The send result has a different submission ID');
     if (status === 202 && data.status === 'processing') {
-      pending.phase = 'unknown'; pending.detail = '后端正在处理，正在等待结果…';
+      pending.phase = 'unknown'; pending.detail = 'The server is processing your message…';
     } else if ([200, 201].includes(status) && data.status === 'committed' &&
         data.turn_ref?.role === 'user' && data.turn_ref.turn_id === `user:${pending.submissionId}`) {
       confirmSend(session, pending); again = false;
-    } else throw new Error('发送响应格式不正确');
+    } else throw new Error('Invalid send response');
   } catch (error) {
     if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
     if (error.status === 409 && error.code === 'submission_out_of_range') {
       if (previouslyUncertain) {
-        beginOldBatchCheck(session, pending); pending.detail = '正在读取消息记录，确认这次发送结果…';
+        beginOldBatchCheck(session, pending); pending.detail = 'Checking message history to confirm delivery…';
         if (session.sync !== 'stopped') historyLoop.kick();
       } else { pending.submissionId = null; pending.phase = 'allocating'; }
       requirePreparation(session);
       again = false;
     } else if (error.status === 409 && error.code === 'attachment_unavailable') {
       // The backend checks the current batch's submission state before looking up attachments.
-      for (const file of session.files) { file.status = 'error'; file.error = '文件需要重新上传'; }
-      rejectSend(session, pending, '文件上传记录已失效，请重新上传后发送。'); again = false;
+      for (const file of session.files) { file.status = 'error'; file.error = 'Upload this file again'; }
+      rejectSend(session, pending, 'The upload records have expired. Upload again before sending.'); again = false;
     } else if (temporary(error)) {
-      pending.uncertain = true; pending.phase = 'unknown'; pending.detail = '发送结果未确认，正在重试确认…';
+      pending.uncertain = true; pending.phase = 'unknown'; pending.detail = 'Delivery is unconfirmed. Retrying…';
     } else if (error.status >= 400 && error.status < 500 && !previouslyUncertain) {
       rejectSend(session, pending, message(error)); again = false;
     } else {
@@ -317,7 +366,7 @@ async function querySubmission(session, pending, generation) {
 
 function rejectSend(session, pending, reason) {
   if (!pending || session.pending !== pending) return;
-  session.pending = null; session.notice = `${reason} 草稿已保留，可以修改后重新发送。`;
+  session.pending = null; session.notice = `${reason} Your draft is still here. Edit it and send again.`;
   if (current() === session) stopQuery();
   scheduleRender();
 }
@@ -325,7 +374,7 @@ function rejectSend(session, pending, reason) {
 function confirmSend(session, pending) {
   if (!pending || session.pending !== pending) return;
   session.pending = null; session.text = ''; session.replies = []; session.files = [];
-  session.notice = '消息已发送';
+  session.notice = 'Message sent';
   if (current() === session) stopQuery();
   scheduleRender();
 }
@@ -360,7 +409,7 @@ async function prepareSession() {
     if (current() !== session || generation !== preparationGeneration) return;
     retry = temporary(error) && error.code !== 'submission_id_exhausted';
     if (session.preparation !== 'ready') session.preparation = retry ? 'loading' : 'failed';
-    session.preparationError = retry ? '等待初始化，正在重试…' : message(error);
+    session.preparationError = retry ? 'Waiting for session setup. Retrying…' : message(error);
     if (!retry && session.pending?.phase === 'allocating' && !session.pending.uncertain) {
       rejectSend(session, session.pending, message(error));
     }
@@ -390,9 +439,9 @@ function sendMessage() {
 
 async function upload(session, item) {
   if (!valid(session) || session.preparation !== 'ready' || session.pending || !session.files.includes(item) || item.status === 'uploading') return;
-  if (!item.file) { item.status = 'error'; item.error = '请重新选择文件'; scheduleRender(); return; }
+  if (!item.file) { item.status = 'error'; item.error = 'Please select the file again'; scheduleRender(); return; }
   if (item.file.size === 0 || item.file.size > MAX_FILE_BYTES) {
-    item.status = 'error'; item.error = '请选择非空且不超过 4 MiB 的文件'; scheduleRender(); return;
+    item.status = 'error'; item.error = 'Choose a nonempty file no larger than 4 MiB'; scheduleRender(); return;
   }
   const generation = epoch; const controller = new AbortController(); item.controller = controller;
   item.status = 'uploading'; item.error = ''; scheduleRender();
@@ -403,7 +452,7 @@ async function upload(session, item) {
     fileInfo(data); item.objectId = data.object_id; item.status = 'ready'; session.fileInfo.uploaded(data);
   } catch (error) {
     if (!valid(session, generation) || !session.files.includes(item) || item.controller !== controller) return;
-    item.status = 'error'; item.error = error.code === 'timeout' ? '上传结果未确认，可以重新上传' : message(error);
+    item.status = 'error'; item.error = error.code === 'timeout' ? 'Upload is unconfirmed. You can upload again.' : message(error);
     if (error.code === 'session_not_initialized') requirePreparation(session);
   } finally {
     if (valid(session, generation) && session.files.includes(item) && item.controller === controller) { item.controller = null; scheduleRender(); }
@@ -427,20 +476,20 @@ async function download(session, reference) {
     const {data, response} = await request(endpoint(session, `/attachments/${reference.object_id}?event_seq=${reference.event_seq}`), {binary: true});
     if (!valid(session, generation)) return;
     const disposition = response.headers.get('Content-Disposition') || '';
-    let name = session.fileInfo.get(reference.object_id)?.name || '附件';
+    let name = session.fileInfo.get(reference.object_id)?.name || 'Attachment';
     const encodedName = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
     if (encodedName) { try { name = decodeURIComponent(encodedName[1]); } catch { /* Fall back to metadata. */ } }
     const url = URL.createObjectURL(data); const link = node('a');
     link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (error) {
-    if (valid(session, generation)) { session.notice = `下载未完成：${message(error)}`; scheduleRender(); }
+    if (valid(session, generation)) { session.notice = `Download failed: ${message(error)}`; scheduleRender(); }
   } finally { if (valid(session, generation)) { session.downloads.delete(key); scheduleRender(); } }
 }
 
 function finishCancellation(session, turn) {
   session.canceling.delete(turn.key);
-  session.notice = turn.state === 'cancelled' ? '输出已取消。' : '输出已结束。';
+  session.notice = turn.state === 'cancelled' ? 'Generation canceled.' : 'Generation finished.';
 }
 
 async function cancelTurn(session, turn) {
@@ -451,65 +500,35 @@ async function cancelTurn(session, turn) {
   try {
     const {data} = await request(endpoint(session, '/cancellations'), {method: 'POST', body: {target_turn_id: turn.id}});
     if (!valid(session, generation)) return;
-    if (data.status !== 'committed') throw new Error('取消结果无法确认');
+    if (data.status !== 'committed') throw new Error('Cancellation could not be confirmed');
     const latest = session.turns.get(turn.key);
     if (latest.state === 'open') {
       session.canceling.set(turn.key, 'committed');
-      session.notice = '取消请求已发送，正在等待消息更新。';
+      session.notice = 'Cancellation requested. Waiting for an update.';
     } else finishCancellation(session, latest);
   } catch (error) {
     if (valid(session, generation)) {
       if (error.code === 'session_not_initialized') requirePreparation(session);
       const latest = session.turns.get(turn.key);
       if (latest.state === 'open') {
-        session.canceling.set(turn.key, 'unknown'); session.notice = `取消结果未确认，可以手动重试取消。${message(error)}`;
+        session.canceling.set(turn.key, 'unknown'); session.notice = `Cancellation is unconfirmed. You can retry canceling. ${message(error)}`;
       } else finishCancellation(session, latest);
     }
   } finally { if (valid(session, generation)) scheduleRender(); }
 }
 
-export function textPrefix(parts, limit, trim = false) {
+export function textPrefix(parts, limit) {
   let prefix = '';
   for (const part of parts) {
-    const text = trim && !prefix ? part.text.trimStart() : part.text;
-    const remaining = limit - prefix.length;
-    prefix += text.slice(0, remaining);
-    // Trailing whitespace belongs in the prefix only if more non-whitespace follows.
-    if (prefix.length === limit && (!trim || /\S/.test(prefix.at(-1)) || /\S/.test(text.slice(remaining)))) return prefix;
+    prefix += part.text.slice(0, limit - prefix.length);
+    if (prefix.length === limit) break;
   }
-  return trim ? prefix.trimEnd() : prefix;
-}
-
-function updateTitle(session, changes) {
-  let source = session.titleSource;
-  let searchFrom = session.order.length;
-  for (const turn of changes.values()) {
-    if (turn.role !== 'user' || (source && turn.orderIndex > source.index)) continue;
-    const text = textPrefix(turn.parts, 35, true);
-    if (text) source = {index: turn.orderIndex, text};
-    else if (source?.index === turn.orderIndex) {
-      searchFrom = turn.orderIndex + 1;
-      source = null;
-    }
-  }
-  // Only losing the current source requires looking for an unchanged successor.
-  // Earlier empty turns have already been checked, including this page's changes.
-  for (let index = searchFrom; index < (source?.index ?? session.order.length); index++) {
-    const turn = session.turns.get(session.order[index]);
-    if (turn.role !== 'user') continue;
-    const text = textPrefix(turn.parts, 35, true);
-    if (text) { source = {index, text}; break; }
-  }
-  session.titleSource = source;
-}
-
-function title(session) {
-  return session.titleSource?.text ?? `会话 ${session.id.slice(-6)}`;
+  return prefix;
 }
 
 function snippet(turn) {
-  if (!turn) return '已引用消息';
-  return `${turn.role === 'user' ? '你' : 'Agent'}：${textPrefix(turn.parts, 80) || '附件消息'}`;
+  if (!turn) return 'Quoted message';
+  return `${turn.role === 'user' ? 'You' : 'Agent'}: ${textPrefix(turn.parts, 80) || 'Attachment message'}`;
 }
 
 function formatSize(size) { return size >= 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(1)} MiB` : size >= 1024 ? `${Math.ceil(size / 1024)} KiB` : `${size} B`; }
@@ -521,18 +540,18 @@ function updateAttachment(session, view) {
   const downloading = session.downloads.has(`${ref.object_id}:${ref.event_seq}`);
   if (view.info === info) {
     view.download.disabled = downloading;
-    setText(view.download, downloading ? '正在下载…' : '下载');
+    setText(view.download, downloading ? 'Downloading…' : 'Download');
     return;
   }
   view.info = info;
   const body = node('div', 'attachment-info');
-  body.append(node('strong', '', info?.state === 'ready' ? info.name || '附件' : '附件'));
-  body.append(node('span', 'muted', info?.state === 'ready' ? `${formatSize(info.nbytes)} · ${info.type}` : info?.state === 'unavailable' ? '文件信息暂不可用' : '正在读取文件信息…'));
+  body.append(node('strong', '', info?.state === 'ready' ? info.name || 'Attachment' : 'Attachment'));
+  body.append(node('span', 'muted', info?.state === 'ready' ? `${formatSize(info.nbytes)} · ${info.type}` : info?.state === 'unavailable' ? 'File info is unavailable' : 'Loading file info…'));
   if (info?.description) body.append(node('span', 'muted', info.description));
   view.element.replaceChildren(node('span', 'file-icon', '↧'), body);
-  view.retry = info?.state === 'unavailable' ? button('重试信息', () => metadata(session, ref, true)) : null;
+  view.retry = info?.state === 'unavailable' ? button('Retry file info', () => metadata(session, ref, true)) : null;
   if (view.retry) view.element.append(view.retry);
-  view.download = button(downloading ? '正在下载…' : '下载', () => download(session, ref));
+  view.download = button(downloading ? 'Downloading…' : 'Download', () => download(session, ref));
   view.download.disabled = downloading;
   view.element.append(view.download);
 }
@@ -563,15 +582,15 @@ function createTurnView(session, turn) {
   const article = node('article', `turn ${turn.role}`); article.id = `message-${turn.creationSeq}`;
   const header = node('div', 'turn-heading');
   const state = node('span', 'turn-state');
-  header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? '你' : '↗'), node('strong', '', turn.role === 'user' ? '你' : 'Agent'), state);
-  const reply = button('回复', () => {
+  header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? 'You' : '↗'), node('strong', '', turn.role === 'user' ? 'You' : 'Agent'), state);
+  const reply = button('Reply', () => {
     if (session.pending) return;
     if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
     else session.replies.push(turn.creationSeq);
     scheduleRender(); $('message-input').focus();
   });
   header.append(reply);
-  const cancel = turn.role === 'agent' ? button('停止输出', () => cancelTurn(session, turn)) : null;
+  const cancel = turn.role === 'agent' ? button('Stop generating', () => cancelTurn(session, turn)) : null;
   if (cancel) header.append(cancel);
   article.append(header);
   const quotes = [];
@@ -604,7 +623,7 @@ function updateTurnView(session, view, turn, selected) {
       view.text.appendData(turn.parts.slice(view.partCount).map(part => part.text).join(''));
       view.partCount = turn.parts.length;
     }
-    setText(view.state, turn.state === 'open' ? '正在输出' : turn.state === 'cancelled' ? '已取消' : '');
+    setText(view.state, turn.state === 'open' ? 'Generating' : turn.state === 'cancelled' ? 'Canceled' : '');
     view.state.hidden = turn.state === 'completed';
     while (view.attachments.length < turn.attachments.length) {
       const attachment = {ref: turn.attachments[view.attachments.length], element: node('div', 'attachment'), info: null};
@@ -615,13 +634,13 @@ function updateTurnView(session, view, turn, selected) {
     view.turn = turn;
   }
   const pending = !!session.pending;
-  setText(view.reply, selected ? '已选回复' : '回复');
+  setText(view.reply, selected ? 'Reply selected' : 'Reply');
   view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
   view.reply.disabled = pending; view.reply.setAttribute('aria-pressed', String(selected));
   if (view.cancel) {
     const status = session.canceling.get(turn.key);
     view.cancel.hidden = turn.state !== 'open';
-    setText(view.cancel, status === 'sending' ? '正在取消…' : status === 'committed' ? '等待取消结果' : status === 'unknown' ? '重试取消' : '停止输出');
+    setText(view.cancel, status === 'sending' ? 'Canceling…' : status === 'committed' ? 'Waiting for cancellation' : status === 'unknown' ? 'Retry cancel' : 'Stop generating');
     view.cancel.disabled = session.preparation !== 'ready' || status === 'sending' || status === 'committed';
   }
   for (const quote of view.quotes) {
@@ -668,7 +687,7 @@ function renderTurns(session) {
   if (!session || !session.order.length) {
     if (!renderedMessages.empty) {
       const empty = node('div', 'empty-state');
-      empty.append(node('div', 'empty-symbol', '↗'), node('h2', '', session ? '从一条消息开始' : '留一个地方，展开想法'), node('p', 'muted', session ? '写下问题，或添加一个文件。' : '选择已有会话，或创建一个新的对话。'));
+      empty.append(node('div', 'empty-symbol', '↗'), node('h2', '', session ? 'Start with a message' : 'A place for your ideas'), node('p', 'muted', session ? 'Ask a question or add a file.' : 'Choose a session or create a new one.'));
       container.replaceChildren(empty); renderedMessages.empty = true;
     }
   } else {
@@ -716,12 +735,12 @@ function renderComposer(session) {
     let view = previous?.files.get(item);
     if (!view) {
       view = {row: node('div', 'draft-file'), name: node('span', 'draft-file-name'), status: node('span'),
-        retry: button('重新上传', () => upload(session, item)),
-        remove: button('移除', () => { item.controller?.abort(); session.files = session.files.filter(file => file !== item); scheduleRender(); })};
+        retry: button('Upload again', () => upload(session, item)),
+        remove: button('Remove', () => { item.controller?.abort(); session.files = session.files.filter(file => file !== item); scheduleRender(); })};
       view.row.append(node('span', 'file-icon', '↧'), view.name, view.status, view.retry, view.remove);
     }
-    setText(view.name, info?.state === 'ready' ? info.name : item.file?.name || '文件');
-    setText(view.status, item.status === 'ready' ? '已上传' : item.status === 'uploading' ? '正在上传…' : item.error || '等待上传');
+    setText(view.name, info?.state === 'ready' ? info.name : item.file?.name || 'File');
+    setText(view.status, item.status === 'ready' ? 'Uploaded' : item.status === 'uploading' ? 'Uploading…' : item.error || 'Waiting to upload');
     view.status.className = item.status === 'error' ? 'error' : 'muted';
     view.retry.hidden = item.status !== 'error';
     view.retry.disabled = disabled;
@@ -731,18 +750,18 @@ function renderComposer(session) {
   let status = session?.notice || '';
   if (session?.pending) {
     const pending = session.pending;
-    status = pending.phase === 'allocating' ? '正在准备发送…' : pending.phase === 'sending' ? '正在发送…' : pending.detail || '发送结果未确认…';
+    status = pending.phase === 'allocating' ? 'Preparing to send…' : pending.phase === 'sending' ? 'Sending…' : pending.detail || 'Delivery is unconfirmed…';
   }
   $('submission-status').textContent = status; $('submission-status').hidden = !status;
   if (session && (session.preparation !== 'ready' || session.preparationError)) {
     $('submission-status').hidden = false;
-    $('submission-status').append(node('div', '', session.preparationError || '会话初始化中…'));
+    $('submission-status').append(node('div', '', session.preparationError || 'Setting up the session…'));
     if (session.preparation === 'failed' || (session.preparation === 'ready' && session.preparationError)) {
-      $('submission-status').append(button('重试初始化', prepareSession));
+      $('submission-status').append(button('Retry setup', prepareSession));
     }
   }
   if (session?.pending?.queryStopped && session.preparation === 'ready') {
-    $('submission-status').append(button('重试确认', () => { session.pending.queryStopped = false; startQuery(); }));
+    $('submission-status').append(button('Retry confirmation', () => { session.pending.queryStopped = false; startQuery(); }));
   }
 }
 
@@ -751,28 +770,42 @@ function render() {
   if (!loggedIn) {
     renderedMessages = null; renderedComposer = null; sessionEntries.clear();
     for (const id of ['messages', 'sessions', 'reply-selection', 'draft-files', 'submission-status', 'message-error']) $(id).replaceChildren();
-    $('message-input').value = ''; $('file-input').value = ''; $('session-title').textContent = '选择一个会话';
+    $('message-input').value = ''; $('file-input').value = ''; $('session-title').textContent = 'Select a session';
+    $('session-name').value = ''; $('session-channel').textContent = '';
     return;
   }
   const session = current(); const list = [];
-  let activeTitle = '选择一个会话';
+  let activeTitle = 'Select a session';
   for (const id of [...sessions.keys()].sort().reverse()) {
-    const itemTitle = title(sessions.get(id));
+    const itemTitle = sessions.get(id).name;
     let entry = sessionEntries.get(id);
     if (!entry) { entry = button('', () => activate(id)); sessionEntries.set(id, entry); }
     setText(entry, itemTitle); entry.className = `session-item${id === activeId ? ' active' : ''}`;
     entry.setAttribute('aria-current', id === activeId ? 'page' : 'false'); entry.title = itemTitle; list.push(entry);
     if (id === activeId) activeTitle = itemTitle;
   }
-  if (!sessions.size && !listing) list.push(node('p', 'muted no-sessions', '还没有会话'));
+  if (!sessions.size && !listing) list.push(node('p', 'muted no-sessions', 'No sessions yet'));
   updateChildren($('sessions'), list);
-  $('new-session').disabled = creating; $('new-session').textContent = creating ? '正在创建…' : pendingCreate ? '↻ 重试创建' : '＋ 新建会话';
+  $('new-session').disabled = creating; $('new-session').textContent = creating ? 'Creating…' : pendingCreate ? '↻ Retry create' : '＋ New session';
   $('refresh-sessions').disabled = listing;
   $('session-title').textContent = activeTitle;
-  $('sync-status').textContent = session ? ({waiting: '等待连接', loading: '正在读取', ready: '已连接', retrying: '正在重连', stopped: '读取已停止'}[session.sync] || '') : '';
+  $('session-title').title = activeTitle;
+  $('session-channel').textContent = session ? `Channel ID: ${session.channelId}` : '';
+  $('session-channel').hidden = !session;
+  const editing = !!renameEditor && renameEditor.session === session;
+  $('session-heading').hidden = editing;
+  $('rename-session').hidden = !session;
+  $('rename-session').disabled = !!session?.renaming;
+  $('rename-form').hidden = !editing;
+  $('session-name').disabled = !!session?.renaming;
+  $('save-session-name').disabled = !!session?.renaming;
+  $('save-session-name').textContent = session?.renaming ? 'Saving…' : 'Save';
+  $('cancel-rename').disabled = !!session?.renaming;
+  $('rename-error').textContent = editing ? renameEditor.error : '';
+  $('sync-status').textContent = session ? ({waiting: 'Connecting', loading: 'Loading', ready: 'Connected', retrying: 'Reconnecting', stopped: 'Updates paused'}[session.sync] || '') : '';
   $('sync-status').dataset.state = session?.sync || '';
   $('message-error').textContent = session?.error || ''; $('message-error').hidden = !session?.error;
-  if (session?.sync === 'stopped') $('message-error').append(button('重新读取', () => activate(session.id)));
+  if (session?.sync === 'stopped') $('message-error').append(button('Reload', () => activate(session.id)));
   renderTurns(session); renderComposer(session);
 }
 
@@ -790,6 +823,12 @@ $('login-form').addEventListener('submit', event => {
 $('logout').addEventListener('click', () => logout());
 $('new-session').addEventListener('click', createConversation);
 $('refresh-sessions').addEventListener('click', loadSessions);
+$('rename-session').addEventListener('click', editSessionName);
+$('rename-form').addEventListener('submit', event => { event.preventDefault(); saveSessionName(); });
+$('cancel-rename').addEventListener('click', cancelRename);
+$('session-name').addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !event.isComposing) { event.preventDefault(); cancelRename(); }
+});
 $('composer').addEventListener('submit', event => { event.preventDefault(); sendMessage(); });
 $('message-input').addEventListener('input', event => {
   const session = current();

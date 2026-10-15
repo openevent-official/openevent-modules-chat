@@ -24,8 +24,10 @@ def run_browser(origin, web_token, events, agent_token, channels):
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
         page.goto(origin + '/api/chat/')
-        page.locator('#token').fill(web_token)
-        page.locator('#login-form button[type=submit]').click()
+        expect(page.locator('html')).to_have_attribute('lang', 'en')
+        expect(page.get_by_role('heading', name='Continue your conversation')).to_be_visible()
+        page.get_by_label('Access token', exact=True).fill(web_token)
+        page.get_by_role('button', name='Open chat', exact=True).click()
         expect(page.locator('#workspace')).to_be_visible()
         expect(page.locator('#message-input')).to_be_enabled()
         allocations = []
@@ -37,6 +39,24 @@ def run_browser(origin, web_token, events, agent_token, channels):
                 page.locator('#new-session').click()
         session = created.value.json()
         sid = session['session_id']
+        config_path = channels / f'{sid}.json'
+        config = json.loads(config_path.read_text())
+        assert session['channel_id'] == config['channel_id']
+        assert session['name'] == config['name'] == f'Session {sid[-6:]}'
+        channel_label = f"Channel ID: {config['channel_id']}"
+        expect(page.locator('#session-title')).to_have_text(config['name'])
+        expect(page.locator('#session-channel')).to_have_text(channel_label)
+        expect(page.locator('.empty-state h2')).to_have_text('Start with a message')
+        expect(page.locator('.empty-state p')).to_have_text('Ask a question or add a file.')
+        expect(page.get_by_placeholder('Write a message…')).to_be_visible()
+        rename = page.get_by_role('button', name='Rename session', exact=True)
+        expect(rename).to_be_visible()
+        expect(rename).to_have_attribute('title', 'Rename session')
+        expect(rename.locator('svg')).to_have_attribute('aria-hidden', 'true')
+        assert rename.inner_text().strip() == '', 'rename should display only the pencil icon'
+        rename_box = rename.bounding_box()
+        assert rename_box['width'] >= 44 and rename_box['height'] >= 44
+        assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         expect(page.locator('#message-input')).to_be_enabled()
         expect(page.locator('#file-input')).to_be_disabled()
         expect(page.locator('#send')).to_be_disabled()
@@ -47,7 +67,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('#message-input')).to_be_enabled()
         expect(page.locator('#message-input')).to_have_value('浏览器发出的消息 <b>按纯文本显示</b>')
         page.locator('#file-input').set_input_files({'name': 'browser.txt', 'mimeType': 'text/plain', 'buffer': b'browser attachment'})
-        expect(page.locator('#draft-files')).to_contain_text('已上传')
+        expect(page.locator('#draft-files')).to_contain_text('Uploaded')
         metadata_requests = []
         page.on('request', lambda req: metadata_requests.append(req.url) if '/metadata?' in req.url else None)
         # Hold the first send so the real DOM must stay locked until its outcome is known.
@@ -65,7 +85,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
             'error': {'code': 'invalid_request', 'message': 'test request rejection'}}))
         expect(page.locator('#message-input')).to_be_enabled()
         expect(page.locator('#message-input')).to_have_value('浏览器发出的消息 <b>按纯文本显示</b>')
-        expect(page.locator('#draft-files')).to_contain_text('已上传')
+        expect(page.locator('#draft-files')).to_contain_text('Uploaded')
         page.unroute('**/turns', hold_send)
         with page.expect_response(lambda response: response.request.method == 'POST' and response.url.endswith('/turns')) as sent:
             page.locator('#send').click()
@@ -83,7 +103,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('.attachment')).to_contain_text('browser.txt')
         assert metadata_requests == [], 'upload metadata must be reused after publication'
         with page.expect_download() as downloading:
-            page.locator('.attachment button').filter(has_text='下载').click()
+            page.locator('.attachment').get_by_role('button', name='Download', exact=True).click()
         with tempfile.TemporaryDirectory() as target:
             saved = Path(target) / 'download'
             downloading.value.save_as(saved)
@@ -93,7 +113,34 @@ def run_browser(origin, web_token, events, agent_token, channels):
         page.locator('#send').click()
         expect(page.locator('.turn.user')).to_have_count(2)
         expect(page.locator('.turn-replies')).to_have_count(1)
-        config = json.loads((channels / f'{sid}.json').read_text())
+        # The configured name remains independent of the first message. Rename
+        # updates both views and the durable config without changing the Channel.
+        expect(page.locator('#session-title')).to_have_text(config['name'])
+        rename.focus()
+        expect(rename).to_be_focused()
+        rename.press('Enter')
+        expect(page.locator('#session-name')).to_have_value(config['name'])
+        expect(page.get_by_role('button', name='Save', exact=True)).to_be_visible()
+        expect(page.get_by_role('button', name='Cancel', exact=True)).to_be_visible()
+        renamed_name = '浏览器会话 <重命名> 😀'
+        page.locator('#session-name').fill(renamed_name)
+        with page.expect_response(lambda response: response.request.method == 'POST' and
+                                  response.url.endswith(f'/sessions/{sid}/rename')) as renamed:
+            page.locator('#save-session-name').click()
+        assert renamed.value.status == 200
+        renamed_session = renamed.value.json()
+        assert renamed_session == {**session, 'name': renamed_name}
+        expect(page.locator('#session-title')).to_have_text(renamed_name)
+        expect(page.locator('.session-item.active')).to_have_text(renamed_name)
+        expect(page.locator('#session-channel')).to_have_text(channel_label)
+        assert json.loads(config_path.read_text()) == {**config, 'name': renamed_name}
+        page.reload()
+        expect(page.locator('#workspace')).to_be_visible()
+        expect(page.locator('#session-title')).to_have_text(renamed_name)
+        expect(page.locator('.session-item.active')).to_have_text(renamed_name)
+        expect(page.locator('#session-channel')).to_have_text(channel_label)
+        expect(page.locator('.turn.user')).to_have_count(2)
+        expect(page.locator('#file-input')).to_be_enabled()
         agent = create_client(events, principal=9002, token=agent_token, channel_id=int(config['channel_id']))
         # Extension values never participate in browser projection or rendering.
         opaque = RawExtensions('{"large":1e400,"precise":0.12345678901234567890123456789,"deep":'
@@ -102,7 +149,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         agent_turn = page.locator('.turn.agent')
         expect(agent_turn).to_have_count(1)
         expect(agent_turn.locator('.turn-content')).to_have_text('')
-        expect(agent_turn.get_by_role('button', name='停止输出')).to_be_enabled()
+        expect(agent_turn.get_by_role('button', name='Stop generating')).to_be_enabled()
         agent_turn.evaluate("element => element.setAttribute('data-e2e-original', 'true')")
         agent_file = events.write_object(principal=9002, token=agent_token, name='agent.txt',
                                         type='text/plain', description='', data=b'agent attachment')
@@ -117,11 +164,11 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(agent_turn).to_have_attribute('data-e2e-original', 'true')
         writer.reset()
         expect(agent_turn.locator('.turn-content')).to_have_text('')
-        expect(agent_turn.get_by_role('button', name='停止输出')).to_be_enabled()
+        expect(agent_turn.get_by_role('button', name='Stop generating')).to_be_enabled()
         writer.append(content=(TextPart('最终输出'),))
         expect(agent_turn.locator('.turn-content')).to_have_text('最终输出')
-        page.get_by_role('button', name='停止输出').click()
-        expect(page.locator('.turn.agent')).to_contain_text('已取消')
+        page.get_by_role('button', name='Stop generating').click()
+        expect(page.locator('.turn.agent')).to_contain_text('Canceled')
         del writer  # External cancellation was observed; releasing performs no RPC.
         agent.close()
 
@@ -177,7 +224,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
             metadata_attempts.append(route.request.url)
             if len(metadata_attempts) == 1:
                 route.fulfill(status=503, content_type='application/json', body=json.dumps({
-                    'error': {'code': 'request_failed', 'message': '文件信息暂时不可用'}}))
+                    'error': {'code': 'request_failed', 'message': 'File information temporarily unavailable'}}))
             else:
                 route.continue_()
         second.route('**/metadata?*', fail_first_metadata)
@@ -192,11 +239,11 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(second.locator('#reply-selection .reply-chip')).to_have_count(1)
         second.locator('#reply-selection .reply-chip').click()
         expect(second.locator('#reply-selection')).to_be_empty()
-        second.get_by_role('button', name='重试信息').click()
+        second.get_by_role('button', name='Retry file info').click()
         expect(second.locator('.attachment')).to_contain_text('browser.txt')
         assert len(metadata_attempts) == 2, metadata_attempts
         with second.expect_download() as downloading:
-            second.locator('.attachment button').filter(has_text='下载').click()
+            second.locator('.attachment').get_by_role('button', name='Download', exact=True).click()
         with tempfile.TemporaryDirectory() as target:
             saved = Path(target) / 'download'
             downloading.value.save_as(saved)
@@ -207,11 +254,15 @@ def run_browser(origin, web_token, events, agent_token, channels):
         second.unroute('**/submissions')
         second.unroute('**/metadata?*', fail_first_metadata)
         expect(second.locator('#send')).to_be_enabled()
-        expect(second.locator('.turn.agent')).to_contain_text('已取消')
+        expect(second.locator('.turn.agent')).to_contain_text('Canceled')
         page.set_viewport_size({'width': 390, 'height': 844})
         expect(page.locator('#send')).to_be_visible()
+        expect(page.get_by_role('button', name='Rename session', exact=True)).to_be_visible()
+        expect(page.locator('#session-title')).to_have_text(renamed_name)
+        expect(page.locator('#session-channel')).to_have_text(channel_label)
+        expect(page.get_by_role('button', name='Sign out', exact=True)).to_be_visible()
         # Mobile keeps the same list retry control; refreshing never reloads the draft.
-        refresh = page.get_by_role('button', name='刷新会话列表')
+        refresh = page.get_by_role('button', name='Refresh sessions')
         expect(refresh).to_be_visible()
         page.locator('#message-input').fill('刷新列表后保留的草稿')
         list_attempts = []
@@ -219,12 +270,12 @@ def run_browser(origin, web_token, events, agent_token, channels):
             list_attempts.append(route.request.method)
             if len(list_attempts) == 1:
                 route.fulfill(status=503, content_type='application/json', body=json.dumps({
-                    'error': {'code': 'request_failed', 'message': '列表暂时不可用'}}))
+                    'error': {'code': 'request_failed', 'message': 'Session list temporarily unavailable'}}))
             else:
                 route.continue_()
         page.route('**/api/chat/sessions', fail_first_list)
         refresh.click()
-        expect(page.locator('#directory-error')).to_have_text('列表暂时不可用')
+        expect(page.locator('#directory-error')).to_have_text('Session list temporarily unavailable')
         expect(refresh).to_be_enabled()
         expect(page.locator('#message-input')).to_have_value('刷新列表后保留的草稿')
         refresh.click()
@@ -235,10 +286,15 @@ def run_browser(origin, web_token, events, agent_token, channels):
         page.unroute('**/api/chat/sessions', fail_first_list)
         page.locator('#message-input').fill('')
         assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+        page.locator('#composer').screenshot(path='build/browser-composer-mobile.png', animations='disabled')
+        page.locator('.turn.agent').scroll_into_view_if_needed()
+        page.locator('#messages').screenshot(path='build/browser-history-mobile.png', animations='disabled')
         page.set_viewport_size({'width': 1280, 'height': 860})
         screenshot = Path('build/browser-chat.png')
         screenshot.parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(screenshot), full_page=True)
+        page.locator('#message-input').fill('Ready to send.')
+        page.locator('#composer').screenshot(path='build/browser-composer-ready.png', animations='disabled')
         page.locator('#logout').click()
         expect(page.locator('#login')).to_be_visible()
         assert page.locator('.turn').count() == 0
@@ -246,4 +302,4 @@ def run_browser(origin, web_token, events, agent_token, channels):
         assert not errors, errors
         context.close()
         browser.close()
-    print('PASS: Chromium: initialization, files, replies, empty start/reset/cancel, same-ID retry, two tabs, mobile')
+    print('PASS: Chromium: English UI, accessible rename icon, names, Channel IDs, reload, files, replies, empty start/reset/cancel, same-ID retry, two tabs, mobile')

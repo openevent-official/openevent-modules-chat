@@ -254,6 +254,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         if self.command == "POST" and len(parts) == 3:
             if parsed.query:
                 raise bad_request("query is not supported")
+            if operation == "rename":
+                self._json(200, service.rename_session(sid, self._json_body()))
+                return
             if operation == "attachments":
                 self._upload(sid)
                 return

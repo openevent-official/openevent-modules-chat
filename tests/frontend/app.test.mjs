@@ -28,7 +28,7 @@ class Element {
   replaceChildren(...children) { this.textContent = ''; this.append(...children); }
   addEventListener(name, callback) { if (!this.listeners.has(name)) this.listeners.set(name, []); this.listeners.get(name).push(callback); }
   setAttribute(name, value) { this[name] = value; }
-  focus() {} scrollIntoView() {}
+  focus() {} select() {} scrollIntoView() {}
   remove() {
     if (this.parentNode) this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1);
     this.parentNode = null;
@@ -66,7 +66,7 @@ function environment(handler) {
 }
 
 const SID = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
-const description = {session_id: SID, scan_start_seq: '1'};
+const description = {session_id: SID, scan_start_seq: '1', channel_id: '9007199254740993', name: `Session ${SID.slice(-6)}`};
 const ok = (body, status = 200) => new Response(JSON.stringify(body), {status, headers: {'Content-Type': 'application/json'}});
 const err = (status, code) => ok({error: {code, message: code}}, status);
 const empty = (next = '1', last = '0') => ({events: [], next_seq: next, last_seq: last});
@@ -88,7 +88,7 @@ function findElement(element, predicate) {
   for (const child of element.children || []) { const found = findElement(child, predicate); if (found) return found; }
 }
 
-test('preview prefixes preserve trimming and UTF-16 slicing without reading unnecessary parts', async () => {
+test('preview prefixes preserve whitespace and UTF-16 slicing without reading unnecessary parts', async () => {
   const ui = environment(() => ok({sessions: []}));
   const {textPrefix} = await load('prefix');
   const cases = [
@@ -101,22 +101,21 @@ test('preview prefixes preserve trimming and UTF-16 slicing without reading unne
   ];
   for (const texts of cases) {
     const parts = texts.map(text => ({text}));
-    assert.equal(textPrefix(parts, 35, true), texts.join('').trim().slice(0, 35));
     assert.equal(textPrefix(parts, 80), texts.join('').slice(0, 80));
   }
-  for (const [limit, trim] of [[35, true], [80, false]]) {
+  for (const limit of [35, 80]) {
     let reads = 0;
     const parts = Array.from({length: 100000}, () => ({get text() { reads++; return 'x'; }}));
-    assert.equal(textPrefix(parts, limit, trim), 'x'.repeat(limit));
+    assert.equal(textPrefix(parts, limit), 'x'.repeat(limit));
     assert.equal(reads, limit);
     assert.equal(textPrefix([
       {text: 'x'.repeat(limit)}, {get text() { throw new Error('unused text was read'); }},
-    ], limit, trim), 'x'.repeat(limit));
+    ], limit), 'x'.repeat(limit));
   }
   ui.get('logout').click();
 });
 
-test('session titles and quoted replies retain their existing whitespace and length', async () => {
+test('saved session names are independent of message text while quoted replies retain their preview', async () => {
   const texts = [' \t', 'x'.repeat(34), ' ', '\u00a0\n', 'y'.repeat(100)];
   const fullText = texts.join('');
   const ui = environment(call => {
@@ -129,104 +128,183 @@ test('session titles and quoted replies retain their existing whitespace and len
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('preview-display');
-  const expectedTitle = fullText.trim().slice(0, 35);
+  const expectedTitle = description.name;
   assert.equal(ui.get('sessions').children[0].textContent, expectedTitle);
   assert.equal(ui.get('sessions').children[0].title, expectedTitle);
   assert.equal(ui.get('session-title').textContent, expectedTitle);
+  assert.equal(ui.get('session-channel').textContent, 'Channel ID: 9007199254740993');
   const quote = findElement(ui.get('messages'), element => element.className === 'quoted-reply');
-  assert.equal(quote.textContent, `你：${fullText.slice(0, 80)}`);
+  assert.equal(quote.textContent, `You: ${fullText.slice(0, 80)}`);
   ui.get('logout').click();
 });
 
-test('session titles inspect only new candidates across 1000 attachment-only pages', async () => {
-  const count = 1000;
-  let histories = 0;
+test('rename saves the displayed name, preserves drafts and history, and survives an older list and page reload', async () => {
+  let name = description.name; let lists = 0; let histories = 0; let finishList; let finishRename;
   const ui = environment(call => {
-    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
-    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
-    if (call.url.includes('/history?')) {
-      const seq = ++histories;
-      return ok({events: [historyEvent(seq, {
-        kind: 'turn.single', turn_id: `title-candidate-${seq}`, reply_to_seqs: [],
-        content: seq > count ? [{type: 'text', text: '终于有正文'}] : seq % 2 ? [] : [{type: 'text', text: ' \t'}],
-      }, 'user', [{object_id: '42'}])], next_seq: String(seq + 1), last_seq: String(Math.max(count, seq))});
+    if (call.url === '/api/chat/sessions') {
+      if (++lists === 2) return new Promise(resolve => { finishList = resolve; });
+      return ok({sessions: [{...description, name}]});
     }
-    if (call.url.includes('/metadata?')) return ok({object_id: '42', name: '文件.txt', type: 'text/plain', description: '', nbytes: 4});
+    if (call.url.endsWith('/rename')) return new Promise(resolve => { finishRename = resolve; });
+    if (call.url.includes('/history?')) {
+      if (++histories === 1) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.single', turn_id: 'question', content: [{type: 'text', text: '聊天正文'}], reply_to_seqs: [],
+      }, 'user')], 2));
+      return ok(empty('2', '1'));
+    }
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
     throw new Error(`unexpected request ${call.url}`);
   });
-  let turnReads = 0;
-  const get = Map.prototype.get;
-  Map.prototype.get = function(key) {
-    const value = get.call(this, key);
-    if (value?.role === 'user' && value.id?.startsWith('title-candidate-')) turnReads++;
-    return value;
-  };
-  try {
-    await load('incremental-title-candidates');
-    while (histories < count) { ui.runTimer(0); await flush(); }
-    await flush();
-    assert.equal(ui.get('session-title').textContent, `会话 ${SID.slice(-6)}`);
-    assert.ok(turnReads < count * 4, `expected linear history access, got ${turnReads} turn reads`);
-    const previousReads = turnReads;
-    ui.runTimer(1000); await until(() => ui.get('session-title').textContent === '终于有正文');
-    assert.ok(turnReads - previousReads < 4, 'the first text title must not revisit the 1000 empty candidates');
-    const beforeRender = turnReads;
-    findElement(ui.get('messages').children.at(-1), element => element.tagName === 'BUTTON' && element.textContent === '回复').click();
-    await flush();
-    assert.ok(turnReads - beforeRender < 4, 'a local control update must reuse the title');
-  } finally { Map.prototype.get = get; ui.get('logout').click(); }
+  await load('rename-save');
+  const entry = ui.get('sessions').children[0]; const article = ui.get('messages').children[0];
+  ui.get('message-input').value = '尚未发送的草稿'; ui.get('message-input').dispatch('input');
+  ui.get('refresh-sessions').click(); await until(() => !!finishList);
+  ui.get('rename-session').click();
+  assert.equal(ui.get('session-name').value, name); assert.equal(ui.get('rename-form').hidden, false);
+  const nextName = ' 项目 <进展> 😀 ';
+  ui.get('session-name').value = nextName;
+  ui.runTimer(1000); await until(() => histories === 2); await flush();
+  assert.equal(ui.get('session-name').value, nextName, 'polling must preserve the name being edited');
+  ui.get('rename-form').dispatch('submit'); await until(() => !!finishRename); await flush();
+  ui.get('rename-form').dispatch('submit');
+  const renames = ui.calls.filter(call => call.url.endsWith('/rename'));
+  assert.equal(renames.length, 1); assert.equal(renames[0].method, 'POST');
+  assert.deepEqual(JSON.parse(renames[0].body), {name: nextName});
+  assert.equal(ui.get('session-title').textContent, description.name);
+  for (const id of ['session-name', 'save-session-name', 'cancel-rename']) assert.equal(ui.get(id).disabled, true);
+  name = nextName; finishRename(ok({...description, name}));
+  await until(() => ui.get('session-title').textContent === nextName);
+  assert.equal(ui.get('session-channel').textContent, 'Channel ID: 9007199254740993');
+  assert.equal(ui.get('rename-form').hidden, true); assert.equal(ui.get('session-heading').hidden, false);
+  assert.equal(ui.get('sessions').children[0], entry); assert.equal(entry.textContent, nextName); assert.equal(entry.title, nextName);
+  assert.equal(ui.get('message-input').value, '尚未发送的草稿'); assert.equal(ui.get('messages').children[0], article);
+  assert.equal(histories, 2, 'rename must not restart history');
+  finishList(ok({sessions: [description]})); await until(() => !ui.get('refresh-sessions').disabled);
+  assert.equal(entry.textContent, nextName, 'the older list must not undo the completed rename');
+  ui.get('refresh-sessions').click(); await flush(); assert.equal(entry.textContent, nextName);
+  ui.get('logout').click();
+
+  const reloaded = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [{...description, name}]});
+    if (call.url.includes('/history?')) return ok(empty());
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('rename-reload');
+  assert.equal(reloaded.get('session-title').textContent, nextName);
+  assert.equal(reloaded.get('session-channel').textContent, 'Channel ID: 9007199254740993');
+  assert.equal(reloaded.get('sessions').children[0].textContent, nextName);
+  reloaded.get('logout').click();
 });
 
-test('titles follow the earliest nonempty user turn through resets and out-of-order changes', async () => {
-  const text = value => value ? [{type: 'text', text: value}] : [];
-  const creation = (seq, id, value, role = 'user') => historyEvent(seq, {
-    kind: 'turn.start', turn_id: id, content: text(value), reply_to_seqs: [],
-  }, role);
-  const change = (seq, id, pre, value, kind = 'turn.reset') => historyEvent(seq, {
-    kind, turn_id: id, pre_seq: String(pre), content: text(value),
-  }, 'user');
-  const pages = [
-    historyPage([creation(1, 'early', ''), creation(2, 'agent', '不作为标题', 'agent'),
-      creation(3, 'middle', '中间'), creation(4, 'late', '最后')], 5),
-    historyPage([change(5, 'middle', 3, '')], 6),
-    historyPage([change(6, 'early', 1, '最早', 'turn.append')], 7),
-    historyPage([change(7, 'early', 6, ' \t')], 8),
-    historyPage([change(8, 'late', 4, '')], 9),
-    historyPage([change(9, 'late', 8, '较晚恢复'), change(10, 'middle', 5, '中间恢复'), change(11, 'early', 7, '最早恢复')], 12),
-    historyPage([change(12, 'early', 11, ''), change(13, 'middle', 10, '')], 14),
-    historyPage([change(14, 'middle', 13, '中间再次恢复'), change(15, 'early', 12, '最早再次恢复')], 16),
-    historyPage([change(16, 'early', 15, '不能部分提交'), change(17, 'middle', 1, '错误前驱')], 18),
-  ];
-  let histories = 0;
+test('rename validation, cancel and server failure preserve the saved name and allow a manual retry', async () => {
+  let renames = 0;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) return ok(empty());
     if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
-    if (call.url.includes('/history?')) return ok(pages[histories++]);
+    if (call.url.endsWith('/rename')) {
+      if (++renames === 1) return err(503, 'server_unavailable');
+      return ok({...description, name: JSON.parse(call.body).name});
+    }
     throw new Error(`unexpected request ${call.url}`);
   });
-  await load('title-source-transfers');
-  assert.equal(ui.get('session-title').textContent, '中间');
-  const entry = ui.get('sessions').children[0];
-  for (const expected of ['最后', '最早', '最后', `会话 ${SID.slice(-6)}`, '最早恢复', '较晚恢复', '最早再次恢复']) {
-    ui.runTimer(1000); await until(() => ui.get('session-title').textContent === expected);
-    assert.equal(ui.get('sessions').children[0], entry);
-    assert.equal(entry.textContent, expected);
+  await load('rename-retry'); ui.get('rename-session').click();
+  for (const invalid of ['', ' \t', '\ud83d']) {
+    ui.get('session-name').value = invalid; ui.get('rename-form').dispatch('submit'); await flush();
+    assert.notEqual(ui.get('rename-error').textContent, '');
+    assert.equal(renames, 0); assert.equal(ui.get('session-title').textContent, description.name);
   }
-  ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === '读取已停止');
-  assert.ok(ui.get('message-error').textContent.includes('消息链前驱不正确'));
-  assert.equal(ui.get('session-title').textContent, '最早再次恢复', 'a rejected page must not change the title');
-  assert.equal(entry.textContent, '最早再次恢复');
+  ui.get('session-name').dispatch('keydown', {key: 'Escape', isComposing: true});
+  assert.equal(ui.get('rename-form').hidden, false);
+  ui.get('session-name').dispatch('keydown', {key: 'Escape'});
+  assert.equal(ui.get('rename-form').hidden, true); assert.equal(renames, 0);
+  ui.get('rename-session').click(); assert.equal(ui.get('session-name').value, description.name);
+  ui.get('session-name').value = '取消这次编辑'; ui.get('cancel-rename').click();
+  assert.equal(ui.get('rename-form').hidden, true); assert.equal(renames, 0);
+
+  ui.get('rename-session').click(); ui.get('session-name').value = '希望保存的名称';
+  ui.get('rename-form').dispatch('submit'); await until(() => ui.get('rename-error').textContent === 'server_unavailable');
+  assert.equal(ui.get('session-title').textContent, description.name);
+  assert.equal(ui.get('sessions').children[0].textContent, description.name);
+  assert.equal(ui.get('session-name').value, '希望保存的名称'); assert.equal(ui.get('session-name').disabled, false);
+  ui.runTimer(1000); await flush(); assert.equal(renames, 1, 'failed renames must not retry automatically');
+  const longName = '多语言名称😀'.repeat(100);
+  ui.get('session-name').value = longName; ui.get('rename-form').dispatch('submit');
+  await until(() => ui.get('session-title').textContent === longName);
+  assert.equal(renames, 2); assert.equal(ui.get('rename-form').hidden, true);
+  ui.get('logout').click();
+});
+
+test('saving an unchanged name preserves characters removed by a browser text input', async () => {
+  const originalName = '甲\r\n乙\r丙\n丁';
+  const submitted = [];
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [{...description, name: originalName}]});
+    if (call.url.includes('/history?')) return ok(empty());
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.endsWith('/rename')) {
+      const {name} = JSON.parse(call.body); submitted.push(name);
+      return ok({...description, name});
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  // Native input[type=text] strips CR and LF even when assigning .value.
+  let inputValue = '';
+  Object.defineProperty(ui.get('session-name'), 'value', {
+    get: () => inputValue,
+    set: value => { inputValue = value.replace(/[\r\n]/g, ''); },
+  });
+  await load('rename-unchanged-newlines');
+  ui.get('rename-session').click(); assert.equal(ui.get('session-name').value, '甲乙丙丁');
+  ui.get('rename-form').dispatch('submit'); await until(() => ui.get('rename-form').hidden);
+  assert.deepEqual(submitted, [originalName]);
+  assert.equal(ui.get('session-title').textContent, originalName);
+  assert.equal(ui.get('sessions').children[0].textContent, originalName);
+  ui.get('rename-session').click(); ui.get('session-name').value = '新的\r\n名称';
+  ui.get('rename-form').dispatch('submit'); await until(() => ui.get('rename-form').hidden);
+  assert.deepEqual(submitted, [originalName, '新的名称']);
+  assert.equal(ui.get('session-title').textContent, '新的名称');
+  ui.get('logout').click();
+});
+
+test('rename completion belongs to its original session and logout discards pending responses', async () => {
+  const other = {...description, session_id: '01ARZ3NDEKTSV4RRFFQ69G5FAW', channel_id: '4', name: '另一个会话'};
+  let original = description; const renames = [];
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [original, other]});
+    if (call.url.includes('/history?')) return ok(empty());
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.endsWith('/rename')) return new Promise(resolve => renames.push({call, resolve}));
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('rename-switch');
+  const [b, a] = ui.get('sessions').children;
+  a.click(); await flush(); ui.get('rename-session').click(); ui.get('session-name').value = '原会话的新名字';
+  ui.get('rename-form').dispatch('submit'); await until(() => renames.length === 1);
+  b.click(); await flush(); ui.get('rename-session').click(); ui.get('session-name').value = '另一个会话的草稿';
+  original = {...description, name: '原会话的新名字'}; renames[0].resolve(ok(original));
+  await until(() => a.textContent === original.name);
+  assert.equal(ui.get('session-title').textContent, other.name);
+  assert.equal(ui.get('session-channel').textContent, 'Channel ID: 4');
+  assert.equal(ui.get('session-name').value, '另一个会话的草稿'); assert.equal(ui.get('rename-form').hidden, false);
+  ui.get('rename-form').dispatch('submit'); await until(() => renames.length === 2);
+  ui.get('logout').click(); assert.equal(renames[1].call.signal.aborted, true);
+  ui.get('token').value = 'new-token'; ui.get('login-form').dispatch('submit'); await flush();
+  renames[1].resolve(ok({...other, name: '过期响应'})); await flush();
+  assert.equal(ui.get('session-title').textContent, other.name);
+  assert.equal(ui.get('rename-form').hidden, true); assert.equal(ui.get('directory-error').textContent, '');
   ui.get('logout').click();
 });
 
 test('session buttons survive polling, title updates, insertions and switching; logout clears their cache', async () => {
-  const newer = {session_id: '01ARZ3NDEKTSV4RRFFQ69G5FAW', scan_start_seq: '1'};
-  let histories = 0; let created = false;
+  const newer = {session_id: '01ARZ3NDEKTSV4RRFFQ69G5FAW', scan_start_seq: '1', channel_id: '4', name: '另一个会话'};
+  let histories = 0; let created = false; let name = description.name;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') {
-      if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
-    if (call.method === 'POST') { created = true; return ok(newer); }
-      return ok({sessions: created ? [description, newer] : [description]});
+      if (call.method === 'POST') { created = true; return ok(newer); }
+      const named = {...description, name};
+      return ok({sessions: created ? [named, newer] : [named]});
     }
     if (call.url.includes(`/sessions/${SID}/history?`)) {
       if (++histories === 1) return ok(empty());
@@ -241,16 +319,20 @@ test('session buttons survive polling, title updates, insertions and switching; 
   });
   await load('session-controls');
   const original = ui.get('sessions').children[0];
-  ui.runTimer(1000); await until(() => original.textContent === '更新后的标题');
+  ui.runTimer(1000); await until(() => histories === 2); await flush();
+  assert.equal(original.textContent, description.name);
+  name = '更新后的标题'; ui.get('refresh-sessions').click(); await until(() => original.textContent === name);
   assert.equal(ui.get('sessions').children[0], original); assert.equal(original.title, original.textContent);
   ui.runTimer(1000); await flush(); assert.equal(ui.get('sessions').children[0], original);
   ui.get('new-session').click(); await until(() => ui.get('sessions').children.length === 2); await flush();
   const latest = ui.get('sessions').children[0];
+  assert.equal(ui.get('session-channel').textContent, 'Channel ID: 4');
   assert.equal(ui.get('sessions').children[1], original);
   assert.equal(latest['aria-current'], 'page'); assert.equal(original['aria-current'], 'false');
   original.click(); await flush();
   assert.equal(ui.get('sessions').children[0], latest); assert.equal(ui.get('sessions').children[1], original);
   assert.equal(original['aria-current'], 'page'); assert.equal(ui.get('session-title').textContent, '更新后的标题');
+  assert.equal(ui.get('session-channel').textContent, 'Channel ID: 9007199254740993');
   ui.get('refresh-sessions').click(); await flush();
   assert.deepEqual(ui.get('sessions').children, [latest, original]);
   ui.get('logout').click(); assert.equal(ui.get('sessions').children.length, 0);
@@ -280,18 +362,18 @@ test('draft controls survive polling and update in place through streaming, uplo
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('draft-controls');
-  for (const article of ui.get('messages').children) findElement(article, element => element.textContent === '回复').click();
+  for (const article of ui.get('messages').children) findElement(article, element => element.textContent === 'Reply').click();
   await flush();
   const [reply, otherReply] = ui.get('reply-selection').children;
   ui.get('file-input').files = [new File(['one'], '一.txt'), new File(['two'], '二.txt')];
   ui.get('file-input').dispatch('change'); await until(() => uploads.length === 2); await flush();
   const [file, otherFile] = ui.get('draft-files').children;
-  const remove = findElement(file, element => element.textContent === '移除');
-  const retry = findElement(file, element => element.textContent === '重新上传');
+  const remove = findElement(file, element => element.textContent === 'Remove');
+  const retry = findElement(file, element => element.textContent === 'Upload again');
   const assertPreserved = () => {
     assert.equal(ui.get('reply-selection').children[0], reply);
     assert.equal(ui.get('draft-files').children[0], file);
-    assert.equal(findElement(file, element => element.textContent === '移除'), remove);
+    assert.equal(findElement(file, element => element.textContent === 'Remove'), remove);
   };
   ui.runTimer(1000); await until(() => reply.textContent.includes('开头追加')); assertPreserved();
   ui.runTimer(1000); await flush(); assertPreserved();
@@ -302,7 +384,7 @@ test('draft controls survive polling and update in place through streaming, uplo
   uploads[2](ok({object_id: '43', name: '一.txt', type: 'text/plain', description: '', nbytes: 3}, 201));
   await until(() => !ui.get('send').disabled); assertPreserved();
   otherReply.click(); await flush(); assertPreserved(); assert.equal(ui.get('reply-selection').children.length, 1);
-  findElement(otherFile, element => element.textContent === '移除').click(); await flush();
+  findElement(otherFile, element => element.textContent === 'Remove').click(); await flush();
   assertPreserved(); assert.equal(ui.get('draft-files').children.length, 1);
   typeAndSend(ui, '暂存草稿'); await until(() => !!finishAllocation); await flush();
   assert.equal(reply.disabled, true); assert.equal(remove.disabled, true); assertPreserved();
@@ -346,7 +428,7 @@ test('a definitively rejected send unlocks its original draft for editing and a 
   assert.equal(ui.get('message-input').disabled, false);
   assert.equal(ui.get('file-input').disabled, false);
   assert.equal(sends, 1);
-  typeAndSend(ui, '已修改的新草稿'); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  typeAndSend(ui, '已修改的新草稿'); await until(() => ui.get('submission-status').textContent === 'Message sent');
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body));
   assert.deepEqual(bodies.map(body => [body.submission_id, body.text]), [['1', '被拒绝的原文'], ['2', '已修改的新草稿']]);
   ui.get('logout').click();
@@ -374,20 +456,20 @@ test('uncertain cancellation allows a manual retry without an automatic POST, th
   });
   await load('cancel-retry');
   const article = ui.get('messages').children[0];
-  const cancel = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '停止输出');
+  const cancel = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === 'Stop generating');
   assert.ok(cancel); cancel.click();
-  await until(() => cancel.textContent === '重试取消');
+  await until(() => cancel.textContent === 'Retry cancel');
   assert.equal(cancel.disabled, false);
-  assert.match(ui.get('submission-status').textContent, /未确认.*手动重试/);
+  assert.match(ui.get('submission-status').textContent, /unconfirmed.*retry canceling/);
   for (let step = 0; step < 3; step++) { ui.runTimer(1000); await flush(); }
   assert.equal(cancellations, 1);
   cancel.click(); cancel.click();
-  await until(() => cancel.textContent === '等待取消结果');
+  await until(() => cancel.textContent === 'Waiting for cancellation');
   assert.equal(cancellations, 2); assert.equal(cancel.disabled, true);
-  ui.runTimer(1000); await until(() => article.textContent.includes('已取消'));
+  ui.runTimer(1000); await until(() => article.textContent.includes('Canceled'));
   assert.equal(ui.get('messages').children[0], article);
-  assert.equal(cancel.hidden, true); assert.equal(cancel.disabled, false); assert.equal(cancel.textContent, '停止输出');
-  assert.equal(ui.get('submission-status').textContent, '输出已取消。');
+  assert.equal(cancel.hidden, true); assert.equal(cancel.disabled, false); assert.equal(cancel.textContent, 'Stop generating');
+  assert.equal(ui.get('submission-status').textContent, 'Generation canceled.');
   assert.deepEqual(ui.calls.filter(call => call.url.endsWith('/cancellations')).map(call => JSON.parse(call.body)), [
     {target_turn_id: 'answer'}, {target_turn_id: 'answer'},
   ]);
@@ -412,13 +494,13 @@ test('late cancellation responses keep the terminal message and cleared button s
     throw new Error(`unexpected request ${call.url}`);
     });
     await load(`late-cancel-${fails}`);
-    const cancel = findElement(ui.get('messages'), element => element.tagName === 'BUTTON' && element.textContent === '停止输出');
+    const cancel = findElement(ui.get('messages'), element => element.tagName === 'BUTTON' && element.textContent === 'Stop generating');
     cancel.click(); await until(() => !!completeCancellation);
     ui.runTimer(1000); await until(() => cancel.hidden);
-    assert.equal(ui.get('submission-status').textContent, '输出已结束。');
+    assert.equal(ui.get('submission-status').textContent, 'Generation finished.');
     completeCancellation(); await flush();
     assert.equal(cancel.hidden, true); assert.equal(cancel.disabled, false);
-    assert.equal(ui.get('submission-status').textContent, '输出已结束。');
+    assert.equal(ui.get('submission-status').textContent, 'Generation finished.');
     ui.get('logout').click();
   }
 });
@@ -449,7 +531,7 @@ test('streaming, reply selection and metadata updates preserve message and text 
   const answerContent = findElement(answer, element => element.className === 'turn-content');
   const questionText = questionContent.children[0]; const answerText = answerContent.children[0];
   const attachment = findElement(answer, element => element.className === 'attachment');
-  const reply = findElement(question, element => element.tagName === 'BUTTON' && element.textContent === '回复');
+  const reply = findElement(question, element => element.tagName === 'BUTTON' && element.textContent === 'Reply');
   const assertPreserved = () => {
     assert.equal(messages.children[0], question); assert.equal(messages.children[1], answer);
     assert.equal(findElement(question, element => element.className === 'turn-content'), questionContent);
@@ -457,8 +539,8 @@ test('streaming, reply selection and metadata updates preserve message and text 
     assert.equal(questionContent.children[0], questionText); assert.equal(answerContent.children[0], answerText);
     assert.equal(findElement(answer, element => element.className === 'attachment'), attachment);
   };
-  reply.click(); await flush(); assert.equal(reply.textContent, '已选回复'); assertPreserved();
-  reply.click(); await flush(); assert.equal(reply.textContent, '回复'); assertPreserved();
+  reply.click(); await flush(); assert.equal(reply.textContent, 'Reply selected'); assertPreserved();
+  reply.click(); await flush(); assert.equal(reply.textContent, 'Reply'); assertPreserved();
   finishMetadata(ok({object_id: '42', name: '报告.txt', type: 'text/plain', description: '', nbytes: 15}));
   await until(() => attachment.textContent.includes('报告.txt')); assertPreserved();
   messages.scrollTop = 17; messages.scrollHeight = 1000;
@@ -489,11 +571,11 @@ test('uncertain sends retry the same POST, then require a fresh history boundary
   });
   await load('unknown');
   typeAndSend(ui, '保留原文\n<script>这不是 HTML</script>');
-  await until(() => ui.get('submission-status').textContent.includes('发送结果未确认'));
+  await until(() => ui.get('submission-status').textContent.includes('Delivery is unconfirmed'));
   assert.equal(ui.get('send').disabled, true);
   assert.equal(ui.get('message-input').disabled, true);
   for (let step = 0; sends < 3 && step < 8; step++) { ui.runTimer(1000); await flush(); }
-  await until(() => ui.get('submission-status').textContent.includes('没有发送成功'));
+  await until(() => ui.get('submission-status').textContent.includes('was not sent'));
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body));
   assert.equal(bodies.length, 3); assert.deepEqual(bodies[0], bodies[1]); assert.deepEqual(bodies[1], bodies[2]);
   assert.equal(bodies[0].submission_id, '9007199254740993');
@@ -506,7 +588,7 @@ test('uncertain sends retry the same POST, then require a fresh history boundary
   for (let index = 0; index < 3; index++) { ui.runTimer(1000); await flush(); }
   assert.equal(sends, 3);
   ui.get('composer').dispatch('submit');
-  await until(() => ui.get('submission-status').textContent === '消息已发送');
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
   const resent = JSON.parse(ui.calls.filter(call => call.url.endsWith('/turns')).at(-1).body);
   assert.equal(resent.submission_id, '9007199254750993'); assert.equal(resent.text, bodies[0].text);
   assert.equal(ui.get('message-input').value, '');
@@ -529,7 +611,7 @@ test('only an explicit send range refusal allocates a new id and republishes; su
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('range'); typeAndSend(ui, '第一条');
-  await until(() => ui.get('submission-status').textContent === '消息已发送');
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
   assert.equal(allocations, 2); assert.equal(sends, 2);
   const requests = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body));
   assert.deepEqual(requests.map(body => body.submission_id), ['1', '10001']);
@@ -562,15 +644,15 @@ test('attachment-unavailable unlocks the retained draft for manual reupload and 
   ui.get('file-input').dispatch('change'); await until(() => uploads === 1); await flush();
   assert.equal(ui.get('send').disabled, false);
   typeAndSend(ui, '附件说明');
-  await until(() => ui.get('submission-status').textContent.includes('重新上传'));
+  await until(() => ui.get('submission-status').textContent.includes('Upload again'));
   assert.equal(ui.get('message-input').value, '附件说明'); assert.equal(uploads, 1); assert.equal(ui.get('send').disabled, true);
   assert.equal(ui.get('message-input').disabled, false);
   ui.get('message-input').value = '附件说明（重新上传）'; ui.get('message-input').dispatch('input');
   const row = ui.get('draft-files').children[0];
-  const retry = row.children.find(child => child.textContent === '重新上传'); assert.ok(retry); retry.click();
+  const retry = row.children.find(child => child.textContent === 'Upload again'); assert.ok(retry); retry.click();
   await until(() => uploads === 2); await flush();
   assert.equal(ui.get('send').disabled, false); ui.get('composer').dispatch('submit');
-  await until(() => ui.get('submission-status').textContent === '消息已发送');
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body));
   assert.equal(bodies[0].submission_id, '1'); assert.equal(bodies[1].submission_id, '2');
   assert.deepEqual(bodies[0].attachments, ['42']); assert.deepEqual(bodies[1].attachments, ['43']);
@@ -603,25 +685,25 @@ test('a lost attachment refusal after restart still unlocks the draft for reuplo
   });
   await load('lost-attachment-refusal');
   ui.get('file-input').files = [new File(['data'], '保留.txt', {type: 'text/plain'})];
-  ui.get('file-input').dispatch('change'); await until(() => ui.get('draft-files').textContent.includes('已上传'));
-  ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === '正在重连');
+  ui.get('file-input').dispatch('change'); await until(() => ui.get('draft-files').textContent.includes('Uploaded'));
+  ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === 'Reconnecting');
   ui.runTimer(1000); await until(() => allocations === 2 && !ui.get('send').disabled);
   typeAndSend(ui, '重启后发送已上传附件');
-  await until(() => ui.get('submission-status').textContent.includes('发送结果未确认'));
+  await until(() => ui.get('submission-status').textContent.includes('Delivery is unconfirmed'));
   assert.equal(ui.get('message-input').disabled, true);
   for (let step = 0; sends < 2 && step < 6; step++) { ui.runTimer(1000); await flush(); }
-  await until(() => ui.get('submission-status').textContent.includes('重新上传'));
+  await until(() => ui.get('submission-status').textContent.includes('Upload again'));
   assert.equal(ui.get('message-input').disabled, false);
   assert.equal(ui.get('message-input').value, '重启后发送已上传附件');
   assert.equal(ui.get('send').disabled, true); assert.equal(ui.get('draft-files').children.length, 1);
   const row = ui.get('draft-files').children[0];
-  const retry = findElement(row, element => element.textContent === '重新上传');
+  const retry = findElement(row, element => element.textContent === 'Upload again');
   assert.equal(retry.hidden, false); assert.equal(retry.disabled, false);
-  assert.equal(findElement(row, element => element.textContent === '移除').disabled, false);
+  assert.equal(findElement(row, element => element.textContent === 'Remove').disabled, false);
   for (let step = 0; step < 2; step++) { ui.runTimer(1000); await flush(); }
   assert.equal(sends, 2); assert.equal(uploads, 1);
   retry.click(); await until(() => uploads === 2 && !ui.get('send').disabled);
-  ui.get('composer').dispatch('submit'); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  ui.get('composer').dispatch('submit'); await until(() => ui.get('submission-status').textContent === 'Message sent');
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body));
   assert.deepEqual(bodies[0], bodies[1]);
   assert.deepEqual(bodies.map(body => body.submission_id), ['10001', '10001', '10002']);
@@ -645,7 +727,7 @@ test('creating again after a lost response reuses its stored ULID and logout dis
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('creation'); ui.get('new-session').click();
-  await until(() => ui.get('new-session').textContent.includes('重试创建'));
+  await until(() => ui.get('new-session').textContent.includes('Retry create'));
   const requestId = JSON.parse(ui.calls.find(call => call.method === 'POST').body).create_request_id;
   assert.match(requestId, /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
   assert.equal(ui.storage.get('openevent.pending-create'), requestId);
@@ -660,7 +742,7 @@ test('an unauthenticated API response returns to the token page and sends no fur
   const ui = environment(() => err(401, 'unauthenticated'));
   await load('auth'); await flush();
   assert.equal(ui.get('workspace').hidden, true); assert.equal(ui.get('login').hidden, false);
-  assert.equal(ui.calls.length, 1); assert.equal(ui.timers.size, 0); assert.match(ui.get('login-error').textContent, /访问口令/);
+  assert.equal(ui.calls.length, 1); assert.equal(ui.timers.size, 0); assert.match(ui.get('login-error').textContent, /access token/);
 });
 
 test('a proxy 503 without failure metadata retries history from the unchanged cursor', async () => {
@@ -674,11 +756,11 @@ test('a proxy 503 without failure metadata retries history from the unchanged cu
     if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
     throw new Error(`unexpected request ${call.url}`);
   });
-  await load('proxy'); await until(() => ui.get('sync-status').textContent === '正在重连');
+  await load('proxy'); await until(() => ui.get('sync-status').textContent === 'Reconnecting');
   ui.runTimer(1000); await until(() => histories === 2); await flush();
   const historyRequests = ui.calls.filter(call => call.url.includes('/history?'));
   assert.equal(historyRequests[0].url, historyRequests[1].url);
-  assert.equal(ui.get('sync-status').textContent, '已连接');
+  assert.equal(ui.get('sync-status').textContent, 'Connected');
   ui.get('logout').click();
 });
 
@@ -701,12 +783,12 @@ test('temporary service, network and timeout failures retry history without chan
     });
     await load(`transient-${failure}`);
     if (failure === 'timeout') ui.runTimer(30000);
-    await until(() => ui.get('sync-status').textContent === '正在重连');
+    await until(() => ui.get('sync-status').textContent === 'Reconnecting');
     if (failure === 'external_unavailable') assert.match(ui.get('message-error').textContent, /Fetch is temporarily unavailable/);
     ui.runTimer(1000); await until(() => histories === 2); await flush();
     const historyRequests = ui.calls.filter(call => call.url.includes('/history?'));
     assert.equal(historyRequests[0].url, historyRequests[1].url);
-    assert.equal(ui.get('sync-status').textContent, '已连接');
+    assert.equal(ui.get('sync-status').textContent, 'Connected');
     ui.get('logout').click();
   }
 });
@@ -729,13 +811,13 @@ test('explicit failure categories stop history retries, preserve records and dis
     });
     await load(`history-fatal-${category}`);
     const article = ui.get('messages').children[0];
-    ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === '读取已停止');
+    ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === 'Updates paused');
     await flush();
     assert.equal(histories, 2); assert.equal(ui.timers.size, 0);
     assert.equal(ui.get('messages').children[0], article); assert.match(article.textContent, /已经读取的内容/);
     assert.ok(ui.calls.filter(call => call.url.includes('/history?'))[1].url.includes('fetch_seq=2'));
-    assert.ok(ui.get('message-error').textContent.startsWith(`chat server is stopping：${detail}`));
-    assert.ok(findElement(ui.get('message-error'), element => element.textContent === '重新读取'));
+    assert.ok(ui.get('message-error').textContent.startsWith(`chat server is stopping: ${detail}`));
+    assert.ok(findElement(ui.get('message-error'), element => element.textContent === 'Reload'));
     ui.get('logout').click();
   }
 });
@@ -756,9 +838,9 @@ test('explicit send failures stop automatic same-id requests and preserve the un
       throw new Error(`unexpected request ${call.url}`);
     });
     await load(`send-fatal-${category}`); typeAndSend(ui, '结果未确认的原始草稿');
-    await until(() => ui.get('submission-status').textContent.includes('发送结果未确认'));
+    await until(() => ui.get('submission-status').textContent.includes('Delivery is unconfirmed'));
     for (let step = 0; sends < 2 && step < 4; step++) { ui.runTimer(1000); await flush(); }
-    assert.ok(ui.get('submission-status').textContent.startsWith(`chat server is stopping：${detail}`));
+    assert.ok(ui.get('submission-status').textContent.startsWith(`chat server is stopping: ${detail}`));
     for (let step = 0; step < 3; step++) { ui.runTimer(1000); await flush(); }
     assert.equal(sends, 2); assert.equal(ui.get('message-input').value, '结果未确认的原始草稿');
     assert.equal(ui.get('send').disabled, true);
@@ -789,16 +871,16 @@ test('a first fatal or malformed send response remains uncertain until fresh old
       throw new Error(`unexpected request ${call.url}`);
     });
     await load(`first-send-${failure}`); typeAndSend(ui, '原消息');
-    await until(() => !!findElement(ui.get('submission-status'), element => element.textContent === '重试确认'));
+    await until(() => !!findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation'));
     assert.equal(ui.get('message-input').disabled, true); assert.equal(sends, 1);
-    findElement(ui.get('submission-status'), element => element.textContent === '重试确认').click();
+    findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation').click();
     await until(() => !!finishHistory && allocations === 2); await flush();
     assert.equal(sends, 2); assert.equal(ui.get('message-input').disabled, true);
     assert.equal(ui.get('message-input').value, '原消息');
     finishHistory(ok(historyPage([historyEvent(1, {
       kind: 'turn.single', turn_id: 'user:1', content: [{type: 'text', text: '原消息'}], reply_to_seqs: [],
     }, 'user')], 2)));
-    await until(() => ui.get('submission-status').textContent === '消息已发送');
+    await until(() => ui.get('submission-status').textContent === 'Message sent');
     assert.equal(ui.get('message-input').value, ''); assert.equal(ui.get('message-input').disabled, false);
     assert.deepEqual(ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body).submission_id), ['1', '1']);
     ui.get('logout').click();
@@ -844,13 +926,13 @@ test('initialization keeps local drafting available but only the current allocat
   typeAndSend(ui, '等待期间写好的草稿'); await flush();
   assert.equal(ui.calls.some(call => call.url.endsWith('/turns')), false);
   ui.runTimer(120000); await flush();
-  assert.match(ui.get('submission-status').textContent, /正在重试/);
+  assert.match(ui.get('submission-status').textContent, /Retrying/);
   for (let index = 0; allocations.length < 2 && index < 4; index++) { ui.runTimer(1000); await flush(); }
   allocations[0](ok({start: '1', end: '100'}, 201)); await flush();
   assert.equal(ui.get('message-input').disabled, false); assert.equal(ui.get('send').disabled, true);
   assert.equal(ui.get('message-input').value, '等待期间写好的草稿');
   allocations[1](ok({start: '101', end: '200'}, 201)); await until(() => !ui.get('send').disabled);
-  ui.get('composer').dispatch('submit'); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  ui.get('composer').dispatch('submit'); await until(() => ui.get('submission-status').textContent === 'Message sent');
   const sent = JSON.parse(ui.calls.find(call => call.url.endsWith('/turns')).body);
   assert.equal(sent.submission_id, '101'); assert.equal(sent.text, '等待期间写好的草稿');
   assert.ok(ui.calls.filter(call => call.url.endsWith('/submissions')).every(call => JSON.parse(call.body).count === '100'));
@@ -868,7 +950,7 @@ test('recovery discards an earlier allocation and only the new preparation respo
     if (call.url.endsWith('/submissions')) return new Promise(resolve => allocations.push({resolve, signal: call.signal}));
     throw new Error(`unexpected request ${call.url}`);
   });
-  await load('reprepare-stale-allocation'); await until(() => ui.get('sync-status').textContent === '正在重连');
+  await load('reprepare-stale-allocation'); await until(() => ui.get('sync-status').textContent === 'Reconnecting');
   assert.equal(allocations.length, 1);
   ui.runTimer(1000); await until(() => allocations.length === 2);
   assert.equal(allocations[0].signal.aborted, true);
@@ -896,10 +978,10 @@ test('waiting or failed allocation permits reply edits and committed attachment 
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('read-during-preparation');
-  await until(() => ui.get('messages').textContent.includes('重试信息'));
+  await until(() => ui.get('messages').textContent.includes('Retry file info'));
   const article = ui.get('messages').children[0];
-  const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '回复');
-  const cancel = findElement(article, element => element.textContent === '停止输出');
+  const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === 'Reply');
+  const cancel = findElement(article, element => element.textContent === 'Stop generating');
   assert.equal(reply.disabled, false); assert.equal(cancel.disabled, true);
   reply.click(); await flush(); assert.equal(ui.get('reply-selection').children.length, 1);
   assert.equal(ui.get('reply-selection').children[0].disabled, false);
@@ -911,10 +993,10 @@ test('waiting or failed allocation permits reply edits and committed attachment 
   await flush();
   assert.equal(ui.calls.some(call => /\/(turns|cancellations|attachments)$/.test(call.url)), false);
   assert.equal(ui.get('send').disabled, true); assert.equal(ui.get('choose-files').disabled, true);
-  const retry = findElement(article, element => element.textContent === '重试信息');
+  const retry = findElement(article, element => element.textContent === 'Retry file info');
   assert.equal(retry.disabled, false); retry.click();
   await until(() => article.textContent.includes('附件.txt'));
-  const download = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '下载');
+  const download = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === 'Download');
   assert.equal(download.disabled, false); download.click(); await until(() => !!finishDownload);
   assert.equal(download.disabled, true);
   finishDownload(new Response('data', {headers: {'Content-Type': 'application/octet-stream',
@@ -964,7 +1046,7 @@ test('send body timeout retries the frozen POST and a late success cannot clear 
   ui.runTimer(30000); await flush();
   assert.equal(ui.get('message-input').disabled, true);
   for (let index = 0; sends < 2 && index < 4; index++) { ui.runTimer(1000); await flush(); }
-  await until(() => ui.get('submission-status').textContent === '消息已发送');
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
   assert.equal(ui.get('message-input').value, ''); assert.equal(ui.get('message-input').disabled, false);
   ui.get('message-input').value = '编辑下一条'; ui.get('message-input').dispatch('input');
   finishBody(JSON.stringify({submission_id: '1', status: 'committed', turn_ref: {role: 'user', turn_id: 'user:1'}})); await flush();
@@ -1017,7 +1099,7 @@ test('reset replaces text and attachments in the original bubble; old metadata n
   });
   await load('reset-dom'); await until(() => !!oldMetadata);
   const article = ui.get('messages').children[0]; const content = findElement(article, element => element.className === 'turn-content');
-  const textNode = content.children[0]; const cancel = findElement(article, element => element.textContent === '停止输出');
+  const textNode = content.children[0]; const cancel = findElement(article, element => element.textContent === 'Stop generating');
   assert.equal(content.textContent, ''); assert.equal(cancel.disabled, false);
   ui.runTimer(1000); await until(() => article.textContent.includes('43.txt'));
   ui.runTimer(1000); await until(() => content.textContent === '新回答');
@@ -1043,7 +1125,7 @@ test('downloads validate headers, wait for the complete body, and never save a p
     throw new Error(`unexpected request ${call.url}`);
   });
   const {request} = await load('download-deadline');
-  await assert.rejects(request('/bad-download', {binary: true}), /下载响应格式/);
+  await assert.rejects(request('/bad-download', {binary: true}), /Invalid download response/);
   const slow = request('/slow-download', {binary: true}).then(() => saved++);
   const rejected = assert.rejects(slow, error => error.code === 'timeout');
   await until(() => !!finishBody); ui.runTimer(120000); await rejected;
@@ -1065,14 +1147,14 @@ test('upload timeout retains the local file, never retries automatically and ign
   await load('upload-timeout');
   const file = new File(['data'], '原文件.txt', {type: 'text/plain'});
   ui.get('file-input').files = [file]; ui.get('file-input').dispatch('change'); await until(() => uploads.length === 1);
-  ui.runTimer(120000); await until(() => ui.get('draft-files').textContent.includes('上传结果未确认'));
+  ui.runTimer(120000); await until(() => ui.get('draft-files').textContent.includes('Upload is unconfirmed'));
   for (let index = 0; index < 3; index++) { ui.runTimer(1000); await flush(); }
   assert.equal(uploads.length, 1); assert.equal(ui.get('send').disabled, true);
-  findElement(ui.get('draft-files'), element => element.textContent === '重新上传').click(); await until(() => uploads.length === 2);
+  findElement(ui.get('draft-files'), element => element.textContent === 'Upload again').click(); await until(() => uploads.length === 2);
   const metadata = id => ({object_id: id, name: file.name, type: file.type, description: '', nbytes: file.size});
   uploads[0](ok(metadata('41'), 201)); await flush(); assert.equal(ui.get('send').disabled, true);
   uploads[1](ok(metadata('42'), 201)); await until(() => !ui.get('send').disabled);
-  typeAndSend(ui, '文件'); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  typeAndSend(ui, '文件'); await until(() => ui.get('submission-status').textContent === 'Message sent');
   const uploadCalls = ui.calls.filter(call => call.url.endsWith('/attachments'));
   assert.equal(uploadCalls[0].body.get('file').name, file.name); assert.equal(uploadCalls[1].body.get('file').name, file.name);
   assert.deepEqual(JSON.parse(ui.calls.find(call => call.url.endsWith('/turns')).body).attachments, ['42']);
@@ -1095,7 +1177,7 @@ test('A → B → A send confirmation ignores the earlier response and retains t
   const committed = () => ok({submission_id: '1', status: 'committed', turn_ref: {role: 'user', turn_id: 'user:1'}}, 200);
   sends[0](committed()); await flush();
   assert.equal(ui.get('send').disabled, true); assert.equal(ui.get('message-input').value, '切换前原文');
-  sends[1](committed()); await until(() => ui.get('submission-status').textContent === '消息已发送');
+  sends[1](committed()); await until(() => ui.get('submission-status').textContent === 'Message sent');
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => call.body);
   assert.equal(bodies.length, 2); assert.equal(bodies[0], bodies[1]);
   ui.get('logout').click();
@@ -1157,7 +1239,7 @@ test('a definitive refill failure ends the unsent attempt and preserves its edit
   assert.equal(ui.get('message-input').disabled, false); assert.equal(ui.get('message-input').value, '领号失败前的草稿');
   assert.equal(sends, 100);
   ui.get('message-input').value = '修改后的草稿'; ui.get('message-input').dispatch('input');
-  findElement(ui.get('submission-status'), element => element.textContent === '重试初始化').click();
+  findElement(ui.get('submission-status'), element => element.textContent === 'Retry setup').click();
   await until(() => allocations === 3); await flush();
   assert.equal(sends, 100); assert.equal(ui.get('message-input').value, '修改后的草稿');
   ui.get('composer').dispatch('submit'); await until(() => sends === 101 && ui.get('message-input').value === '');
@@ -1202,7 +1284,7 @@ test('a long history leaves unrelated attachments untouched during local message
   assert.equal(articles.length, count);
   let unrelatedUpdates = 0;
   for (const article of articles.slice(0, -1)) {
-    const control = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '下载');
+    const control = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === 'Download');
     let disabled = control.disabled;
     Object.defineProperty(control, 'disabled', {
       get: () => disabled,
@@ -1213,17 +1295,17 @@ test('a long history leaves unrelated attachments untouched during local message
   const content = findElement(active, element => element.className === 'turn-content');
   ui.runTimer(1000); await until(() => content.textContent === '正文追加');
   assert.equal(unrelatedUpdates, 0, 'one append must not update the other 999 attachments');
-  const reply = findElement(active, element => element.tagName === 'BUTTON' && element.textContent === '回复');
+  const reply = findElement(active, element => element.tagName === 'BUTTON' && element.textContent === 'Reply');
   reply.click(); await flush();
-  assert.equal(reply.textContent, '已选回复'); assert.equal(unrelatedUpdates, 0);
+  assert.equal(reply.textContent, 'Reply selected'); assert.equal(unrelatedUpdates, 0);
   finishMetadata(ok({object_id: '43', name: '当前.txt', type: 'text/plain', description: '', nbytes: 4}));
   await until(() => active.textContent.includes('当前.txt'));
   assert.equal(unrelatedUpdates, 0);
-  const cancel = findElement(active, element => element.tagName === 'BUTTON' && element.textContent === '停止输出');
+  const cancel = findElement(active, element => element.tagName === 'BUTTON' && element.textContent === 'Stop generating');
   cancel.click(); await until(() => !!finishCancellation); await flush();
-  assert.equal(cancel.textContent, '正在取消…'); assert.equal(unrelatedUpdates, 0);
+  assert.equal(cancel.textContent, 'Canceling…'); assert.equal(unrelatedUpdates, 0);
   finishCancellation(ok({status: 'committed'}, 201));
-  await until(() => cancel.textContent === '等待取消结果'); assert.equal(unrelatedUpdates, 0);
+  await until(() => cancel.textContent === 'Waiting for cancellation'); assert.equal(unrelatedUpdates, 0);
   assert.equal(ui.calls.filter(call => call.url.includes('/metadata?')).length, 2);
   ui.get('logout').click();
 });
@@ -1261,8 +1343,8 @@ test('one long turn touches only new or changed attachments during text, reply a
   try {
     ui.runTimer(1000); await until(() => text.textContent === '正文追加');
     assert.equal(oldReads, 0, 'text append must not inspect the 1000 old attachments');
-    const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === '回复');
-    reply.click(); await flush(); assert.equal(reply.textContent, '已选回复');
+    const reply = findElement(article, element => element.tagName === 'BUTTON' && element.textContent === 'Reply');
+    reply.click(); await flush(); assert.equal(reply.textContent, 'Reply selected');
     assert.equal(oldReads, 0, 'reply selection must not inspect the old attachments');
     finishMetadata(ok({object_id: '43', name: '43.txt', type: 'text/plain', description: '', nbytes: 4}));
     await until(() => attachments.at(-1).textContent.includes('43.txt'));
@@ -1277,7 +1359,7 @@ test('one long turn touches only new or changed attachments during text, reply a
   } finally { FileInfoStore.prototype.get = get; ui.get('logout').click(); }
 });
 
-test('local append and reset refresh dependent quotes, draft previews and titles without touching unrelated files', async () => {
+test('local append and reset refresh dependent quotes and draft previews without changing names or unrelated files', async () => {
   let histories = 0;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
@@ -1302,15 +1384,15 @@ test('local append and reset refresh dependent quotes, draft previews and titles
   await until(() => ui.get('messages').textContent.includes('文件.txt')); await flush();
   const [source, dependent, unrelated] = ui.get('messages').children;
   let unrelatedUpdates = 0;
-  const download = findElement(unrelated, element => element.tagName === 'BUTTON' && element.textContent === '下载');
+  const download = findElement(unrelated, element => element.tagName === 'BUTTON' && element.textContent === 'Download');
   Object.defineProperty(download, 'disabled', {get: () => false, set: () => { unrelatedUpdates++; }});
-  findElement(source, element => element.tagName === 'BUTTON' && element.textContent === '回复').click(); await flush();
+  findElement(source, element => element.tagName === 'BUTTON' && element.textContent === 'Reply').click(); await flush();
   const quote = findElement(dependent, element => element.className === 'quoted-reply');
   const draft = ui.get('reply-selection').children[0];
   for (const text of ['原文追加', '重置']) {
-    ui.runTimer(1000); await until(() => quote.textContent === `你：${text}`);
-    assert.equal(draft.textContent, `你：${text} ×`);
-    assert.equal(ui.get('session-title').textContent, text);
+    ui.runTimer(1000); await until(() => quote.textContent === `You: ${text}`);
+    assert.equal(draft.textContent, `You: ${text} ×`);
+    assert.equal(ui.get('session-title').textContent, description.name);
     assert.equal(ui.get('messages').children[1], dependent);
     assert.equal(unrelatedUpdates, 0);
   }
