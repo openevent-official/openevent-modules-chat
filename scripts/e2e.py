@@ -198,9 +198,11 @@ def run():
                     assert initial_history == {'events': [], 'next_seq': str(initial_raw.next_seq),
                                                'last_seq': str(initial_raw.last_seq)}
                     assert int(initial_history['next_seq']) > int(session['scan_start_seq'])
-                    assert upload(base, b'x', expected=409)['error']['code'] == 'session_not_initialized'
-                    assert api('POST', base + '/cancellations', {'target_turn_id': 'not-started'},
-                               expected=409)['error']['code'] == 'session_not_initialized'
+                    assert upload(base, b'x')['nbytes'] == 1
+                    early_writer = agent.start_turn(turn_id='before-allocation')
+                    assert api('POST', base + '/cancellations', {'target_turn_id': early_writer.turn_id},
+                               expected=201) == {'status': 'committed'}
+                    del early_writer  # The external cancellation ends this turn.
                     assert api('POST', base + '/turns', {'submission_id': '1', 'text': 'not ready'},
                                expected=409)['error']['code'] == 'submission_out_of_range'
                     allocation = api('POST', base + '/submissions', {'count': '3'}, expected=201)
@@ -328,7 +330,7 @@ def run():
                     assert api('POST', '/api/chat/sessions', {'create_request_id': pending_request}) == pending_session
                     api('POST', base + '/turns', send_body, expected=409)
                     # Previously committed attachments remain readable before allocating a
-                    # batch in this process; only operations that write require preparation.
+                    # batch in this process; only sending a user turn requires an issued ID.
                     assert api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}')['nbytes'] == len(file_data)
                     assert api('GET', base + f'/attachments/{oid}?event_seq={creation}') == file_data
                     fresh = api('POST', base + '/submissions', {'count': '1'}, expected=201)

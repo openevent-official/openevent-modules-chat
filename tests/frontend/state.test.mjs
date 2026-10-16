@@ -135,6 +135,55 @@ test('reply indexes use creation seq; append attachments keep their carrying eve
   assert.deepEqual(state.order, [turnKey('user', 'user:1'), turnKey('agent', 'a')]);
 });
 
+test('replies require terminal targets at their own event position, within or across pages', () => {
+  for (const terminal of ['turn.end', 'turn.cancel']) {
+    for (const split of [0, 1, 3]) {
+      const state = session();
+      const finish = terminal === 'turn.end'
+        ? event(2, terminal, {turn_id: 'a', pre_seq: '1'})
+        : event(2, terminal, {target_turn: {role: 'agent', turn_id: 'a'}}, 'user');
+      const reply = create(4, 'reply', 'turn.single', 'user');
+      reply.payload.reply_to_seqs = ['3', '1'];
+      const prior = [create(1), finish, create(3, 'single', 'turn.single')];
+      if (split) apply(state, page(prior.slice(0, split), split + 1));
+      apply(state, page([...prior.slice(split), reply], 5));
+      assert.deepEqual(state.turns.get(turnKey('user', 'reply')).replies, ['3', '1']);
+    }
+  }
+  for (const split of [false, true]) {
+    const state = session();
+    const reply = create(2, 'reply', 'turn.single', 'user'); reply.payload.reply_to_seqs = ['1'];
+    const finish = event(3, 'turn.end', {turn_id: 'a', pre_seq: '1'});
+    if (split) apply(state, page([create(1)], 2));
+    const oldCursor = state.fetchSeq;
+    assert.throws(() => apply(state, page([...(split ? [] : [create(1)]), reply, finish], 4)), /Reply target/);
+    assert.equal(state.fetchSeq, oldCursor);
+    assert.equal(state.turns.size, split ? 1 : 0);
+    assert.equal(state.turns.get(turnKey('agent', 'a'))?.state, split ? 'open' : undefined);
+  }
+});
+
+test('reply validation rejects non-creation, unknown, self and future references without committing a partial page', () => {
+  const state = apply(session(), page([
+    create(1), event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '内容'}]}),
+    event(3, 'turn.end', {turn_id: 'a', pre_seq: '2'}),
+    event(4, 'submission.reserve', {reserved_through: '100'}, 'user'),
+    create(5, 'open'),
+  ], 6));
+  const original = state.turns.get(turnKey('agent', 'open'));
+  for (const reference of ['2', '3', '4', '5', '8', '9', '100']) {
+    const reply = create(8, 'reply', 'turn.single', 'user'); reply.payload.reply_to_seqs = [reference];
+    assert.throws(() => apply(state, page([
+      event(6, 'turn.append', {turn_id: 'open', pre_seq: '5', content: [{type: 'text', text: '未提交'}]}),
+      create(7, 'new', 'turn.single'), reply, create(9, 'future', 'turn.single'),
+    ], 10)), /Reply target/);
+    assert.equal(state.fetchSeq, '6'); assert.equal(state.turns.size, 2);
+    assert.equal(state.turns.get(original.key), original); assert.equal(original.parts.length, 1);
+    assert.deepEqual(state.order, [turnKey('agent', 'a'), original.key]);
+    assert.deepEqual([...state.creationIndex.keys()], ['1', '5']);
+  }
+});
+
 test('the first terminal event wins and later events do not change content or files', () => {
   const state = apply(session(), page([create(1)], 2));
   apply(state, page([

@@ -6,11 +6,11 @@ OpenEvent Chat 定义面向用户与 Agent 永久会话的精简事件协议 `ch
 方式保存 turn 事件和发送编号预留控制事件。文本可以在模型生成过程中持续追加，尚未结束的流式内容可以重置后重新输出，
 不同 turn 也可以安全交错。
 
-> Chat SDK、Chat Server、浏览器和 Agent 必须全部支持当前 `chat.v1`，包括流式重置、空内容 start 和纯附件 append；不兼容旧版读取规则。
+> Chat SDK、Chat Server、浏览器和 Agent 必须全部支持当前 `chat.v1`，包括流式重置、空内容 start、纯附件 append 和只引用已结束消息；不兼容旧版读取规则。
 
 项目包含用于 `chat.v1` 写入、一次一页的 Fetch 读取和无状态消息解析的 Python SDK。
 流式消息通过调用方持有的写入对象追加、重置和结束；续写旧消息时，可以按已知状态直接构造 `TurnWriter`，状态恢复由调用方负责。
-具体用法见[公开写入 API](docs/CHAT_SDK_cn.md#3-写入-api)。SDK 创建时不自动恢复历史；
+具体用法见[公开写入 API](docs/CHAT_SDK_cn.md#5-写入-api)。SDK 创建时不自动恢复历史；
 需要持续读取时，调用方自行循环 Fetch 并保存读取位置。
 项目还提供一个聊天后端和浏览器页面，支持会话、文件和主动消息拉取；不包含 Agent runtime 或模型集成。
 
@@ -29,19 +29,19 @@ ChannelInfo.protocol = "chat.v1"
   `turn_id` 共同标识。
 - `turn.append`：向已有 turn 追加文字或附件，内容约束见[协议第 4 节](docs/CHAT_PROTOCOL_cn.md#4-content-part)。
 - `turn.reset`：替换仍在输出的 turn 的当前可见内容，保留同一条回复及其引用；完整规则见
-  [协议第 15 节](docs/CHAT_PROTOCOL_cn.md#15-turnreset)。
+  [协议第 8 节](docs/CHAT_PROTOCOL_cn.md#8-turnreset)。
 - `turn.end`：正常完成 turn。
 - `turn.cancel`：独立中止已有 turn。
 - `submission.reserve`：记录当前 Channel 的发送编号预留上限，不创建 turn；完整规则见
-  [协议第 14 节](docs/CHAT_PROTOCOL_cn.md#14-submissionreserve)。
+  [协议第 13 节](docs/CHAT_PROTOCOL_cn.md#13-submissionreserve)。
 
-回复通过 `reply_to_seqs` 引用目标 turn 的创建事件 seq，具体语义见
-[协议第 11 节](docs/CHAT_PROTOCOL_cn.md#11-回复关系)。
+回复只能指向已结束的 turn，通过 `reply_to_seqs` 引用其创建事件 seq；取消也属于已结束，具体语义见
+[协议第 12 节](docs/CHAT_PROTOCOL_cn.md#12-回复关系)。
 
 `turn.cancel` 只记录取消事实。使用 Chat SDK 时，应用通过 `fetch_page()` 读取生效的取消事件，并自行停止对应的模型、工具或
 其它业务处理；Chat 协议不直接中止应用任务。
 
-turn 的终态不会被后续事件改变，完整规则见[协议第 10 节](docs/CHAT_PROTOCOL_cn.md#10-链与终态语义)。
+turn 的终态不会被后续事件改变，完整规则见[协议第 11 节](docs/CHAT_PROTOCOL_cn.md#11-链与终态语义)。
 
 完整公开规格见 [docs/CHAT_PROTOCOL_cn.md](docs/CHAT_PROTOCOL_cn.md)。
 
@@ -67,7 +67,7 @@ turn 的终态不会被后续事件改变，完整规则见[协议第 10 节](do
 - 业务级幂等、重试或非法历史处理策略。
 
 应用可以在 turn 事件上附加 OpenEvent ObjectKey，也可以在协议的 `extensions` 对象中保存用户可见的应用元数据。
-Python SDK 将读取到的扩展作为原文保留；需要解释或转发时见[扩展 API](docs/CHAT_SDK_cn.md#22-扩展原文与序列化)。
+Python SDK 将读取到的扩展作为原文保留；需要解释或转发时见[扩展 API](docs/CHAT_SDK_cn.md#4-数据表示与序列化)。
 基础协议只支持文本 content part，不允许增加上述七种之外的事件 kind。
 
 ## 运行前提
@@ -77,7 +77,7 @@ Python SDK 将读取到的扩展作为原文保留；需要解释或转发时见
 - 支持消息 UUID 的 OpenEvent server，具体以 OpenEvent API 文档为准。
 - 直接使用 SDK 时，需提前创建 `protocol="chat.v1"` 的非系统 Channel；浏览器应用会自动创建。
 
-构建或测试前运行 `make check-sdk`，确认当前环境已安装的 SDK 可用。`make e2e`
+构建和安装入口通过 `make check-sdk` 确认当前环境已安装的 SDK 可用。`make test` 使用测试环境已安装的依赖，不额外执行 SDK 检查，也不要求检出 SDK 源码子模块；原有 SDK 文档链接保留。`make e2e`
 还要求 `OPENEVENT_SERVER_BIN` 指向可执行的 OpenEvent server；它只使用已安装的
 SDK，不会从源码安装 SDK。
 

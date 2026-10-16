@@ -56,11 +56,11 @@ while True:
         break
 ```
 
-A successful write return means OpenEvent committed the message. The example application loop reads from the history start one page at a time, saves `next_seq` after processing each page, and stops after passing the reply's end event. The SDK has already excluded OpenEvent system messages; continue using the returned cursor even if the page contains no Chat messages. Applications also organize their own continuous read and processing loops. Tail waits and stopping conditions are covered by the [one-page read contract](CHAT_SDK.md#21-reading-one-page).
+A successful write return means OpenEvent committed the message. The example application loop reads from the history start one page at a time, saves `next_seq` after processing each page, and stops after passing the reply's end event. The SDK has already excluded OpenEvent system messages; continue using the returned cursor even if the page contains no Chat messages. Applications also organize their own continuous read and processing loops. Tail waits and stopping conditions are covered by the [one-page read contract](CHAT_SDK.md#32-reading-one-page).
 
-Save the seq returned by `single_turn`, or the `creation_seq` of a writer returned by `start_turn`, and pass it in `reply_to_seqs` when replying. The SDK validates field shape only; it does not read history to validate targets. Select valid targets according to [protocol section 11](CHAT_PROTOCOL.md#11-reply-relationships).
+Save the seq returned by `single_turn`, or the `creation_seq` of a writer returned by `start_turn`, and pass it in `reply_to_seqs` when replying after confirming the target is terminal. The SDK validates field shape only; it does not read history to validate targets. Select valid targets according to [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
 
-For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn` to record cancellation of an existing TurnRef. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. For files generated during output, see the [attachment append example](CHAT_SDK.md#3-write-api).
+For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn` to record cancellation of an existing TurnRef. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. For files generated during output, see the [attachment append example](CHAT_SDK.md#5-write-api).
 
 ## Continuing an unfinished turn
 
@@ -75,31 +75,7 @@ writer.append(content=(TextPart("Continuing the previous reply."),))
 writer.complete()
 ```
 
-Construction does not reread history or publish another `turn.start`. See the [writer contract](CHAT_SDK.md#31-independent-writers) for parameter semantics. Applications reconstruct the current state. Old requests must finish before continuation; see the [old-write handoff contract](CHAT_SDK.md#32-old-write-handoff).
-
-## Carrying extensions unchanged
-
-Use `RawExtensions` to forward extensions; ordinary application-generated extensions may still be supplied as dictionaries. See the
-[raw extensions and serialization contract](CHAT_SDK.md#22-raw-extensions-and-serialization) for the interfaces and parsed result types.
-
-```python
-from openevent.chat_sdk import RawExtensions, serialize_payload
-
-chat.single_turn(
-    turn_id="with-metadata-1",
-    content=(TextPart("A message with application metadata"),),
-    extensions=RawExtensions('{"value":1e400}'),
-)
-
-# message is one ParsedMessage returned by fetch_page.
-payload_bytes = serialize_payload(message.payload)
-raw_extensions = message.payload.get("extensions")
-if raw_extensions is not None:
-    extension_json = raw_extensions.json_text
-```
-
-`payload_bytes` preserves the extension source text; do not first decode `extension_json` with an ordinary JSON parser just to forward it.
-Applications choose an appropriate parser only when they need to read extension contents.
+Construction does not reread history or publish another `turn.start`. See the [writer contract](CHAT_SDK.md#51-independent-writers) for parameter semantics. Applications reconstruct the current state. Old requests must finish before continuation; see the [old-write handoff contract](CHAT_SDK.md#52-old-write-handoff).
 
 ## Resetting unfinished output
 
@@ -120,7 +96,31 @@ writer.append(content=(TextPart("New content from the retry"),))
 writer.complete()
 ```
 
-Alternatively, `writer.reset(content=(TextPart("First retry chunk"),))` clears the old content and publishes the new first chunk in one event. A successful reset return means only that the event committed; it does not prove that the user has not cancelled. Applications may read back before retrying, but this is not a required synchronization barrier and cannot rule out a new cancellation after the read. Stop writing when normal reads observe an effective cancellation. The page still shows the same turn, with unchanged creation position and reply relationships. Replacement of content and attachments, cancellation races, unresolved publication, and recovery limits are defined only by the [public writer contract](CHAT_SDK.md#31-independent-writers). Reset cannot bypass an unresolved write or reopen a terminal turn.
+Alternatively, `writer.reset(content=(TextPart("First retry chunk"),))` clears the old content and publishes the new first chunk in one event. A successful reset return means only that the event committed; it does not prove that the user has not cancelled. Applications may read back before retrying, but this is not a required synchronization barrier and cannot rule out a new cancellation after the read. Stop writing when normal reads observe an effective cancellation. The page still shows the same turn, with unchanged creation position and reply relationships. Replacement of content and attachments, cancellation races, unresolved publication, and recovery limits are defined only by the [public writer contract](CHAT_SDK.md#51-independent-writers). Reset cannot bypass an unresolved write or reopen a terminal turn.
+
+## Carrying extensions unchanged
+
+Use `RawExtensions` to forward extensions; ordinary application-generated extensions may still be supplied as dictionaries. See the
+[raw extensions and serialization contract](CHAT_SDK.md#4-data-representation-and-serialization) for the interfaces and parsed result types.
+
+```python
+from openevent.chat_sdk import RawExtensions, serialize_payload
+
+chat.single_turn(
+    turn_id="with-metadata-1",
+    content=(TextPart("A message with application metadata"),),
+    extensions=RawExtensions('{"value":1e400}'),
+)
+
+# message is one ParsedMessage returned by fetch_page.
+payload_bytes = serialize_payload(message.payload)
+raw_extensions = message.payload.get("extensions")
+if raw_extensions is not None:
+    extension_json = raw_extensions.json_text
+```
+
+`payload_bytes` preserves the extension source text; do not first decode `extension_json` with an ordinary JSON parser just to forward it.
+Applications choose an appropriate parser only when they need to read extension contents.
 
 ## Closing
 
@@ -129,4 +129,4 @@ chat.close()
 events.close()
 ```
 
-The example waits for Chat calls to finish before releasing `events`. See the [lifecycle contract](CHAT_SDK.md#5-client-lifecycle) for interrupting in-flight requests. Methods report failure through exceptions; see the [error contract](CHAT_SDK.md#4-uuids-retries-and-errors).
+The example waits for Chat calls to finish before releasing `events`. See the [lifecycle contract](CHAT_SDK.md#7-client-lifecycle) for interrupting in-flight requests. Methods report failure through exceptions; see the [error contract](CHAT_SDK.md#6-uuids-retries-and-errors).

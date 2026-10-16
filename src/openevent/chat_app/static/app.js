@@ -13,9 +13,9 @@ let pageSuspended = false;
 let queryController = null;
 let queryTimer = null;
 let queryGeneration = 0;
-let preparationController = null;
-let preparationTimer = null;
-let preparationGeneration = 0;
+let allocationController = null;
+let allocationTimer = null;
+let allocationGeneration = 0;
 let renderQueued = false;
 let listing = false;
 let creating = false;
@@ -129,7 +129,7 @@ function writeToken(value) {
 function logout(reason = '') {
   epoch++; loggedIn = false; activeId = null; listing = false; creating = false;
   renameEditor = null;
-  historyLoop.stop(); stopQuery(); stopPreparation();
+  historyLoop.stop(); stopQuery(); stopAllocation();
   for (const controller of requests) controller.abort();
   requests.clear();
   for (const session of sessions.values()) session.fileInfo.clear();
@@ -225,9 +225,11 @@ async function createConversation() {
 function activate(id) {
   if (!loggedIn || !sessions.has(id)) return;
   if (renameEditor?.session.id !== id) renameEditor = null;
-  stopQuery(); stopPreparation(); activeId = id;
+  stopQuery(); stopAllocation(); activeId = id;
   const session = current(); session.sync = 'loading'; session.error = '';
-  render(); historyLoop.activate(session); prepareSession(); startQuery();
+  render(); historyLoop.activate(session);
+  if (session.pending?.phase === 'allocating') allocatePending(session);
+  else startQuery();
 }
 
 function editSessionName() {
@@ -282,13 +284,10 @@ const historyLoop = new ActiveLoop({
     for (const [key, turn] of changes) {
       if (renderedMessages?.session === session) {
         renderedMessages.dirty.add(key);
-        for (const dependent of renderedMessages.byReply.get(turn.creationSeq) || []) renderedMessages.dirty.add(dependent);
       }
       if (turn.state !== 'open' && session.canceling.has(key)) finishCancellation(session, turn);
     }
-    const recovered = session.sync === 'retrying';
     session.sync = 'ready'; session.error = '';
-    if (recovered) requirePreparation(session);
     const result = inspectSubmission(session, session.pending, page, serial);
     if (result === 'committed') confirmSend(session, session.pending);
     else if (result === 'absent') rejectSend(session, session.pending, 'This message was not sent.');
@@ -312,7 +311,7 @@ function stopQuery() {
 function startQuery(delay = 0) {
   const session = current();
   if (pageSuspended || !session?.pending || !['unknown', 'sending'].includes(session.pending.phase) ||
-      session.pending.queryStopped || session.preparation !== 'ready' || queryController || queryTimer) return;
+      session.pending.queryStopped || queryController || queryTimer) return;
   const generation = queryGeneration;
   if (delay) queryTimer = setTimeout(() => { queryTimer = null; querySubmission(session, session.pending, generation); }, delay);
   else querySubmission(session, session.pending, generation);
@@ -339,11 +338,11 @@ async function querySubmission(session, pending, generation) {
   } catch (error) {
     if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
     if (error.status === 409 && error.code === 'submission_out_of_range') {
+      session.inventory = null;
       if (previouslyUncertain) {
         beginOldBatchCheck(session, pending); pending.detail = 'Checking message history to confirm delivery…';
         if (session.sync !== 'stopped') historyLoop.kick();
-      } else { pending.submissionId = null; pending.phase = 'allocating'; }
-      requirePreparation(session);
+      } else { pending.submissionId = null; pending.phase = 'allocating'; allocatePending(session); }
       again = false;
     } else if (error.status === 409 && error.code === 'attachment_unavailable') {
       // The backend checks the current batch's submission state before looking up attachments.
@@ -379,66 +378,61 @@ function confirmSend(session, pending) {
   scheduleRender();
 }
 
-function stopPreparation() {
-  preparationGeneration++; clearTimeout(preparationTimer); preparationTimer = null;
-  preparationController?.abort(); preparationController = null;
+function stopAllocation() {
+  allocationGeneration++; clearTimeout(allocationTimer); allocationTimer = null;
+  allocationController?.abort(); allocationController = null;
 }
 
-function requirePreparation(session) {
-  session.inventory = null; session.preparation = 'waiting'; session.preparationError = '';
-  if (current() === session) { stopQuery(); stopPreparation(); prepareSession(); }
-  scheduleRender();
-}
-
-async function prepareSession() {
+async function allocateSubmissions() {
   const session = current();
-  if (!session || pageSuspended || !loggedIn || preparationController || preparationTimer ||
-      (session.preparation === 'ready' && session.inventory && session.inventory.next <= session.inventory.end)) return;
-  const generation = preparationGeneration;
-  const controller = new AbortController(); preparationController = controller;
-  if (session.preparation !== 'ready') session.preparation = 'loading';
-  session.preparationError = ''; scheduleRender();
+  if (!session || session.pending?.phase !== 'allocating' || pageSuspended || !loggedIn || allocationController || allocationTimer) return;
+  const pending = session.pending;
+  const generation = allocationGeneration;
+  const controller = new AbortController(); allocationController = controller;
+  pending.detail = ''; scheduleRender();
   let retry = false;
   try {
     const {data} = await request(endpoint(session, '/submissions'), {method: 'POST', body: {count: '100'}, signal: controller.signal});
-    if (current() !== session || generation !== preparationGeneration) return;
-    setInventory(session, data); session.preparation = 'ready';
-    if (session.pending?.phase === 'allocating') allocatePending(session);
-    else startQuery();
+    if (current() !== session || generation !== allocationGeneration || session.pending !== pending) return;
+    setInventory(session, data); allocatePending(session);
   } catch (error) {
-    if (current() !== session || generation !== preparationGeneration) return;
+    if (current() !== session || generation !== allocationGeneration || session.pending !== pending) return;
     retry = temporary(error) && error.code !== 'submission_id_exhausted';
-    if (session.preparation !== 'ready') session.preparation = retry ? 'loading' : 'failed';
-    session.preparationError = retry ? 'Waiting for session setup. Retrying…' : message(error);
-    if (!retry && session.pending?.phase === 'allocating' && !session.pending.uncertain) {
-      rejectSend(session, session.pending, message(error));
-    }
+    if (retry) pending.detail = 'Preparing to send. Retrying…';
+    else rejectSend(session, pending, message(error));
   } finally {
-    if (generation === preparationGeneration) {
-      preparationController = null; scheduleRender();
-      if (retry && current() === session && !pageSuspended) preparationTimer = setTimeout(() => {
-        preparationTimer = null; prepareSession();
+    if (generation === allocationGeneration) {
+      allocationController = null; scheduleRender();
+      if (retry && current() === session && session.pending === pending && !pageSuspended) allocationTimer = setTimeout(() => {
+        allocationTimer = null; allocateSubmissions();
       }, 1000);
     }
   }
 }
 
 function allocatePending(session) {
+  if (session.pending?.phase !== 'allocating') return;
   const id = takeSubmission(session);
-  if (id === null) { prepareSession(); return; }
+  if (id === null) { allocateSubmissions(); return; }
   session.pending.submissionId = id; session.pending.phase = 'sending'; startQuery();
 }
 
 function sendMessage() {
   const session = current();
-  if (!session || session.preparation !== 'ready' || session.pending || session.files.some(file => file.status !== 'ready')) return;
+  if (!session || session.pending || session.files.some(file => file.status !== 'ready')) return;
+  if (session.replies.some(seq => {
+    const target = session.turns.get(session.creationIndex.get(seq));
+    return !target || !['completed', 'cancelled'].includes(target.state);
+  })) {
+    session.error = 'Reply targets must be completed or canceled messages'; scheduleRender(); return;
+  }
   session.pending = {phase: 'allocating', submissionId: null, text: session.text, replies: session.replies.slice(),
     attachments: session.files.map(file => file.objectId), uncertain: false};
   session.notice = ''; allocatePending(session); scheduleRender();
 }
 
 async function upload(session, item) {
-  if (!valid(session) || session.preparation !== 'ready' || session.pending || !session.files.includes(item) || item.status === 'uploading') return;
+  if (!valid(session) || session.pending || !session.files.includes(item) || item.status === 'uploading') return;
   if (!item.file) { item.status = 'error'; item.error = 'Please select the file again'; scheduleRender(); return; }
   if (item.file.size === 0 || item.file.size > MAX_FILE_BYTES) {
     item.status = 'error'; item.error = 'Choose a nonempty file no larger than 4 MiB'; scheduleRender(); return;
@@ -453,7 +447,6 @@ async function upload(session, item) {
   } catch (error) {
     if (!valid(session, generation) || !session.files.includes(item) || item.controller !== controller) return;
     item.status = 'error'; item.error = error.code === 'timeout' ? 'Upload is unconfirmed. You can upload again.' : message(error);
-    if (error.code === 'session_not_initialized') requirePreparation(session);
   } finally {
     if (valid(session, generation) && session.files.includes(item) && item.controller === controller) { item.controller = null; scheduleRender(); }
   }
@@ -493,7 +486,6 @@ function finishCancellation(session, turn) {
 }
 
 async function cancelTurn(session, turn) {
-  if (session.preparation !== 'ready') return;
   const status = session.canceling.get(turn.key);
   if (session.turns.get(turn.key)?.state !== 'open' || (status && status !== 'unknown')) return;
   const generation = epoch; session.canceling.set(turn.key, 'sending'); session.notice = ''; scheduleRender();
@@ -508,7 +500,6 @@ async function cancelTurn(session, turn) {
     } else finishCancellation(session, latest);
   } catch (error) {
     if (valid(session, generation)) {
-      if (error.code === 'session_not_initialized') requirePreparation(session);
       const latest = session.turns.get(turn.key);
       if (latest.state === 'open') {
         session.canceling.set(turn.key, 'unknown'); session.notice = `Cancellation is unconfirmed. You can retry canceling. ${message(error)}`;
@@ -584,7 +575,8 @@ function createTurnView(session, turn) {
   const state = node('span', 'turn-state');
   header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? 'You' : '↗'), node('strong', '', turn.role === 'user' ? 'You' : 'Agent'), state);
   const reply = button('Reply', () => {
-    if (session.pending) return;
+    const target = session.turns.get(turn.key);
+    if (session.pending || !target || !['completed', 'cancelled'].includes(target.state)) return;
     if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
     else session.replies.push(turn.creationSeq);
     scheduleRender(); $('message-input').focus();
@@ -593,18 +585,17 @@ function createTurnView(session, turn) {
   const cancel = turn.role === 'agent' ? button('Stop generating', () => cancelTurn(session, turn)) : null;
   if (cancel) header.append(cancel);
   article.append(header);
-  const quotes = [];
   if (turn.replies.length) {
     const replies = node('div', 'turn-replies');
     for (const seq of turn.replies) {
-      const element = button('', () => document.getElementById(`message-${seq}`)?.scrollIntoView({block: 'center', behavior: 'smooth'}), 'quoted-reply');
-      quotes.push({seq, element, target: null}); replies.append(element);
+      const target = session.turns.get(session.creationIndex.get(seq));
+      replies.append(button(snippet(target), () => document.getElementById(`message-${seq}`)?.scrollIntoView({block: 'center', behavior: 'smooth'}), 'quoted-reply'));
     }
     article.append(replies);
   }
   const content = node('div', 'turn-content'); const text = document.createTextNode('');
   content.append(text); article.append(content);
-  return {article, state, reply, cancel, quotes, text, partCount: 0, attachments: [], turn: null};
+  return {article, state, reply, cancel, text, partCount: 0, attachments: [], turn: null};
 }
 
 function updateTurnView(session, view, turn, selected) {
@@ -636,16 +627,12 @@ function updateTurnView(session, view, turn, selected) {
   const pending = !!session.pending;
   setText(view.reply, selected ? 'Reply selected' : 'Reply');
   view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
-  view.reply.disabled = pending; view.reply.setAttribute('aria-pressed', String(selected));
+  view.reply.disabled = pending || turn.state === 'open'; view.reply.setAttribute('aria-pressed', String(selected));
   if (view.cancel) {
     const status = session.canceling.get(turn.key);
     view.cancel.hidden = turn.state !== 'open';
     setText(view.cancel, status === 'sending' ? 'Canceling…' : status === 'committed' ? 'Waiting for cancellation' : status === 'unknown' ? 'Retry cancel' : 'Stop generating');
-    view.cancel.disabled = session.preparation !== 'ready' || status === 'sending' || status === 'committed';
-  }
-  for (const quote of view.quotes) {
-    const target = session.turns.get(session.creationIndex.get(quote.seq));
-    if (quote.target !== target) { quote.target = target; setText(quote.element, snippet(target)); }
+    view.cancel.disabled = status === 'sending' || status === 'committed';
   }
 }
 
@@ -655,14 +642,14 @@ function renderTurns(session) {
   if (switching && renderedMessages?.session) renderedMessages.session.scrollTop = container.scrollTop;
   if (switching || !renderedMessages) {
     container.replaceChildren();
-    renderedMessages = {session, views: new Map(), byReply: new Map(), byObject: new Map(), dirty: new Set(session?.order),
+    renderedMessages = {session, views: new Map(), byObject: new Map(), dirty: new Set(session?.order),
       dirtyAttachments: new Set(), selected: new Set(), canceling: new Map(), downloads: new Set(), empty: false};
   }
   const viewState = renderedMessages;
   const selected = new Set(session?.replies);
   if (session) {
     // Only changes to all controls require visiting all messages.
-    if (viewState.pending !== !!session.pending || viewState.preparation !== session.preparation) {
+    if (viewState.pending !== !!session.pending) {
       for (const key of viewState.views.keys()) viewState.dirty.add(key);
     }
     for (const seq of new Set([...viewState.selected, ...selected])) {
@@ -678,7 +665,7 @@ function renderTurns(session) {
         }
       }
     }
-    viewState.pending = !!session.pending; viewState.preparation = session.preparation;
+    viewState.pending = !!session.pending;
     viewState.selected = selected; viewState.canceling = new Map(session.canceling); viewState.downloads = new Set(session.downloads);
   }
   if (!switching && !viewState.dirty.size && !viewState.dirtyAttachments.size && (viewState.empty || viewState.views.size)) return;
@@ -698,7 +685,6 @@ function renderTurns(session) {
       let view = renderedMessages.views.get(key);
       if (!view) {
         view = createTurnView(session, turn); renderedMessages.views.set(key, view); container.append(view.article);
-        for (const seq of turn.replies) addReference(viewState.byReply, seq, key);
       }
       updateTurnView(session, view, turn, selected.has(turn.creationSeq));
     }
@@ -713,13 +699,14 @@ function renderTurns(session) {
 
 function renderComposer(session) {
   const draftLocked = !session || !!session.pending;
-  const disabled = draftLocked || session.preparation !== 'ready';
+  const disabled = draftLocked;
   $('message-input').disabled = draftLocked; $('choose-files').disabled = disabled;
   $('file-input').disabled = disabled;
   $('send').disabled = disabled || session.files.some(file => file.status !== 'ready');
   const value = session?.text || ''; if ($('message-input').value !== value) $('message-input').value = value;
   const previous = renderedComposer?.session === session ? renderedComposer : null;
-  renderedComposer = {session, replies: new Map(), files: new Map()};
+  renderedComposer = {session, replies: new Map(), files: new Map(),
+    statusText: previous?.statusText || node('span'), retryConfirmation: previous?.retryConfirmation};
   for (const seq of session?.replies || []) {
     const target = session.turns.get(session.creationIndex.get(seq));
     const chip = previous?.replies.get(seq) || button('', () => {
@@ -750,19 +737,19 @@ function renderComposer(session) {
   let status = session?.notice || '';
   if (session?.pending) {
     const pending = session.pending;
-    status = pending.phase === 'allocating' ? 'Preparing to send…' : pending.phase === 'sending' ? 'Sending…' : pending.detail || 'Delivery is unconfirmed…';
+    status = pending.phase === 'allocating' ? pending.detail || 'Preparing to send…' : pending.phase === 'sending' ? 'Sending…' : pending.detail || 'Delivery is unconfirmed…';
   }
-  $('submission-status').textContent = status; $('submission-status').hidden = !status;
-  if (session && (session.preparation !== 'ready' || session.preparationError)) {
-    $('submission-status').hidden = false;
-    $('submission-status').append(node('div', '', session.preparationError || 'Setting up the session…'));
-    if (session.preparation === 'failed' || (session.preparation === 'ready' && session.preparationError)) {
-      $('submission-status').append(button('Retry setup', prepareSession));
-    }
+  setText(renderedComposer.statusText, status);
+  const statusChildren = [renderedComposer.statusText];
+  if (session?.pending?.queryStopped) {
+    renderedComposer.retryConfirmation ||= button('Retry confirmation', () => {
+      if (!session.pending?.queryStopped) return;
+      session.pending.queryStopped = false; startQuery(); scheduleRender();
+    });
+    statusChildren.push(renderedComposer.retryConfirmation);
   }
-  if (session?.pending?.queryStopped && session.preparation === 'ready') {
-    $('submission-status').append(button('Retry confirmation', () => { session.pending.queryStopped = false; startQuery(); }));
-  }
+  updateChildren($('submission-status'), statusChildren);
+  $('submission-status').hidden = !status;
 }
 
 function render() {
@@ -839,11 +826,11 @@ $('message-input').addEventListener('keydown', event => {
 });
 $('choose-files').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', event => {
-  const session = current(); if (!session || session.preparation !== 'ready' || session.pending) return;
+  const session = current(); if (!session || session.pending) return;
   for (const file of event.target.files) { const item = {file, objectId: null, status: 'waiting'}; session.files.push(item); upload(session, item); }
   event.target.value = ''; scheduleRender();
 });
-window.addEventListener('pagehide', () => { pageSuspended = true; historyLoop.stop(); stopQuery(); stopPreparation(); for (const controller of requests) controller.abort(); });
+window.addEventListener('pagehide', () => { pageSuspended = true; historyLoop.stop(); stopQuery(); stopAllocation(); for (const controller of requests) controller.abort(); });
 window.addEventListener('pageshow', event => { pageSuspended = false; if (event.persisted && loggedIn && current()) activate(activeId); });
 
 const token = cookieToken();

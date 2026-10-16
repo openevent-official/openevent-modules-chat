@@ -49,7 +49,7 @@ export function createSession(description) {
     id: description.session_id, name: sessionName(description.name), channelId: decimal(description.channel_id),
     start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
     turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new FileInfoStore(), historySerial: 0,
-    inventory: null, pending: null, preparation: 'waiting', preparationError: '', text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
+    inventory: null, pending: null, text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
   };
 }
 
@@ -87,6 +87,13 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
       if (turns.has(key) || session.turns.has(key) || creationIndex.has(event.event_seq) || session.creationIndex.has(event.event_seq)) throw new Error('Duplicate message creation event');
       const replyTo = list(payload.reply_to_seqs, 'reply references').map(seq => decimal(seq));
       if (new Set(replyTo).size !== replyTo.length) throw new Error('Duplicate reply reference');
+      for (const reference of replyTo) {
+        const targetKey = creationIndex.get(reference) ?? session.creationIndex.get(reference);
+        const target = turns.get(targetKey) ?? session.turns.get(targetKey);
+        if (BigInt(reference) >= seq || !target || !['completed', 'cancelled'].includes(target.state)) {
+          throw new Error('Reply target must be an earlier completed or canceled message');
+        }
+      }
       const content = parts(payload.content);
       turns.set(key, {
         key, role: event.publisher_role, id: payload.turn_id, creationSeq: event.event_seq,

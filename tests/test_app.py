@@ -329,21 +329,116 @@ class AppTests(unittest.TestCase):
             self.assertEqual(called.call_count, 1)
         self.assertEqual(len(list((self.path / ".pending").glob("*.json"))), 1)
 
-    def test_uninitialized_operations_reject_without_waiting_for_initialization_lock(self):
+    def test_send_without_batch_rejects_without_waiting_for_write_lock(self):
         sid = self.session()
         worker = self.service.sessions[sid]
         self.events.calls.clear()
-        operations = (
-            ("session_not_initialized", lambda: self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")),
-            ("session_not_initialized", lambda: self.service.cancel(sid, {"target_turn_id": "agent:1"})),
-            ("submission_out_of_range", lambda: self.send(sid)),
-        )
-        with ThreadPoolExecutor(3) as pool, worker.write_lock:
-            for code, operation in operations:
-                future = pool.submit(operation)
-                error = self.assert_error(code, lambda: future.result(1))
-                self.assertEqual(error.status, 409)
+        with ThreadPoolExecutor(1) as pool, worker.write_lock:
+            future = pool.submit(self.send, sid)
+            error = self.assert_error("submission_out_of_range", lambda: future.result(1))
+            self.assertEqual(error.status, 409)
         self.assertEqual(self.events.calls, [])
+
+    def test_upload_before_allocation_does_not_wait_for_write_lock(self):
+        sid = self.session()
+        worker = self.service.sessions[sid]
+        self.events.calls.clear()
+        with ThreadPoolExecutor(1) as pool, worker.write_lock:
+            uploaded = pool.submit(self.service.upload, sid, name="a.txt", content_type="text/plain", data=b"a").result(1)
+        self.assertEqual(self.events.calls, ["WriteObject"])
+        self.assertEqual(self.service.uploads[int(uploaded["object_id"])], ("object-secret", sid))
+        self.assertEqual(worker.batch_start, 0)
+
+    def test_cancel_during_initial_number_recovery_does_not_wait_for_fetch(self):
+        sid = self.session()
+        self.service.close()
+        entered, release = threading.Event(), threading.Event()
+        agent_start = pb.EventMessage(
+            seq=1, channel_id=1, principal=20, ts_ms=1, uuid=1,
+            payload=encode_payload({"kind": "turn.start", "turn_id": "agent:1", "content": [], "reply_to_seqs": []}))
+        reservation = pb.EventMessage(
+            seq=2, channel_id=1, principal=10, ts_ms=1, uuid=2,
+            payload=encode_payload({"kind": "submission.reserve", "reserved_through": 10000}))
+        publications = []
+
+        def fetch(**kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release the recovery Fetch")
+            return NS(messages=[agent_start, reservation], next_seq=3, last_seq=2)
+
+        def publish(**kwargs):
+            publications.append(kwargs)
+            return NS(seq=len(publications) + 2)
+
+        events = NS(timeout_ms=500.0, get_channel=self.events.get_channel,
+                    get_status=Mock(return_value=NS(max_seq=2)), fetch=Mock(side_effect=fetch),
+                    get_uuid=Mock(side_effect=[101, 102, 103]), get_seq_by_uuid=Mock(),
+                    publish_auto_seq=Mock(side_effect=publish))
+        # Use the real Chat SDK so both calls share its lifecycle and RPC accounting.
+        self.service = ChatService(self.config, events)
+        with ThreadPoolExecutor(3) as pool:
+            allocation = pool.submit(self.service.allocate, sid, {"count": "1"})
+            try:
+                self.assertTrue(entered.wait(1))
+                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+                self.assertEqual(cancellation.result(1), {"status": "committed"})
+                self.assertFalse(allocation.done())
+                self.assertEqual(self.service.sessions[sid].batch_start, 0)
+                rejected = pool.submit(self.send, sid)
+                self.assert_error("submission_out_of_range", lambda: rejected.result(1))
+                self.assertEqual([json.loads(item["payload"])["kind"] for item in publications], ["turn.cancel"])
+                self.assertEqual(events.fetch.call_count, 1)
+            finally:
+                release.set()
+            self.assertEqual(allocation.result(1), {"start": "10001", "end": "10001"})
+        self.assertEqual(self.send(sid, "10001")[0], 201)
+        payloads = [json.loads(item["payload"]) for item in publications]
+        self.assertEqual([payload["kind"] for payload in payloads], ["turn.cancel", "submission.reserve", "turn.single"])
+        self.assertEqual(payloads[0]["target_turn"], {"principal": 20, "turn_id": "agent:1"})
+        self.assertEqual(payloads[1]["reserved_through"], 20000)
+        self.assertEqual([item["uuid"] for item in publications], [101, 102, 103])
+        events.get_seq_by_uuid.assert_not_called()
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_close_waits_for_inflight_cancel_and_keeps_its_success(self):
+        sid = self.session()
+        self.service.close()
+        entered, release, closing = threading.Event(), threading.Event(), threading.Event()
+
+        def publish(**kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release the cancel Publish")
+            return NS(seq=1)
+
+        events = NS(timeout_ms=500.0, get_channel=self.events.get_channel, fetch=Mock(),
+                    get_uuid=Mock(return_value=101), get_seq_by_uuid=Mock(),
+                    publish_auto_seq=Mock(side_effect=publish))
+        self.service = ChatService(self.config, events)
+        chat = self.service.sessions[sid].chat
+        close = chat.close
+
+        def close_chat():
+            closing.set()
+            close()
+
+        with patch.object(chat, "close", side_effect=close_chat), ThreadPoolExecutor(2) as pool:
+            cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+            try:
+                self.assertTrue(entered.wait(1))
+                stopped = pool.submit(self.service.close)
+                self.assertTrue(closing.wait(1))
+                self.assertFalse(stopped.done())
+                with self.assertRaises(ConfigurationError):
+                    ConfigStore(self.path)
+            finally:
+                release.set()
+            self.assertEqual(cancellation.result(1), {"status": "committed"})
+            stopped.result(1)
+        self.assert_error("server_unavailable", lambda: self.service.cancel(sid, {"target_turn_id": "agent:1"}))
+        events.publish_auto_seq.assert_called_once()
+        self.assertFalse(self.service.fatal.is_set())
 
     def test_committed_repeat_returns_original_result_without_upload_records(self):
         sid = self.session()
@@ -394,7 +489,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(results[0][1], results[1][1])
         self.assertEqual(self.events.calls.count("turn.single"), 1)
 
-    def test_repeated_send_does_not_wait_for_publish_and_rotation_does(self):
+    def test_repeat_and_cancel_do_not_wait_for_publish_but_rotation_does(self):
         sid = self.session()
         self.assertEqual(self.service.allocate(sid, {"count": "1"}), {"start": "1", "end": "1"})
         self.events.block_publish = True
@@ -407,7 +502,13 @@ class AppTests(unittest.TestCase):
             time.sleep(.03)
             self.assertFalse(rotation.done())
             self.assertEqual(self.events.calls.count("submission.reserve"), 1)
-            self.events.publish_release.set()
+            try:
+                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+                self.assertEqual(cancellation.result(1), {"status": "committed"})
+                self.assertFalse(rotation.done())
+                self.assertEqual(self.events.calls.count("submission.reserve"), 1)
+            finally:
+                self.events.publish_release.set()
             sending.result(1)
             self.assertEqual(rotation.result(1), {"start": "10001", "end": "20000"})
         self.assert_error("submission_out_of_range", lambda: self.send(sid))

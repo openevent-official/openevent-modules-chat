@@ -466,25 +466,17 @@ class ChatService:
             return 200, self._committed(submission)
         return None
 
-    @staticmethod
-    def _ready(worker):
-        with worker.state_lock:
-            if not worker.batch_start:
-                raise AppError(409, "session_not_initialized", "prepare the session before this operation")
-
     def cancel(self, session_id, body):
         worker = self._session(session_id)
         fields(body, {"target_turn_id"})
         target = text_value(body["target_turn_id"], nonempty=True, max_bytes=128)
-        self._ready(worker)
-        with worker.write_lock:
-            self._accepting()
-            self._call("PublishAutoSeq", lambda: worker.chat.cancel_turn(target_turn=TurnRef(self.config.agent_principal, target)),
-                       session_id=session_id)
+        self._accepting()
+        self._call("PublishAutoSeq", lambda: worker.chat.cancel_turn(target_turn=TurnRef(self.config.agent_principal, target)),
+                   session_id=session_id)
         return {"status": "committed"}
 
     def upload(self, session_id, *, name, content_type, data):
-        self._ready(self._session(session_id))
+        self._session(session_id)
         name = text_value(name, nonempty=True, max_bytes=255)
         content_type = text_value(content_type or "application/octet-stream", nonempty=True, max_bytes=255)
         if not isinstance(data, bytes) or not 1 <= len(data) <= MAX_OBJECT_BYTES:

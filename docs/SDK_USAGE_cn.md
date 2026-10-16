@@ -63,15 +63,15 @@ while True:
 写入方法成功返回表示 OpenEvent 已经提交消息。示例中的应用循环从历史起点逐页读取，
 处理完本页再保存 `next_seq`，读过回复结束事件的位置后结束。SDK 已排除 OpenEvent 系统消息；即使本页没有 Chat 消息，也要按返回的游标继续。
 持续读取也由应用组织读取和处理循环；
-到达尾部后的等待和停止条件见[单页读取契约](CHAT_SDK_cn.md#21-一次读取一页)。
+到达尾部后的等待和停止条件见[单页读取契约](CHAT_SDK_cn.md#32-一次读取一页)。
 
-保存 `single_turn` 返回的 seq，或 `start_turn` 返回对象的 `creation_seq`，回复时传入 `reply_to_seqs`。
-SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议第 11 节](CHAT_PROTOCOL_cn.md#11-回复关系) 选择合法目标。
+保存 `single_turn` 返回的 seq，或 `start_turn` 返回对象的 `creation_seq`；确认目标已结束后，回复时传入 `reply_to_seqs`。
+SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议第 12 节](CHAT_PROTOCOL_cn.md#12-回复关系) 选择合法目标。
 
 流式 turn 使用 `start_turn` 取得写入对象，然后零次或多次调用它的 `append()`，最后调用 `complete()`。
 写入对象保存自己的链尾，client 不保存 turn 状态；完成后可释放对象。使用 `cancel_turn` 记录对既有 TurnRef 的取消；正常读取观察到有效取消后，
 调用方停止续写并释放对应对象，释放本身不发布事件或撤销在途请求。
-输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#3-写入-api)。
+输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#5-写入-api)。
 
 ## 继续未结束的 turn
 
@@ -86,32 +86,8 @@ writer.append(content=(TextPart("继续之前的回复。"),))
 writer.complete()
 ```
 
-构造不重新读取历史，也不再发一条 `turn.start`。参数语义见[写入对象契约](CHAT_SDK_cn.md#31-独立写入对象)。
-应用负责恢复当前状态；旧请求必须完成后才能续写，详见[旧写入交接](CHAT_SDK_cn.md#32-旧写入交接)。
-
-## 原样携带扩展
-
-需要转发扩展时使用 `RawExtensions`；普通应用生成的扩展仍可传字典。接口与解析结果类型见
-[扩展原文与序列化契约](CHAT_SDK_cn.md#22-扩展原文与序列化)。
-
-```python
-from openevent.chat_sdk import RawExtensions, serialize_payload
-
-chat.single_turn(
-    turn_id="with-metadata-1",
-    content=(TextPart("带应用元数据的消息"),),
-    extensions=RawExtensions('{"value":1e400}'),
-)
-
-# message 是 fetch_page 返回的一条 ParsedMessage。
-payload_bytes = serialize_payload(message.payload)
-raw_extensions = message.payload.get("extensions")
-if raw_extensions is not None:
-    extension_json = raw_extensions.json_text
-```
-
-`payload_bytes` 保留扩展原文；不要为转发先用普通 JSON 解析器解码 `extension_json`。
-只有应用需要读取扩展内容时，才自行选择相应的解析方式。
+构造不重新读取历史，也不再发一条 `turn.start`。参数语义见[写入对象契约](CHAT_SDK_cn.md#51-独立写入对象)。
+应用负责恢复当前状态；旧请求必须完成后才能续写，详见[旧写入交接](CHAT_SDK_cn.md#52-旧写入交接)。
 
 ## 重置未结束的输出
 
@@ -136,7 +112,31 @@ writer.complete()
 reset 成功返回只表示事件已提交，不能把提交成功当作用户尚未取消的证明。应用可以在重试前回读，但这不是必须的同步屏障，
 也不能排除回读后发生新的取消；按正常读取观察到有效取消时停止续写即可。
 网页仍显示同一个 turn，创建位置和回复关系不变。内容与附件的替换、取消竞态、发布未决和恢复限制只由
-[公开写入契约](CHAT_SDK_cn.md#31-独立写入对象)规定；不能用 reset 绕过未决写入或重新打开已经结束的 turn。
+[公开写入契约](CHAT_SDK_cn.md#51-独立写入对象)规定；不能用 reset 绕过未决写入或重新打开已经结束的 turn。
+
+## 原样携带扩展
+
+需要转发扩展时使用 `RawExtensions`；普通应用生成的扩展仍可传字典。接口与解析结果类型见
+[扩展原文与序列化契约](CHAT_SDK_cn.md#4-数据表示与序列化)。
+
+```python
+from openevent.chat_sdk import RawExtensions, serialize_payload
+
+chat.single_turn(
+    turn_id="with-metadata-1",
+    content=(TextPart("带应用元数据的消息"),),
+    extensions=RawExtensions('{"value":1e400}'),
+)
+
+# message 是 fetch_page 返回的一条 ParsedMessage。
+payload_bytes = serialize_payload(message.payload)
+raw_extensions = message.payload.get("extensions")
+if raw_extensions is not None:
+    extension_json = raw_extensions.json_text
+```
+
+`payload_bytes` 保留扩展原文；不要为转发先用普通 JSON 解析器解码 `extension_json`。
+只有应用需要读取扩展内容时，才自行选择相应的解析方式。
 
 ## 关闭
 
@@ -145,5 +145,5 @@ chat.close()
 events.close()
 ```
 
-示例先等待 Chat 调用结束，再释放 `events`；中断在途请求的方式见[生命周期契约](CHAT_SDK_cn.md#5-client-生命周期)。
-方法失败通过异常返回，详见[错误契约](CHAT_SDK_cn.md#4-uuid重试与错误)。
+示例先等待 Chat 调用结束，再释放 `events`；中断在途请求的方式见[生命周期契约](CHAT_SDK_cn.md#7-client-生命周期)。
+方法失败通过异常返回，详见[错误契约](CHAT_SDK_cn.md#6-uuid重试与错误)。

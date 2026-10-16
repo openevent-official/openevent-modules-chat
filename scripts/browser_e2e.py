@@ -34,9 +34,8 @@ def run_browser(origin, web_token, events, agent_token, channels):
         def hold_allocation(route):
             allocations.append(route)
         page.route('**/submissions', hold_allocation)
-        with page.expect_request(lambda request: request.url.endswith('/submissions')):
-            with page.expect_response(lambda response: response.request.method == 'POST' and response.url.endswith('/sessions')) as created:
-                page.locator('#new-session').click()
+        with page.expect_response(lambda response: response.request.method == 'POST' and response.url.endswith('/sessions')) as created:
+            page.locator('#new-session').click()
         session = created.value.json()
         sid = session['session_id']
         config_path = channels / f'{sid}.json'
@@ -58,16 +57,13 @@ def run_browser(origin, web_token, events, agent_token, channels):
         assert rename_box['width'] >= 44 and rename_box['height'] >= 44
         assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         expect(page.locator('#message-input')).to_be_enabled()
-        expect(page.locator('#file-input')).to_be_disabled()
-        expect(page.locator('#send')).to_be_disabled()
+        expect(page.locator('#file-input')).to_be_enabled()
+        expect(page.locator('#send')).to_be_enabled()
         page.locator('#message-input').fill('浏览器发出的消息 <b>按纯文本显示</b>')
-        assert len(allocations) == 1
-        allocations[0].continue_()
-        page.unroute('**/submissions', hold_allocation)
-        expect(page.locator('#message-input')).to_be_enabled()
-        expect(page.locator('#message-input')).to_have_value('浏览器发出的消息 <b>按纯文本显示</b>')
+        assert allocations == [], 'opening a session must not allocate submission IDs'
         page.locator('#file-input').set_input_files({'name': 'browser.txt', 'mimeType': 'text/plain', 'buffer': b'browser attachment'})
         expect(page.locator('#draft-files')).to_contain_text('Uploaded')
+        assert allocations == [], 'uploading must not allocate submission IDs'
         metadata_requests = []
         page.on('request', lambda req: metadata_requests.append(req.url) if '/metadata?' in req.url else None)
         # Hold the first send so the real DOM must stay locked until its outcome is known.
@@ -75,11 +71,15 @@ def run_browser(origin, web_token, events, agent_token, channels):
         def hold_send(route):
             sends.append(route)
         page.route('**/turns', hold_send)
-        with page.expect_request(lambda request: request.url.endswith('/turns')):
+        with page.expect_request(lambda request: request.url.endswith('/submissions')):
             page.locator('#send').click()
         expect(page.locator('#message-input')).to_be_disabled()
         expect(page.locator('#choose-files')).to_be_disabled()
         expect(page.locator('#send')).to_be_disabled()
+        assert len(allocations) == 1 and sends == []
+        with page.expect_request(lambda request: request.url.endswith('/turns')):
+            allocations[0].continue_()
+        page.unroute('**/submissions', hold_allocation)
         assert len(sends) == 1
         sends[0].fulfill(status=400, content_type='application/json', body=json.dumps({
             'error': {'code': 'invalid_request', 'message': 'test request rejection'}}))
@@ -150,6 +150,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(agent_turn).to_have_count(1)
         expect(agent_turn.locator('.turn-content')).to_have_text('')
         expect(agent_turn.get_by_role('button', name='Stop generating')).to_be_enabled()
+        expect(agent_turn.locator('.reply-action')).to_be_disabled()
         agent_turn.evaluate("element => element.setAttribute('data-e2e-original', 'true')")
         agent_file = events.write_object(principal=9002, token=agent_token, name='agent.txt',
                                         type='text/plain', description='', data=b'agent attachment')
@@ -160,6 +161,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(agent_turn.locator('.turn-content')).to_have_text('原来的内容')
         writer.reset(content=(TextPart('重置后的内容'),))
         expect(agent_turn.locator('.turn-content')).to_have_text('重置后的内容')
+        expect(agent_turn.locator('.reply-action')).to_be_disabled()
         expect(agent_turn.locator('.attachment')).to_have_count(0)
         expect(agent_turn).to_have_attribute('data-e2e-original', 'true')
         writer.reset()
@@ -169,6 +171,11 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(agent_turn.locator('.turn-content')).to_have_text('最终输出')
         page.get_by_role('button', name='Stop generating').click()
         expect(page.locator('.turn.agent')).to_contain_text('Canceled')
+        expect(agent_turn.locator('.reply-action')).to_be_enabled()
+        agent_turn.locator('.reply-action').click()
+        expect(page.locator('#reply-selection .reply-chip')).to_contain_text('最终输出')
+        page.locator('#reply-selection .reply-chip').click()
+        expect(page.locator('#reply-selection')).to_be_empty()
         del writer  # External cancellation was observed; releasing performs no RPC.
         agent.close()
 
@@ -232,9 +239,9 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(second.locator('#workspace')).to_be_visible()
         expect(second.locator('.turn.user')).to_have_count(4)
         expect(second.locator('#message-input')).to_be_enabled()
-        expect(second.locator('#file-input')).to_be_disabled()
-        expect(second.locator('#send')).to_be_disabled()
-        second.locator('#message-input').fill('编号准备期间的草稿')
+        expect(second.locator('#file-input')).to_be_enabled()
+        expect(second.locator('#send')).to_be_enabled()
+        second.locator('#message-input').fill('尚未发送的草稿')
         second.locator('.turn .reply-action').first.click()
         expect(second.locator('#reply-selection .reply-chip')).to_have_count(1)
         second.locator('#reply-selection .reply-chip').click()
@@ -248,9 +255,8 @@ def run_browser(origin, web_token, events, agent_token, channels):
             saved = Path(target) / 'download'
             downloading.value.save_as(saved)
             assert saved.read_bytes() == b'browser attachment'
-        expect(second.locator('#message-input')).to_have_value('编号准备期间的草稿')
-        assert len(second_allocations) == 1
-        second_allocations[0].continue_()
+        expect(second.locator('#message-input')).to_have_value('尚未发送的草稿')
+        assert second_allocations == [], 'reading, replying and downloading must not allocate submission IDs'
         second.unroute('**/submissions')
         second.unroute('**/metadata?*', fail_first_metadata)
         expect(second.locator('#send')).to_be_enabled()
