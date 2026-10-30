@@ -20,6 +20,11 @@ def run_browser(origin, web_token, events, agent_token, channels):
         browser = runtime.chromium.launch(**launch)
         context = browser.new_context(viewport={'width': 1280, 'height': 860}, accept_downloads=True)
         context.set_default_timeout(10000)
+        metadata_requests = []
+        def record_metadata_request(req):
+            if req.url.endswith('/attachments/metadata'):
+                metadata_requests.append((req.method, req.url))
+        context.on('request', record_metadata_request)
         page = context.new_page()
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
@@ -64,8 +69,6 @@ def run_browser(origin, web_token, events, agent_token, channels):
         page.locator('#file-input').set_input_files({'name': 'browser.txt', 'mimeType': 'text/plain', 'buffer': b'browser attachment'})
         expect(page.locator('#draft-files')).to_contain_text('Uploaded')
         assert allocations == [], 'uploading must not allocate submission IDs'
-        metadata_requests = []
-        page.on('request', lambda req: metadata_requests.append(req.url) if '/metadata?' in req.url else None)
         # Hold the first send so the real DOM must stay locked until its outcome is known.
         sends = []
         def hold_send(route):
@@ -101,7 +104,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('.turn-content')).to_contain_text('<b>按纯文本显示</b>')
         assert page.locator('.turn-content b').count() == 0
         expect(page.locator('.attachment')).to_contain_text('browser.txt')
-        assert metadata_requests == [], 'upload metadata must be reused after publication'
+        assert metadata_requests == [], 'history must include attachment information without another HTTP request'
         with page.expect_download() as downloading:
             page.locator('.attachment').get_by_role('button', name='Download', exact=True).click()
         with tempfile.TemporaryDirectory() as target:
@@ -141,6 +144,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(page.locator('#session-channel')).to_have_text(channel_label)
         expect(page.locator('.turn.user')).to_have_count(2)
         expect(page.locator('#file-input')).to_be_enabled()
+        expect(page.locator('.attachment')).to_contain_text('browser.txt')
         agent = create_client(events, principal=9002, token=agent_token, channel_id=int(config['channel_id']))
         # Extension values never participate in browser projection or rendering.
         opaque = RawExtensions('{"large":1e400,"precise":0.12345678901234567890123456789,"deep":'
@@ -154,8 +158,16 @@ def run_browser(origin, web_token, events, agent_token, channels):
         agent_turn.evaluate("element => element.setAttribute('data-e2e-original', 'true')")
         agent_file = events.write_object(principal=9002, token=agent_token, name='agent.txt',
                                         type='text/plain', description='', data=b'agent attachment')
-        writer.append(object_keys=(ObjectKey(agent_file.object_id, agent_file.object_token),))
-        expect(agent_turn.locator('.attachment')).to_contain_text('agent.txt')
+        another_agent_file = events.write_object(principal=9002, token=agent_token, name='agent-second.txt',
+                                                type='text/plain', description='', data=b'another agent attachment')
+        agent_key = ObjectKey(agent_file.object_id, agent_file.object_token)
+        another_agent_key = ObjectKey(another_agent_file.object_id, another_agent_file.object_token)
+        writer.append(object_keys=(agent_key, another_agent_key, agent_key))
+        expect(agent_turn.locator('.attachment')).to_have_count(3)
+        expect(agent_turn.locator('.attachment').nth(0)).to_contain_text('agent.txt')
+        expect(agent_turn.locator('.attachment').nth(1)).to_contain_text('agent-second.txt')
+        expect(agent_turn.locator('.attachment').nth(2)).to_contain_text('agent.txt')
+        assert metadata_requests == [], 'streaming attachments must arrive with their history page information'
         expect(agent_turn.locator('.turn-content')).to_have_text('')
         writer.append(content=(TextPart('原来的内容'),))
         expect(agent_turn.locator('.turn-content')).to_have_text('原来的内容')
@@ -199,7 +211,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         def hold_history(route):
             cursor = parse_qs(urlsplit(route.request.url).query)['fetch_seq'][0]
             route.fulfill(status=200, content_type='application/json', body=json.dumps({
-                'events': [], 'next_seq': cursor, 'last_seq': str(int(cursor) - 1)}))
+                'events': [], 'next_seq': cursor, 'last_seq': str(int(cursor) - 1), 'files': []}))
         with page.expect_response(lambda response: '/history?' in response.url):
             page.route('**/history?*', hold_history)
         posts = []
@@ -226,29 +238,40 @@ def run_browser(origin, web_token, events, agent_token, channels):
         second = context.new_page()
         second_allocations = []
         second.route('**/submissions', lambda route: second_allocations.append(route))
-        metadata_attempts = []
-        def fail_first_metadata(route):
-            metadata_attempts.append(route.request.url)
-            if len(metadata_attempts) == 1:
+        history_attempts = []
+        history_ready = False
+        def wait_for_history_recovery(route):
+            assert route.request.method == 'GET'
+            history_attempts.append(route.request.url)
+            if not history_ready:
                 route.fulfill(status=503, content_type='application/json', body=json.dumps({
-                    'error': {'code': 'request_failed', 'message': 'File information temporarily unavailable'}}))
+                    'error': {'code': 'request_failed', 'message': 'History temporarily unavailable'}}))
             else:
                 route.continue_()
-        second.route('**/metadata?*', fail_first_metadata)
-        second.goto(origin + '/api/chat/')
+        second.route('**/history?*', wait_for_history_recovery)
+        with second.expect_response(lambda response: '/history?' in response.url and response.status == 503):
+            second.goto(origin + '/api/chat/')
         expect(second.locator('#workspace')).to_be_visible()
-        expect(second.locator('.turn.user')).to_have_count(4)
+        expect(second.locator('#sync-status')).to_have_text('Reconnecting')
+        expect(second.locator('.turn')).to_have_count(0)
+        expect(second.locator('.attachment')).to_have_count(0)
         expect(second.locator('#message-input')).to_be_enabled()
         expect(second.locator('#file-input')).to_be_enabled()
         expect(second.locator('#send')).to_be_enabled()
         second.locator('#message-input').fill('尚未发送的草稿')
+        with second.expect_response(lambda response: '/history?' in response.url and response.status == 503):
+            expect(second.locator('.turn')).to_have_count(0)
+        assert len(history_attempts) >= 2, history_attempts
+        assert all(attempt == history_attempts[0] for attempt in history_attempts)
+        history_ready = True
+        expect(second.locator('.turn.user')).to_have_count(4)
+        assert 'browser.txt' in second.locator('.attachment').inner_text(), 'messages and file information must appear together'
+        expect(second.locator('#messages')).not_to_contain_text('Loading file info')
+        assert metadata_requests == [], 'a retried history page must not start separate metadata requests'
         second.locator('.turn .reply-action').first.click()
         expect(second.locator('#reply-selection .reply-chip')).to_have_count(1)
         second.locator('#reply-selection .reply-chip').click()
         expect(second.locator('#reply-selection')).to_be_empty()
-        second.get_by_role('button', name='Retry file info').click()
-        expect(second.locator('.attachment')).to_contain_text('browser.txt')
-        assert len(metadata_attempts) == 2, metadata_attempts
         with second.expect_download() as downloading:
             second.locator('.attachment').get_by_role('button', name='Download', exact=True).click()
         with tempfile.TemporaryDirectory() as target:
@@ -258,7 +281,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(second.locator('#message-input')).to_have_value('尚未发送的草稿')
         assert second_allocations == [], 'reading, replying and downloading must not allocate submission IDs'
         second.unroute('**/submissions')
-        second.unroute('**/metadata?*', fail_first_metadata)
+        second.unroute('**/history?*', wait_for_history_recovery)
         expect(second.locator('#send')).to_be_enabled()
         expect(second.locator('.turn.agent')).to_contain_text('Canceled')
         page.set_viewport_size({'width': 390, 'height': 844})
@@ -301,11 +324,42 @@ def run_browser(origin, web_token, events, agent_token, channels):
         page.screenshot(path=str(screenshot), full_page=True)
         page.locator('#message-input').fill('Ready to send.')
         page.locator('#composer').screenshot(path='build/browser-composer-ready.png', animations='disabled')
+        # Check geometry before clicking: locator.click() can scroll an overflow:hidden
+        # ancestor and would hide a composer that has already grown off screen.
+        page.locator('.turn .reply-action').first.click()
+        page.locator('#file-input').set_input_files([
+            {'name': f'layout-{index}.txt', 'mimeType': 'text/plain', 'buffer': b'x'}
+            for index in range(100)
+        ])
+        expect(page.locator('.draft-file').filter(has_text='Uploaded')).to_have_count(100, timeout=30000)
+        remaining_files = 100
+        for viewport in [{'width': 1280, 'height': 860}, {'width': 390, 'height': 844}]:
+            page.set_viewport_size(viewport)
+            for selector in ['#message-input', '#send']:
+                assert page.locator(selector).evaluate('''element => {
+                    const box = element.getBoundingClientRect();
+                    const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+                    return box.width > 0 && box.height > 0 && box.top >= 0 && box.bottom <= innerHeight &&
+                        box.left >= 0 && box.right <= innerWidth && element.contains(hit);
+                }'''), f'{selector} is outside the usable viewport: {viewport}'
+            files_box = page.locator('#draft-files').bounding_box()
+            page.mouse.move(files_box['x'] + files_box['width'] / 2, files_box['y'] + files_box['height'] / 2)
+            page.mouse.wheel(0, 10000)
+            page.wait_for_function('''() => {
+                const files = document.getElementById('draft-files');
+                return files.scrollTop > 0 && files.scrollHeight - files.scrollTop - files.clientHeight < 2;
+            }''')
+            remove_box = page.locator('.draft-file').last.get_by_role('button', name='Remove', exact=True).bounding_box()
+            # A coordinate click cannot silently scroll the last row into view.
+            page.mouse.click(remove_box['x'] + remove_box['width'] / 2, remove_box['y'] + remove_box['height'] / 2)
+            remaining_files -= 1
+            expect(page.locator('.draft-file')).to_have_count(remaining_files)
         page.locator('#logout').click()
         expect(page.locator('#login')).to_be_visible()
         assert page.locator('.turn').count() == 0
         assert 'web_token=' not in page.evaluate('document.cookie')
+        assert metadata_requests == [], metadata_requests
         assert not errors, errors
         context.close()
         browser.close()
-    print('PASS: Chromium: English UI, accessible rename icon, names, Channel IDs, reload, files, replies, empty start/reset/cancel, same-ID retry, two tabs, mobile')
+    print('PASS: Chromium: English UI, accessible rename icon, names, Channel IDs, reload, files, replies, empty start/reset/cancel, same-ID retry, two tabs, mobile, scrollable large drafts')

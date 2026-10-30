@@ -30,7 +30,7 @@ def _history_bytes(page):
     for event in page["events"]:
         envelope = _json_bytes({key: value for key, value in event.items() if key != "payload"})
         events.append(envelope[:-1] + b',"payload":' + serialize_payload(event["payload"]) + b'}')
-    cursors = _json_bytes({"next_seq": page["next_seq"], "last_seq": page["last_seq"]})
+    cursors = _json_bytes({"next_seq": page["next_seq"], "last_seq": page["last_seq"], "files": page["files"]})
     return cursors[:-1] + b',"events":[' + b','.join(events) + b']}'
 
 
@@ -242,14 +242,11 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             page = service.history(sid, query["fetch_seq"], int(limit_text))
             self._bytes(200, _history_bytes(page), "application/json; charset=utf-8")
             return
-        if self.command == "GET" and operation == "attachments" and (len(parts) == 4 or len(parts) == 5 and parts[4] == "metadata"):
+        if self.command == "GET" and operation == "attachments" and len(parts) == 4:
             query = self._query(parsed.query, {"event_seq"})
-            if len(parts) == 5:
-                self._json(200, service.metadata(sid, parts[3], query["event_seq"]))
-            else:
-                metadata, data = service.download(sid, parts[3], query["event_seq"])
-                disposition = "attachment; filename*=UTF-8''" + quote(metadata["name"], safe="")
-                self._bytes(200, data, "application/octet-stream", headers={"Content-Disposition": disposition})
+            metadata, data = service.download(sid, parts[3], query["event_seq"])
+            disposition = "attachment; filename*=UTF-8''" + quote(metadata["name"], safe="")
+            self._bytes(200, data, "application/octet-stream", headers={"Content-Disposition": disposition})
             return
         if self.command == "POST" and len(parts) == 3:
             if parsed.query:

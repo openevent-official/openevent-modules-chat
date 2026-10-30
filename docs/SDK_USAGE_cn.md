@@ -9,7 +9,7 @@
 
 ## 运行前提
 
-安装 `openevent-modules-chat` 及其 `openevent-sdk>=0.11.1` 依赖。构造
+安装 `openevent-modules-chat` 及其 `openevent-sdk>=0.13.0` 依赖。构造
 client 前，需要创建一个 `protocol="chat.v1"` 的非系统 Channel。
 
 ## 创建 Client
@@ -111,8 +111,8 @@ writer.complete()
 也可以用 `writer.reset(content=(TextPart("重试的第一段"),))` 一次清除旧内容并写入新首段。
 reset 成功返回只表示事件已提交，不能把提交成功当作用户尚未取消的证明。应用可以在重试前回读，但这不是必须的同步屏障，
 也不能排除回读后发生新的取消；按正常读取观察到有效取消时停止续写即可。
-网页仍显示同一个 turn，创建位置和回复关系不变。内容与附件的替换、取消竞态、发布未决和恢复限制只由
-[公开写入契约](CHAT_SDK_cn.md#51-独立写入对象)规定；不能用 reset 绕过未决写入或重新打开已经结束的 turn。
+网页仍显示同一个 turn，创建位置和回复关系不变。内容与附件的替换见[协议第 8 节](CHAT_PROTOCOL_cn.md#8-turnreset)，取消竞态与终态见[协议第 11 节](CHAT_PROTOCOL_cn.md#11-链与终态语义)。
+发布未决和恢复限制见 SDK 的[写入对象契约](CHAT_SDK_cn.md#51-独立写入对象)与[旧写入交接](CHAT_SDK_cn.md#52-旧写入交接)；不能用 reset 绕过未决写入或重新打开已经结束的 turn。
 
 ## 原样携带扩展
 

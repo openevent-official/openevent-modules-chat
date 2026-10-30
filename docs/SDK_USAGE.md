@@ -8,7 +8,7 @@ The examples use replies by creation event seq, independent writers, continuing 
 
 ## Prerequisites
 
-Install `openevent-modules-chat` and its `openevent-sdk>=0.11.1` dependency. Before constructing a client, create a non-system Channel with `protocol="chat.v1"`.
+Install `openevent-modules-chat` and its `openevent-sdk>=0.13.0` dependency. Before constructing a client, create a non-system Channel with `protocol="chat.v1"`.
 
 ## Creating a client
 
@@ -96,7 +96,7 @@ writer.append(content=(TextPart("New content from the retry"),))
 writer.complete()
 ```
 
-Alternatively, `writer.reset(content=(TextPart("First retry chunk"),))` clears the old content and publishes the new first chunk in one event. A successful reset return means only that the event committed; it does not prove that the user has not cancelled. Applications may read back before retrying, but this is not a required synchronization barrier and cannot rule out a new cancellation after the read. Stop writing when normal reads observe an effective cancellation. The page still shows the same turn, with unchanged creation position and reply relationships. Replacement of content and attachments, cancellation races, unresolved publication, and recovery limits are defined only by the [public writer contract](CHAT_SDK.md#51-independent-writers). Reset cannot bypass an unresolved write or reopen a terminal turn.
+Alternatively, `writer.reset(content=(TextPart("First retry chunk"),))` clears the old content and publishes the new first chunk in one event. A successful reset return means only that the event committed; it does not prove that the user has not cancelled. Applications may read back before retrying, but this is not a required synchronization barrier and cannot rule out a new cancellation after the read. Stop writing when normal reads observe an effective cancellation. The page still shows the same turn, with unchanged creation position and reply relationships. See [protocol section 8](CHAT_PROTOCOL.md#8-turnreset) for content and attachment replacement, and [protocol section 11](CHAT_PROTOCOL.md#11-chain-and-terminal-state-semantics) for cancellation races and terminal states. Unresolved publication and recovery limits are defined by the SDK's [writer contract](CHAT_SDK.md#51-independent-writers) and [old-write handoff](CHAT_SDK.md#52-old-write-handoff). Reset cannot bypass an unresolved write or reopen a terminal turn.
 
 ## Carrying extensions unchanged
 

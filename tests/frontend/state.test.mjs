@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ActiveLoop, FileInfoStore, MAX_UINT64, applyPage, beginOldBatchCheck, createSession,
-  decimal, inspectSubmission, sessionName, setInventory, takeSubmission, turnKey,
+  ActiveLoop, MAX_UINT64, applyPage, beginOldBatchCheck, createSession,
+  decimal, fileInfo, inspectSubmission, sessionName, setInventory, takeSubmission, turnKey,
 } from '../../src/openevent/chat_app/static/state.mjs';
 
 const SESSION = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -14,7 +14,10 @@ function event(seq, kind, fields = {}, role = 'agent', attachments = []) {
 function create(seq, id = 'a', kind = 'turn.start', role = 'agent', text = '开头') {
   return event(seq, kind, {turn_id: id, content: [{type: 'text', text}], reply_to_seqs: []}, role);
 }
-function page(events, next, last = BigInt(next) - 1n) { return {events, next_seq: String(next), last_seq: String(last)}; }
+function page(events, next, last = BigInt(next) - 1n) {
+  const ids = [...new Set(events.flatMap(event => event.attachments.map(item => item.object_id)))];
+  return {events, next_seq: String(next), last_seq: String(last), files: ids.map(metadata)};
+}
 function apply(state, response) { applyPage(state, response); return state; }
 function deferred() {
   let resolve, reject;
@@ -333,38 +336,75 @@ test('a current batch absence stays unknown, and a loaded user turn confirms wit
   assert.equal(inspectSubmission(state, pending), 'committed');
 });
 
-test('file information requests are shared, failures require a manual retry, and uploaded info avoids a request', async () => {
-  const store = new FileInfoStore(); const ref = {object_id: '42', event_seq: '7'};
-  let calls = 0; const first = deferred();
-  const loader = () => { calls++; return first.promise; };
-  const one = store.ensure(ref, loader); const two = store.ensure({...ref, event_seq: '8'}, loader);
-  assert.equal(one, two); await flush(); assert.equal(calls, 1);
-  first.reject(new Error('暂时失败')); await one;
-  assert.equal(store.get('42').state, 'unavailable');
-  await store.ensure(ref, loader); assert.equal(calls, 1);
-  await store.ensure(ref, () => { calls++; return metadata('42'); }, true);
-  assert.equal(calls, 2); assert.equal(store.get('42').state, 'ready');
-  store.uploaded(metadata('43'));
-  await store.ensure({object_id: '43', event_seq: '9'}, () => { throw new Error('must not read'); });
-  assert.equal(store.get('43').state, 'ready');
+test('file information, records and cursor commit only after every event and file validates', () => {
+  const initial = page([event(1, 'turn.start', {turn_id: 'a', content: [{type: 'text', text: 'old'}], reply_to_seqs: []},
+    'agent', [{object_id: '42'}])], 2);
+  const next = page([event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: 'new'}]},
+    'agent', [{object_id: '43'}, {object_id: '44'}])], 3);
+  const invalid = [undefined, null, [], [metadata('43')], [metadata('44'), metadata('43')],
+    [metadata('43'), metadata('43')], [metadata('43'), {...metadata('44'), nbytes: 0}],
+    [metadata('43'), metadata('44'), metadata('45')]];
+  for (const files of invalid) {
+    const state = apply(session(), initial); const original = state.turns.get(turnKey('agent', 'a'));
+    const oldInfo = state.fileInfo.get('42');
+    assert.throws(() => apply(state, {...next, files}));
+    assert.equal(state.fetchSeq, '2'); assert.equal(state.turns.get(original.key), original);
+    assert.equal(original.parts.map(part => part.text).join(''), 'old');
+    assert.deepEqual(original.attachments, [{object_id: '42', event_seq: '1'}]);
+    assert.deepEqual([...state.fileInfo.keys()], ['42']); assert.equal(state.fileInfo.get('42'), oldInfo);
+    apply(state, next);
+    assert.equal(state.fetchSeq, '3'); assert.equal(state.fileInfo.size, 3);
+    assert.equal(state.turns.get(original.key).parts.map(part => part.text).join(''), 'oldnew');
+  }
+  const state = apply(session(), initial);
+  const badEvent = page([...next.events, event(3, 'turn.append', {turn_id: 'missing', pre_seq: '2', content: []},
+    'agent', [{object_id: '45'}])], 4);
+  assert.throws(() => apply(state, badEvent));
+  assert.deepEqual([...state.fileInfo.keys()], ['42']); assert.equal(state.fetchSeq, '2');
 });
 
-test('clearing a file map discards late requests, and a later upload wins over older metadata', async () => {
-  const store = new FileInfoStore(); const pending = deferred();
-  const first = store.ensure({object_id: '42', event_seq: '7'}, () => pending.promise);
-  store.clear(); pending.resolve(metadata('42')); await first;
-  assert.equal(store.entries.size, 0);
-  const older = deferred(); const second = store.ensure({object_id: '42', event_seq: '7'}, () => older.promise);
-  store.uploaded({...metadata('42'), name: '上传时的名称'});
-  older.resolve(metadata('42')); await second;
-  assert.equal(store.get('42').name, '上传时的名称');
+test('history validates all page attachments including duplicates, reset content and ignored terminal events', () => {
+  const state = session();
+  const response = page([
+    event(1, 'turn.start', {turn_id: 'a', content: [], reply_to_seqs: []}, 'agent', [{object_id: '42'}, {object_id: '42'}]),
+    event(2, 'turn.reset', {turn_id: 'a', pre_seq: '1', content: []}, 'agent', [{object_id: '43'}]),
+    event(3, 'turn.end', {turn_id: 'a', pre_seq: '2'}),
+    event(4, 'turn.append', {turn_id: 'a', pre_seq: '3', content: []}, 'agent', [{object_id: '44'}]),
+  ], 5);
+  assert.deepEqual(response.files.map(file => file.object_id), ['42', '43', '44']);
+  assert.throws(() => apply(state, {...response, files: response.files.slice(0, 2)}));
+  assert.equal(state.turns.size, 0); assert.equal(state.fileInfo.size, 0); assert.equal(state.fetchSeq, '1');
+  apply(state, response);
+  assert.deepEqual([...state.fileInfo.keys()], ['42', '43', '44']);
+  assert.deepEqual(state.turns.get(turnKey('agent', 'a')).attachments, [{object_id: '43', event_seq: '2'}]);
 });
 
-test('file maps stay independent across sessions and malformed metadata cannot become ready', async () => {
-  const one = new FileInfoStore(); const two = new FileInfoStore(); one.uploaded(metadata('42'));
-  assert.equal(two.get('42'), undefined);
-  await two.ensure({object_id: '42', event_seq: '7'}, () => metadata('43'));
-  assert.equal(two.get('42').state, 'unavailable'); assert.equal(one.get('42').state, 'ready');
+test('uploaded and previously loaded information stay shared while every page is still fully validated', () => {
+  const one = session(); const two = session();
+  const uploaded = fileInfo(metadata('42')); one.fileInfo.set('42', uploaded);
+  const response = page([event(1, 'turn.single', {turn_id: 'a', content: [], reply_to_seqs: []},
+    'agent', [{object_id: '42'}])], 2);
+  assert.throws(() => apply(one, {...response, files: []}));
+  apply(one, response); apply(two, response);
+  assert.equal(one.fileInfo.get('42'), uploaded); assert.notEqual(two.fileInfo.get('42'), uploaded);
+  apply(one, page([event(2, 'turn.single', {turn_id: 'b', content: [], reply_to_seqs: []},
+    'agent', [{object_id: '42'}])], 3));
+  assert.equal(one.fileInfo.get('42'), uploaded); assert.equal(one.fileInfo.size, 1);
+  one.fileInfo.clear(); assert.equal(one.fileInfo.size, 0); assert.equal(two.fileInfo.size, 1);
+});
+
+test('one history page can contain more than one metadata RPC batch worth of files', () => {
+  const state = session();
+  const ids = Array.from({length: 1025}, (_, index) => String(index + 1));
+  const response = page([
+    event(1, 'turn.single', {turn_id: 'a', content: [], reply_to_seqs: []},
+      'agent', ids.slice(0, 1024).map(object_id => ({object_id}))),
+    event(2, 'turn.single', {turn_id: 'b', content: [], reply_to_seqs: []},
+      'agent', [{object_id: ids[1024]}]),
+  ], 3);
+  apply(state, response);
+  assert.equal(state.fileInfo.size, 1025); assert.equal(state.turns.size, 2); assert.equal(state.fetchSeq, '3');
+  assert.equal(state.fileInfo.get('1025').name, '报告.txt');
 });
 
 test('A → B → A activations discard both earlier responses, even if abort is ignored', async () => {

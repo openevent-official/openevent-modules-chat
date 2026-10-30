@@ -73,7 +73,8 @@ Python SDK 将读取到的扩展作为原文保留；需要解释或转发时见
 ## 运行前提
 
 - 支持 Channel、事件历史和 Fetch 的 OpenEvent server。
-- Python SDK 需要当前环境已安装 `openevent-sdk>=0.11.1`；当前参考 SDK 为 `0.12.0`。
+- Python SDK 需要当前环境已安装 `openevent-sdk>=0.13.0`；当前参考 SDK 为 `0.13.0`。
+- 浏览器应用要求 OpenEvent server 0.13.0 或更高版本，支持 `BatchGetObjectMetadata`。
 - 支持消息 UUID 的 OpenEvent server，具体以 OpenEvent API 文档为准。
 - 直接使用 SDK 时，需提前创建 `protocol="chat.v1"` 的非系统 Channel；浏览器应用会自动创建。
 

@@ -2,11 +2,11 @@
 
 [中文版本](APP_USAGE_cn.md)
 
-The application includes a Python backend and a browser page shipped with the package. Run OpenEvent separately; the integrating application provides model and Agent services. For Python SDK use alone, see the [SDK quick start](SDK_USAGE.md).
+The application includes a Python backend and a browser page shipped with the package. Run OpenEvent 0.13.0 or later separately to support batch file-information queries; the integrating application provides model and Agent services. For Python SDK use alone, see the [SDK quick start](SDK_USAGE.md).
 
 ## Installation and verification
 
-Use Python 3.10 or later, install `openevent-sdk>=0.11.1` in the current environment, then run in this repository:
+Use Python 3.10 or later, install `openevent-sdk>=0.13.0` in the current environment, then run in this repository:
 
 ```sh
 make check-sdk
@@ -45,11 +45,15 @@ Create `chat.json` and protect its credentials through deployment access control
   "user_openevent_token": "replace-with-user-openevent-token",
   "agent_principal": "9002",
   "rpc_timeout_ms": 2000.0,
-  "max_retries": 3
+  "max_retries": 3,
+  "max_user_message_bytes": 65536
 }
 ```
 
 A relative `channels_dir` is resolved from the configuration file's directory and is created automatically if absent. The deployment must ensure that only the backend's operating identity can read and write the configuration file and directory, with one process per directory. Restart after changing configuration; neither the configuration file nor the target directory may be a symbolic link.
+
+`max_user_message_bytes` is optional, defaults to 65536 (64 KiB), and must be a positive integer. It limits each newly sent user message's text by its UTF-8 byte count, including spaces and line breaks; Chinese characters and emoji usually occupy multiple bytes.
+Attachments and reply-target content do not count toward this limit. Existing history and Agent output remain readable; the Agent checks its own budget for the complete model input.
 
 ```sh
 openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080
@@ -81,17 +85,20 @@ History uses pale blue cards for user messages and pale green cards for Agent re
 - Opening a session starts loading history. You can edit the draft, upload files, and use loaded messages to reply, cancel output, or download attachments without waiting for submission numbers.
   Sending requests numbers only when needed. Waiting for numbers or confirmation locks that send's draft; history, cancellation, and sent attachments remain available.
 - Enter text and optionally add files. Selected files upload immediately and must finish uploading before sending; each file must be between 1 byte and 4 MiB.
+  With many files, the draft attachment list scrolls independently while the text input and send button remain visible.
+- If the text is too long, the page asks you to shorten it and preserves the editable draft, attachments, and reply selections. The backend also rejects oversized new messages (HTTP 413, `message_too_long`) without stopping the service; shorten the text and send again.
 - A file or its information failing validation rejects only that upload and does not stop the entire service.
 - Select terminal messages as reply targets; multiple targets are supported. Cancelled messages can also be selected, but streaming messages cannot. See [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
 - Streaming replies append in place. When retrying, the Agent can reset the same reply and replace its interrupted content with new output. It remains visibly in progress and cancellable even with no text or after being reset to empty. Resetting does not change this reply's position or the targets it references; it can only be selected as a reply target after becoming terminal.
 - Select Stop generating while the Agent is producing output. If cancellation is unconfirmed, retry manually; the page does not resend automatically. Stopping the actual work requires support from the Agent service.
-- Retry failed file-information loads manually. Files open through downloads and are neither executed nor previewed in the chat page.
+- Each page loads its messages and attachment information together. Temporary failures or timeouts retry the current page while preserving pages already loaded. Files open through downloads and are neither executed nor previewed in the chat page.
 - Ordinary requests wait at most 30 seconds; requesting submission numbers, uploads, and downloads wait at most 120 seconds. Message synchronization and requests for submission numbers retry temporary network failures and timeouts automatically.
-  Session lists, session creation, renaming, file information, uploads, downloads, and cancellation require manual retries. If session creation fails, use the page's retry action to continue. A download is handed to the browser for saving only after it finishes completely; failures do not save a partial file.
-- Select the circular up-arrow button at the bottom right of the composer (labelled “Send message”) to send. This immediately locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
+  Session lists, session creation, renaming, uploads, downloads, and cancellation require manual retries. If session creation fails, use the page's retry action to continue. A download is handed to the browser for saving only after it finishes completely; failures do not save a partial file.
+- Select the circular up-arrow button at the bottom right of the composer (labelled “Send message”) to send. Once the text passes the length check, this locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
   If a send times out or is still processing, the page automatically checks the original message's outcome. A timeout does not mean the message was not sent. The content stays locked while the outcome is unknown; follow any prompt to confirm it manually.
   Confirmed success clears the submitted content and restores editing. Confirmation that nothing was sent preserves the content and restores editing; use the same send button to send it again.
   If the backend explicitly reports that an attachment is unavailable, the page ends that send, preserves the content, and restores editing even if an earlier request timed out. Upload the attachment again before sending again.
+  An explicit “message too long” rejection also ends the wait and restores editing; shorten the text before sending again.
   Switching away pauses automatic confirmation; switching back resumes it. If the page has reported an error and stopped automatic confirmation, follow its instructions.
 
 Refreshing loses drafts; sent chat records and files remain in OpenEvent.

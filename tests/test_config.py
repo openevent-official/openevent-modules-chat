@@ -21,6 +21,44 @@ def hold_store(directory, connection):
         connection.close()
 
 
+class ServerConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "server.json"
+        self.data = {"openevent_target": "localhost:50051", "channels_dir": "channels",
+                     "web_token": "browser-secret", "user_principal": "10",
+                     "user_openevent_token": "user-secret", "agent_principal": "20",
+                     "rpc_timeout_ms": 500.0, "max_retries": 0}
+
+    def load(self):
+        self.path.write_text(json.dumps(self.data), encoding="utf-8")
+        return config.ServerConfig.load(self.path)
+
+    def test_message_limit_defaults_to_64_kib_and_accepts_positive_integers(self):
+        self.assertEqual(self.load().max_user_message_bytes, 65536)
+        for limit in (1, 7, 65536, 131072):
+            with self.subTest(limit=limit):
+                self.data["max_user_message_bytes"] = limit
+                self.assertEqual(self.load().max_user_message_bytes, limit)
+
+    def test_message_limit_rejects_nonpositive_and_noninteger_values(self):
+        for limit in (0, -1, True, False, 1.0, "65536", None, [], {}):
+            with self.subTest(limit=limit):
+                self.data["max_user_message_bytes"] = limit
+                with self.assertRaises(config.ConfigurationError):
+                    self.load()
+
+    def test_optional_message_limit_does_not_relax_other_configuration_fields(self):
+        self.data["unknown"] = 1
+        with self.assertRaises(config.ConfigurationError):
+            self.load()
+        del self.data["unknown"]
+        del self.data["max_retries"]
+        with self.assertRaises(config.ConfigurationError):
+            self.load()
+
+
 class DirectoryTests(unittest.TestCase):
     def test_missing_name_uses_default_and_rename_persists_it_without_changing_identity(self):
         with tempfile.TemporaryDirectory() as temporary:

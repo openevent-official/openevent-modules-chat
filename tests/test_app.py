@@ -5,6 +5,7 @@ from dataclasses import replace
 import http.client
 import json
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ from openevent.chat_app.config import ConfigStore, ConfigurationError, ServerCon
 from openevent.chat_app.http import ChatHTTPServer
 from openevent.chat_app.service import AppError, ChatService
 from openevent.chat_app import __main__ as entrypoint
+from openevent.chat_app import service as service_module
 
 
 class Unavailable(grpc.RpcError):
@@ -86,6 +88,10 @@ class Events:
         self.calls.append("GetObjectMetadata")
         return self.objects[object_id][0]
 
+    def batch_get_object_metadata(self, object_keys):
+        self.calls.append("BatchGetObjectMetadata")
+        return NS(metadata=[self.objects[key.object_id][0] for key in object_keys])
+
     def read_object(self, object_id, **kwargs):
         self.calls.append("ReadObject")
         return NS(data=b"" if self.bad_data else self.objects[object_id][1])
@@ -142,6 +148,73 @@ class Chat:
 
     def close(self):
         pass
+
+
+class InstalledSdkChecks(unittest.TestCase):
+    def setUp(self):
+        from openevent.chat_app import sdk_check
+        self.sdk_check = sdk_check
+        self.check = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/check_sdk.py"))["check"]
+        self.entrypoints = (("script", self.check), ("deployment", lambda: ChatService(NS())))
+
+    def test_script_uses_checkout_helper_and_deployment_checks_before_connecting(self):
+        self.assertEqual(Path(self.check.__code__.co_filename).resolve(),
+                         Path(self.sdk_check.__file__).resolve())
+        self.assertIs(service_module.check_installed_sdk, self.sdk_check.check_installed_sdk)
+        with patch.object(self.sdk_check.metadata, "version", return_value="0.13.0"):
+            self.assertEqual(self.check(), "0.13.0")
+            with patch.object(service_module, "OpenEventClient", side_effect=RuntimeError("connection requested")) as client:
+                with self.assertRaisesRegex(RuntimeError, "connection requested"):
+                    ChatService(NS(openevent_target="unused", rpc_timeout_ms=100))
+                client.assert_called_once_with("unused", timeout_ms=100)
+
+    def test_both_entrypoints_reject_old_sdk_before_opening_a_connection(self):
+        with patch.object(service_module, "OpenEventClient") as client:
+            with patch.object(self.sdk_check.metadata, "version", return_value="0.12.0"):
+                for name, check in self.entrypoints:
+                    with self.subTest(entrypoint=name):
+                        with self.assertRaisesRegex(RuntimeError, r"openevent-sdk>=0\.13\.0"):
+                            check()
+            client.assert_not_called()
+
+    def test_both_entrypoints_require_installed_package_metadata(self):
+        with patch.object(service_module, "OpenEventClient") as client:
+            with patch.object(self.sdk_check.metadata, "version", side_effect=
+                              self.sdk_check.metadata.PackageNotFoundError("openevent-sdk")):
+                for name, check in self.entrypoints:
+                    with self.subTest(entrypoint=name):
+                        with self.assertRaisesRegex(RuntimeError, r"Install openevent-sdk>=0\.13\.0"):
+                            check()
+            client.assert_not_called()
+
+    def test_both_entrypoints_require_sdk_methods_and_proto_before_connecting(self):
+        cases = (
+            (OpenEventClient, "batch_get_object_metadata", None, "missing batch_get_object_metadata"),
+            (OpenEventClient, "read_object", None, "missing read_object"),
+            (pb, "DESCRIPTOR", NS(services_by_name={}), "does not support BatchGetObjectMetadata"),
+            (pb, "EventMessage", NS(DESCRIPTOR=NS(fields_by_name={})), "does not support UUIDs"),
+            (self.sdk_check.inspect, "signature", lambda _: NS(parameters={}), "must expose timeout_ms"),
+        )
+        with patch.object(self.sdk_check.metadata, "version", return_value="0.13.0"), \
+                patch.object(service_module, "OpenEventClient") as client:
+            for target, attribute, value, error in cases:
+                with patch.object(target, attribute, value):
+                    for name, check in self.entrypoints:
+                        with self.subTest(capability=attribute, entrypoint=name):
+                            with self.assertRaisesRegex(RuntimeError, error):
+                                check()
+            client.assert_not_called()
+
+    def test_injected_client_does_not_run_deployment_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = ServerConfig("unused", Path(directory) / "channels", "browser-secret",
+                                  10, "user-secret", 20, 500.0, 0)
+            with patch.object(service_module, "check_installed_sdk", side_effect=RuntimeError("not installed")) as check:
+                service = ChatService(config, Events(), chat_factory=Chat)
+                try:
+                    check.assert_not_called()
+                finally:
+                    service.close()
 
 
 class AppTests(unittest.TestCase):
@@ -214,11 +287,11 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.events.calls, [])
         self.assertEqual(self.events.channels[1].name, "chat-" + sid)
         self.assertEqual(json.loads((self.path / (sid + ".json")).read_text()), dict(original, name="项目讨论 🌱"))
-        self.assertEqual(self.service.list_sessions(), {"sessions": [result]})
+        self.assertEqual(self.service.list_sessions(), {"sessions": [result], "max_user_message_bytes": 65536})
         self.assertEqual(self.service.create_session({"create_request_id": request_id}), (200, result))
         self.service.close()
         self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        self.assertEqual(self.service.list_sessions(), {"sessions": [result]})
+        self.assertEqual(self.service.list_sessions(), {"sessions": [result], "max_user_message_bytes": 65536})
 
     def test_rename_rejects_invalid_names_without_writing_or_calling_openevent(self):
         sid = self.session()
@@ -440,7 +513,80 @@ class AppTests(unittest.TestCase):
         events.publish_auto_seq.assert_called_once()
         self.assertFalse(self.service.fatal.is_set())
 
-    def test_committed_repeat_returns_original_result_without_upload_records(self):
+    def test_message_limit_counts_untrimmed_utf8_and_rejected_number_can_be_edited(self):
+        self.service.config = replace(self.config, max_user_message_bytes=7)
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        uploaded = self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")
+        worker = self.service.sessions[sid]
+        before_messages = list(self.events.messages)
+        before_uploads = dict(self.service.uploads)
+        self.events.calls.clear()
+        body = {"submission_id": "1", "text": "中😀 ", "attachments": [uploaded["object_id"]]}
+        for text in ("中😀 ", " 中😀", "😀😀", "12345678"):
+            with self.subTest(text=text):
+                body["text"] = text
+                error = self.assert_error("message_too_long", lambda: self.service.send(sid, body))
+                self.assertEqual(error.status, 413)
+                self.assertIn("7 UTF-8 bytes", error.message)
+                self.assertEqual(worker.submissions, {})
+                self.assertEqual(self.events.calls, [])
+                self.assertEqual(self.events.messages, before_messages)
+                self.assertEqual(self.service.uploads, before_uploads)
+                self.assertFalse(self.service.fatal.is_set())
+        body["text"] = "中😀"
+        self.assertEqual(self.service.send(sid, body)[0], 201)
+        self.assertEqual(self.events.messages[-1].payload["content"], [{"type": "text", "text": "中😀"}])
+        self.assertEqual(self.events.messages[-1].object_keys, (ObjectKey(1, "object-secret"),))
+        self.assertEqual(worker.submissions, {1: "committed"})
+
+    def test_message_limit_allows_an_empty_body_with_an_attachment(self):
+        self.service.config = replace(self.config, max_user_message_bytes=1)
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        uploaded = self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"more than one byte")
+        self.assertEqual(self.service.send(sid, {"submission_id": "1", "text": "",
+                                                "attachments": [uploaded["object_id"]]})[0], 201)
+        self.assertEqual(self.events.messages[-1].payload["content"], [])
+        self.assertEqual(self.events.messages[-1].object_keys, (ObjectKey(1, "object-secret"),))
+
+    def test_request_shape_and_current_batch_are_checked_before_message_limit(self):
+        self.service.config = replace(self.config, max_user_message_bytes=1)
+        sid = self.session()
+        body = {"submission_id": "1", "text": "too long"}
+        self.assert_error("submission_out_of_range", lambda: self.service.send(sid, body))
+        self.service.allocate(sid, {"count": "1"})
+        self.assert_error("invalid_request", lambda: self.service.send(sid, dict(body, reply_to_seqs=["1", "1"])))
+        self.assertEqual(self.service.sessions[sid].submissions, {})
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_message_limit_rechecks_submission_result_after_a_competing_send(self):
+        self.service.config = replace(self.config, max_user_message_bytes=1)
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        checked, release = threading.Event(), threading.Event()
+        original = self.service._submission_result
+
+        def check(worker, submission):
+            result = original(worker, submission)
+            if not checked.is_set():
+                checked.set()
+                if not release.wait(3):
+                    raise RuntimeError("test did not release the first submission check")
+            return result
+
+        with patch.object(self.service, "_submission_result", side_effect=check), ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(self.service.send, sid, {"submission_id": "1", "text": "too long"})
+            try:
+                self.assertTrue(checked.wait(1))
+                status, success = self.service.send(sid, {"submission_id": "1", "text": "a"})
+                self.assertEqual(status, 201)
+            finally:
+                release.set()
+            self.assertEqual(pending.result(1), (200, success))
+        self.assertEqual(self.events.calls.count("turn.single"), 1)
+
+    def test_committed_repeat_survives_lower_message_limit_and_missing_upload_records(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
         uploaded = self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"a")
@@ -450,6 +596,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(success, {"status": "committed", "submission_id": "1",
                                   "turn_ref": {"role": "user", "turn_id": "user:1"}})
         self.service.uploads.clear()
+        self.service.config = replace(self.config, max_user_message_bytes=1)
         self.events.calls.clear()
         self.assertEqual(self.service.send(sid, body), (200, success))
         self.assertEqual(self.events.calls, [])
@@ -532,6 +679,87 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("Fetch", self.events.calls)
         self.assertNotIn("GetStatus", self.events.calls)
 
+    def test_number_recovery_follows_short_and_empty_pages_and_uses_the_highest_reservation(self):
+        with patch.object(self.events, "get_status", return_value=NS(max_seq=40)):
+            sid = self.session()
+        self.service.close()
+
+        def reservation(seq, upper):
+            return pb.EventMessage(
+                seq=seq, channel_id=1, principal=10, ts_ms=1, uuid=seq,
+                payload=encode_payload({"kind": "submission.reserve", "reserved_through": upper}))
+
+        # Channel filtering and response budgets can leave short or empty pages
+        # before the tail. Neither the last event nor the page length is a cursor.
+        pages = {
+            41: NS(messages=[reservation(45, 10000)], next_seq=80, last_seq=250),
+            80: NS(messages=[], next_seq=130, last_seq=250),
+            130: NS(messages=[reservation(141, 50000), reservation(155, 20000)], next_seq=200, last_seq=250),
+            200: NS(messages=[reservation(219, 50000), reservation(230, 30000)], next_seq=251, last_seq=250),
+        }
+        events = NS(timeout_ms=500.0, get_channel=self.events.get_channel,
+                    get_status=Mock(return_value=NS(max_seq=250)),
+                    fetch=Mock(side_effect=lambda **kwargs: pages[kwargs["from_seq"]]),
+                    get_uuid=Mock(return_value=101), get_seq_by_uuid=Mock(),
+                    publish_auto_seq=Mock(return_value=NS(seq=251)))
+        self.service = ChatService(self.config, events)
+
+        self.assertEqual(self.service.allocate(sid, {"count": "2"}), {"start": "50001", "end": "50002"})
+        self.assertEqual(self.service.allocate(sid, {"count": "3"}), {"start": "50003", "end": "50005"})
+        self.assertEqual([call.kwargs for call in events.fetch.call_args_list], [
+            {"principal": 10, "token": "user-secret", "from_seq": start, "limit": 1000,
+             "channels": (1,), "only_my_recipient": False}
+            for start in (41, 80, 130, 200)
+        ])
+        events.get_status.assert_called_once_with(principal=10, token="user-secret")
+        events.publish_auto_seq.assert_called_once()
+        self.assertEqual(json.loads(events.publish_auto_seq.call_args.kwargs["payload"]),
+                         {"kind": "submission.reserve", "reserved_through": 60000})
+        events.get_seq_by_uuid.assert_not_called()
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_number_recovery_stops_at_its_initial_boundary_while_the_global_tail_grows(self):
+        sid = self.session()
+        self.service.close()
+
+        def reservation(seq, upper):
+            return pb.EventMessage(
+                seq=seq, channel_id=1, principal=10, ts_ms=1, uuid=seq,
+                payload=encode_payload({"kind": "submission.reserve", "reserved_through": upper}))
+
+        def agent_turn(seq):
+            return pb.EventMessage(
+                seq=seq, channel_id=1, principal=20, ts_ms=1, uuid=seq,
+                payload=encode_payload({"kind": "turn.single", "turn_id": f"agent:{seq}",
+                                        "content": [{"type": "text", "text": "reply"}], "reply_to_seqs": []}))
+
+        # Only the Agent writes during recovery; the application remains the sole
+        # number allocator. The final page crosses S=30 but has not reached its tail.
+        pages = {
+            1: NS(messages=[reservation(4, 10000)], next_seq=12, last_seq=30),
+            12: NS(messages=[reservation(18, 30000)], next_seq=26, last_seq=45),
+            26: NS(messages=[agent_turn(29), agent_turn(36)], next_seq=40, last_seq=90),
+        }
+        events = NS(timeout_ms=500.0, get_channel=self.events.get_channel,
+                    get_status=Mock(return_value=NS(max_seq=30)),
+                    fetch=Mock(side_effect=lambda **kwargs: pages[kwargs["from_seq"]]),
+                    get_uuid=Mock(return_value=101), get_seq_by_uuid=Mock(),
+                    publish_auto_seq=Mock(return_value=NS(seq=91)))
+        self.service = ChatService(self.config, events)
+
+        self.assertEqual(self.service.allocate(sid, {"count": "2"}), {"start": "30001", "end": "30002"})
+        self.assertEqual([call.kwargs for call in events.fetch.call_args_list], [
+            {"principal": 10, "token": "user-secret", "from_seq": start, "limit": 1000,
+             "channels": (1,), "only_my_recipient": False}
+            for start in (1, 12, 26)
+        ])
+        events.get_status.assert_called_once_with(principal=10, token="user-secret")
+        events.publish_auto_seq.assert_called_once()
+        self.assertEqual(json.loads(events.publish_auto_seq.call_args.kwargs["payload"]),
+                         {"kind": "submission.reserve", "reserved_through": 40000})
+        events.get_seq_by_uuid.assert_not_called()
+        self.assertFalse(self.service.fatal.is_set())
+
     def test_history_is_one_page_and_redacts_capabilities(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "5"})
@@ -541,26 +769,225 @@ class AppTests(unittest.TestCase):
         page = self.service.history(sid, "1", 1)
         self.assertEqual(page["events"][0]["payload"]["reserved_through"], "10000")
         self.assertEqual(page["next_seq"], "2")
+        self.assertEqual(page["files"], [])
         self.assertEqual(self.events.calls, ["Fetch"])
+        self.events.calls.clear()
         page = self.service.history(sid, "2")
         event = page["events"][0]
         self.assertEqual(event["attachments"], [{"object_id": "1"}, {"object_id": "1"}])
+        self.assertEqual(page["files"], [obj])
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata"])
         encoded = json.dumps(page)
         for secret in ("object-secret", "user-secret", "principal", "uuid", "channel_id"):
             self.assertNotIn(secret, encoded)
 
-    def test_metadata_does_not_read_data_and_download_checks_complete_data(self):
+    def test_history_reads_file_information_but_download_alone_reads_file_data(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
-        self.service.upload(sid, name="file.txt", content_type="text/plain", data=b"data")
+        obj = self.service.upload(sid, name="file.txt", content_type="text/plain", data=b"data")
         self.send(sid, attachments=["1"])
         self.events.calls.clear()
-        self.assertEqual(self.service.metadata(sid, "1", "2")["nbytes"], 4)
-        self.assertEqual(self.events.calls, ["Fetch", "GetObjectMetadata"])
-        self.assert_error("attachment_reference_not_found", lambda: self.service.metadata(sid, "1", "1"))
+        self.assertEqual(self.service.history(sid, "2")["files"], [obj])
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata"])
+        self.assert_error("attachment_reference_not_found", lambda: self.service.download(sid, "1", "1"))
+        self.events.calls.clear()
+        self.assertEqual(self.service.download(sid, "1", "2"), (obj, b"data"))
+        self.assertEqual(self.events.calls, ["Fetch", "GetObjectMetadata", "ReadObject"])
         self.events.bad_data = True
         self.assert_error("server_unavailable", lambda: self.service.download(sid, "1", "2"))
         self.assertTrue(self.service.fatal.is_set())
+
+    def test_history_deduplicates_file_information_in_message_attachment_order(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(4)]
+        self.send(sid, "1", attachments=["2", "1", "2"])
+        self.send(sid, "2", attachments=["1", "4", "3"])
+        self.events.calls.clear()
+        with patch.object(self.events, "batch_get_object_metadata", wraps=self.events.batch_get_object_metadata) as batch:
+            page = self.service.history(sid, "2")
+        self.assertEqual(page["files"], [objects[1], objects[0], objects[3], objects[2]])
+        self.assertEqual([event["event_seq"] for event in page["events"]], ["2", "3"])
+        self.assertEqual(page["events"][0]["attachments"],
+                         [{"object_id": "2"}, {"object_id": "1"}, {"object_id": "2"}])
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata"])
+        self.assertEqual(batch.call_count, 1)
+        keys = batch.call_args.kwargs["object_keys"]
+        self.assertTrue(all(isinstance(key, pb.ObjectKey) for key in keys))
+        self.assertEqual([(key.object_id, key.object_token) for key in keys],
+                         [(index, "object-secret") for index in (2, 1, 4, 3)])
+        self.assertNotIn("object-secret", json.dumps(page))
+
+    def test_history_one_hundred_messages_with_sparse_attachments_use_one_fetch_and_batch(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "100"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(10)]
+        for index in range(100):
+            attachments = [objects[index // 10]["object_id"]] if index % 10 == 0 else []
+            self.send(sid, str(index + 1), attachments=attachments)
+        chat = self.service.sessions[sid].chat
+        self.events.calls.clear()
+        with patch.object(chat, "fetch_page", wraps=chat.fetch_page) as fetch:
+            with patch.object(self.events, "batch_get_object_metadata", wraps=self.events.batch_get_object_metadata) as batch:
+                page = self.service.history(sid, "2", 100)
+        self.assertEqual(len(page["events"]), 100)
+        self.assertEqual(sum(bool(event["attachments"]) for event in page["events"]), 10)
+        self.assertEqual(page["files"], objects)
+        self.assertEqual((page["next_seq"], page["last_seq"]), ("102", "101"))
+        fetch.assert_called_once_with(from_seq=2, limit=100)
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata"])
+        self.assertEqual(batch.call_count, 1)
+        self.assertEqual([key.object_id for key in batch.call_args.kwargs["object_keys"]], list(range(1, 11)))
+
+    def test_history_each_page_returns_file_information_for_repeated_objects(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(3)]
+        self.send(sid, "1", attachments=["2", "1"])
+        self.send(sid, "2", attachments=["1", "3"])
+        self.events.calls.clear()
+        with patch.object(self.events, "batch_get_object_metadata", wraps=self.events.batch_get_object_metadata) as batch:
+            first = self.service.history(sid, "2", 1)
+            second = self.service.history(sid, first["next_seq"], 1)
+        self.assertEqual(first["files"], [objects[1], objects[0]])
+        self.assertEqual(second["files"], [objects[0], objects[2]])
+        self.assertEqual([[key.object_id for key in call.kwargs["object_keys"]]
+                          for call in batch.call_args_list], [[2, 1], [1, 3]])
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata", "Fetch", "BatchGetObjectMetadata"])
+
+    def test_history_short_page_keeps_raw_cursors_and_does_not_fetch_another_page(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(2)]
+        self.send(sid, "1", attachments=["1"])
+        self.send(sid, "2", attachments=["2"])
+        response = NS(messages=(self.events.messages[1],), next_seq=3, last_seq=3)
+        self.events.calls.clear()
+        with patch.object(self.service.sessions[sid].chat, "fetch_page", return_value=response) as fetch:
+            page = self.service.history(sid, "2", 100)
+        fetch.assert_called_once_with(from_seq=2, limit=100)
+        self.assertEqual([event["event_seq"] for event in page["events"]], ["2"])
+        self.assertEqual((page["next_seq"], page["last_seq"]), ("3", "3"))
+        self.assertEqual(page["files"], [objects[0]])
+        self.assertEqual(self.events.calls, ["BatchGetObjectMetadata"])
+
+    def test_history_empty_pages_keep_raw_cursors_without_metadata_reads(self):
+        sid = self.session()
+        for next_seq, last_seq in ((1, 20), (4, 20), (21, 20)):
+            with self.subTest(next_seq=next_seq):
+                response = NS(messages=(), next_seq=next_seq, last_seq=last_seq)
+                self.events.calls.clear()
+                with patch.object(self.service.sessions[sid].chat, "fetch_page", return_value=response) as fetch:
+                    page = self.service.history(sid, "1")
+                fetch.assert_called_once_with(from_seq=1, limit=100)
+                self.assertEqual(page, {"events": [], "files": [], "next_seq": str(next_seq), "last_seq": str(last_seq)})
+                self.assertEqual(self.events.calls, [])
+
+    def test_history_system_only_page_has_no_files_after_sdk_filtering(self):
+        sid = self.session()
+        self.service.close()
+        response = NS(messages=(NS(seq=1, channel_id=1, principal=0),), next_seq=2, last_seq=3)
+        with patch.multiple(self.events, create=True, get_uuid=DEFAULT, get_seq_by_uuid=DEFAULT,
+                            publish_auto_seq=DEFAULT, fetch=DEFAULT) as methods:
+            methods["fetch"].return_value = response
+            self.service = ChatService(self.config, self.events)
+            self.events.calls.clear()
+            page = self.service.history(sid, "1")
+        self.assertEqual(page, {"events": [], "files": [], "next_seq": "2", "last_seq": "3"})
+        self.assertEqual(self.events.calls, [])
+        methods["fetch"].assert_called_once_with(principal=10, token="user-secret", from_seq=1,
+                                                 limit=100, channels=(1,), only_my_recipient=False)
+
+    def test_history_batches_1025_distinct_objects_from_one_page_in_order(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(1025)]
+        self.send(sid, "1", attachments=[item["object_id"] for item in objects[:1024][::-1]])
+        self.send(sid, "2", attachments=["1024", "1025"])
+        chat = self.service.sessions[sid].chat
+        self.events.calls.clear()
+        with patch.object(chat, "fetch_page", wraps=chat.fetch_page) as fetch:
+            with patch.object(self.events, "batch_get_object_metadata", wraps=self.events.batch_get_object_metadata) as batch:
+                page = self.service.history(sid, "2")
+        fetch.assert_called_once_with(from_seq=2, limit=100)
+        self.assertEqual(page["files"], objects[:1024][::-1] + objects[1024:])
+        self.assertEqual(len(page["events"]), 2)
+        self.assertEqual([[key.object_id for key in call.kwargs["object_keys"]]
+                          for call in batch.call_args_list], [list(range(1024, 0, -1)), [1025]])
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata", "BatchGetObjectMetadata"])
+
+    def test_number_recovery_does_not_read_attachment_metadata(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        self.service.upload(sid, name="a.txt", content_type="text/plain", data=b"x")
+        self.send(sid, attachments=["1"])
+        self.service.close()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        self.events.calls.clear()
+        self.assertEqual(self.service.allocate(sid, {"count": "1"}), {"start": "10001", "end": "10001"})
+        self.assertEqual(self.events.calls, ["GetStatus", "Fetch", "submission.reserve"])
+
+    def test_history_metadata_retries_same_ordered_keys_and_exhaustion_is_fatal(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(2)]
+        self.send(sid, attachments=["2", "1"])
+        self.service.close()
+        self.config = replace(self.config, max_retries=2)
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        response = NS(metadata=[self.events.objects[2][0], self.events.objects[1][0]])
+        self.events.calls.clear()
+        with patch.object(self.events, "batch_get_object_metadata", side_effect=[
+                Unavailable(), RpcError(grpc.StatusCode.DEADLINE_EXCEEDED), response]) as batch:
+            self.assertEqual(self.service.history(sid, "2")["files"], [objects[1], objects[0]])
+        self.assertEqual(self.events.calls, ["Fetch"])
+        self.assertEqual(batch.call_count, 3)
+        self.assertTrue(all(call == batch.call_args_list[0] for call in batch.call_args_list))
+        self.assertEqual([key.object_id for key in batch.call_args.kwargs["object_keys"]], [2, 1])
+        self.assertFalse(self.service.fatal.is_set())
+        with patch.object(self.events, "batch_get_object_metadata", side_effect=Unavailable()) as batch:
+            with self.assertLogs("openevent.chat_app.service", level="ERROR"):
+                error = self.assert_error("server_unavailable", lambda: self.service.history(sid, "2"))
+        self.assertEqual(batch.call_count, 3)
+        self.assertEqual(error.failure.stage, "BatchGetObjectMetadata")
+        self.assertEqual(error.failure.category, "external_unavailable")
+        self.assertIn("3 attempts", error.failure.detail)
+        self.assertTrue(self.service.fatal.is_set())
+
+    def test_history_rejects_the_whole_page_on_bad_metadata_count_or_fields(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        for index in range(2):
+            self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+        self.send(sid, attachments=["1", "2"])
+        good = self.events.objects[1][0]
+        bad_fields = [
+            {"name": ""}, {"name": "名" * 86}, {"name": "\ud800"},
+            {"type": ""}, {"type": "型" * 86}, {"type": None},
+            {"description": "🙂" * 1025}, {"description": None},
+            {"nbytes": 0}, {"nbytes": 4 * 1024 * 1024 + 1}, {"nbytes": True}, {"nbytes": "1"},
+        ]
+        responses = [NS(), NS(metadata=None), NS(metadata=[]), NS(metadata=[good]),
+                     NS(metadata=[good, good, good]), NS(metadata=[good, NS()])]
+        responses.extend(NS(metadata=[good, NS(**(vars(good) | changes))]) for changes in bad_fields)
+        for response in responses:
+            with self.subTest(response=response):
+                self.service.close()
+                self.service = ChatService(self.config, self.events, chat_factory=Chat)
+                with patch.object(self.events, "batch_get_object_metadata", return_value=response) as batch:
+                    with self.assertLogs("openevent.chat_app.service", level="ERROR"):
+                        error = self.assert_error("server_unavailable", lambda: self.service.history(sid, "2"))
+                self.assertEqual(batch.call_count, 1)
+                self.assertEqual(error.failure.stage, "BatchGetObjectMetadata")
+                self.assertEqual(error.failure.category, "contract")
+                self.assertEqual(set(error.as_json()), {"error"})
+                self.assertTrue(self.service.fatal.is_set())
 
     def test_read_object_retries_the_same_complete_file_request(self):
         sid = self.session()
@@ -639,8 +1066,8 @@ class AppTests(unittest.TestCase):
         self.service.upload(sid, name="file-secret.txt", content_type="text/plain", data=b"file-secret")
         self.service.send(sid, {"submission_id": "1", "text": "body-secret", "attachments": ["1"]})
         faults = (
-            ("GetObjectMetadata", "get_object_metadata", "metadata", {"side_effect": RuntimeError("object-secret file-secret")}),
-            ("GetObjectMetadata", "get_object_metadata", "metadata", {
+            ("GetObjectMetadata", "get_object_metadata", "download", {"side_effect": RuntimeError("object-secret file-secret")}),
+            ("GetObjectMetadata", "get_object_metadata", "download", {
                 "return_value": NS(name="file-secret", type="text/plain", description="body-secret", nbytes=0)}),
             ("ReadObject", "read_object", "download", {"side_effect": RuntimeError("user-secret object-secret")}),
             ("ReadObject", "read_object", "download", {"return_value": NS(data=b"")}),
@@ -650,9 +1077,26 @@ class AppTests(unittest.TestCase):
                 self.service.close()
                 self.service = ChatService(self.config, self.events, chat_factory=Chat)
                 with patch.object(self.events, method, **result):
-                    record = self.assert_fatal_log(lambda: getattr(self.service, operation)(sid, "1", "2"),
+                    args = (sid, "1", "2")
+                    record = self.assert_fatal_log(lambda: getattr(self.service, operation)(*args),
                                                    session_id=sid, channel_id="1", event_seq="2", object_id="1")
                 self.assertEqual(record["failure"]["stage"], stage)
+
+    def test_history_metadata_failures_log_safe_batch_or_item_location(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        self.service.upload(sid, name="file-secret.txt", content_type="text/plain", data=b"file-secret")
+        self.send(sid, attachments=["1"])
+        with patch.object(self.events, "batch_get_object_metadata", side_effect=RuntimeError("object-secret file-secret")):
+            record = self.assert_fatal_log(lambda: self.service.history(sid, "2"), session_id=sid, channel_id="1")
+        self.assertEqual(record["failure"]["stage"], "BatchGetObjectMetadata")
+        self.service.close()
+        self.service = ChatService(self.config, self.events, chat_factory=Chat)
+        response = NS(metadata=[NS(name="file-secret", type="text/plain", description="body-secret", nbytes=0)])
+        with patch.object(self.events, "batch_get_object_metadata", return_value=response):
+            record = self.assert_fatal_log(lambda: self.service.history(sid, "2"),
+                                          session_id=sid, channel_id="1", event_seq="2", object_id="1")
+        self.assertEqual(record["failure"]["stage"], "BatchGetObjectMetadata")
 
     def test_history_failures_log_page_or_event_location_without_payload(self):
         sid = self.session()
@@ -1165,7 +1609,7 @@ class HTTPTests(unittest.TestCase):
         status, headers, data = self.request("GET", f"/api/chat/sessions/{sid}/history?fetch_seq=1&limit=100")
         self.assertEqual(status, 200)
         self.assertIn("no-store", headers["Cache-Control"])
-        self.assertEqual(json.loads(data), {"events": [], "next_seq": "1", "last_seq": "0"})
+        self.assertEqual(json.loads(data), {"events": [], "files": [], "next_seq": "1", "last_seq": "0"})
         status, _, data = self.request("POST", f"/api/chat/sessions/{sid}/submissions", '{"count":"1","count":"2"}', headers={"Content-Type": "application/json"})
         self.assertEqual(status, 400)
         self.assertFalse(self.service.fatal.is_set())
@@ -1182,7 +1626,36 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(data), {"session_id": sid, "scan_start_seq": "1", "name": "工作计划", "channel_id": "1"})
         self.assertEqual(json.loads(self.request("GET", "/api/chat/sessions")[2])["sessions"], [json.loads(data)])
 
-    def test_http_send_reports_processing_and_replays_success_without_a_query_route(self):
+    def test_http_reports_message_limit_and_rejects_long_text_without_stopping(self):
+        status, _, data = self.request("GET", "/api/chat/sessions")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data), {"sessions": [], "max_user_message_bytes": 65536})
+        self.service.config = replace(self.config, max_user_message_bytes=7)
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        path = f"/api/chat/sessions/{sid}/turns"
+        self.events.calls.clear()
+        status, headers, data = self.request("POST", path, {"submission_id": "1", "text": "中😀 "})
+        self.assertEqual(status, 413)
+        self.assertIn("no-store", headers["Cache-Control"])
+        error = json.loads(data)["error"]
+        self.assertEqual(error["code"], "message_too_long")
+        self.assertIn("shorten it", error["message"])
+        self.assertEqual(self.events.calls, [])
+        self.assertEqual(self.service.sessions[sid].submissions, {})
+        self.assertFalse(self.service.fatal.is_set())
+        self.assertFalse(self.server._stop_requested)
+        status, _, data = self.request("GET", "/api/chat/sessions")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)["max_user_message_bytes"], 7)
+        self.assertEqual(json.loads(data)["sessions"][0]["session_id"], sid)
+        # The JSON escape spelling is longer than seven bytes; only decoded text counts.
+        status, _, data = self.request("POST", path, {"submission_id": "1", "text": "中😀"})
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(data)["status"], "committed")
+        self.assertEqual(self.events.calls.count("turn.single"), 1)
+
+    def test_http_send_preserves_processing_and_committed_results_after_lowering_limit(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
         path = f"/api/chat/sessions/{sid}/turns"
@@ -1192,6 +1665,7 @@ class HTTPTests(unittest.TestCase):
             first = pool.submit(self.request, "POST", path, body)
             try:
                 self.assertTrue(self.events.publish_entered.wait(1))
+                self.service.config = replace(self.config, max_user_message_bytes=1)
                 status, headers, data = self.request("POST", path, body)
                 self.assertEqual(status, 202)
                 self.assertEqual(json.loads(data), {"submission_id": "1", "status": "processing"})
@@ -1207,6 +1681,103 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.events.calls.count("turn.single"), 1)
         status, _, _ = self.request("GET", f"/api/chat/sessions/{sid}/submissions/1")
         self.assertEqual(status, 404)
+
+    def test_http_history_returns_messages_and_files_with_one_event_fetch(self):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "1"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(2)]
+        self.send(sid, attachments=["2", "1", "2"])
+        path = f"/api/chat/sessions/{sid}/history?fetch_seq=2"
+        self.events.calls.clear()
+        self.assertEqual(self.request("GET", path, token=False)[0], 401)
+        self.assertEqual(self.events.calls, [])
+        status, headers, data = self.request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertIn("no-store", headers["Cache-Control"])
+        result = json.loads(data)
+        self.assertEqual(set(result), {"events", "files", "next_seq", "last_seq"})
+        self.assertEqual(result["files"], objects[::-1])
+        self.assertEqual(result["events"][0]["attachments"],
+                         [{"object_id": "2"}, {"object_id": "1"}, {"object_id": "2"}])
+        self.assertEqual((result["next_seq"], result["last_seq"]), ("3", "2"))
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata"])
+        self.assertNotIn(b"object-secret", data)
+
+    def test_http_standalone_metadata_routes_are_removed(self):
+        sid = self.session()
+        self.events.calls.clear()
+        status, _, data = self.request("POST", f"/api/chat/sessions/{sid}/attachments/metadata", {
+            "references": [{"object_id": "1", "event_seq": "2"}]})
+        self.assertEqual(status, 404)
+        self.assertEqual(set(json.loads(data)), {"error"})
+        self.assertEqual(self.request("GET", f"/api/chat/sessions/{sid}/attachments/1/metadata?event_seq=2")[0], 404)
+        self.assertEqual(self.events.calls, [])
+        self.assertFalse(self.service.fatal.is_set())
+
+    def test_http_history_fetch_failure_returns_no_page_or_file_information(self):
+        sid = self.session()
+        self.events.fail_fetch = True
+        self.events.calls.clear()
+        with self.assertLogs("openevent.chat_app.service", level="ERROR"):
+            status, _, data = self.request("GET", f"/api/chat/sessions/{sid}/history?fetch_seq=1")
+        self.assertEqual(status, 503)
+        result = json.loads(data)
+        self.assertEqual(set(result), {"error"})
+        self.assertEqual(result["error"]["failure"]["stage"], "Fetch")
+        self.assertEqual(self.events.calls, ["Fetch"])
+
+    def _assert_second_history_metadata_batch_failure(self, fault):
+        sid = self.session()
+        self.service.allocate(sid, {"count": "2"})
+        objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
+                   for index in range(1025)]
+        self.send(sid, "1", attachments=[item["object_id"] for item in objects[:1024]])
+        self.send(sid, "2", attachments=[objects[-1]["object_id"]])
+        original_batch = self.events.batch_get_object_metadata
+        first_batch_finished = False
+
+        def batch_page(object_keys):
+            nonlocal first_batch_finished
+            if object_keys[0].object_id == 1:
+                self.assertEqual(len(object_keys), 1024)
+                self.assertEqual(self.events.calls, ["Fetch"])
+                response = original_batch(object_keys)
+                first_batch_finished = True
+                return response
+            self.assertTrue(first_batch_finished)
+            self.assertEqual([key.object_id for key in object_keys], [1025])
+            self.events.calls.append("BatchGetObjectMetadata")
+            if fault == "rpc":
+                raise Unavailable()
+            if fault == "count":
+                return NS(metadata=[])
+            self.assertEqual(fault, "fields")
+            return NS(metadata=[NS(name="bad", type="text/plain", description="", nbytes=0)])
+
+        self.events.calls.clear()
+        with patch.object(self.events, "batch_get_object_metadata", side_effect=batch_page):
+            with self.assertLogs("openevent.chat_app.service", level="ERROR"):
+                status, _, data = self.request("GET", f"/api/chat/sessions/{sid}/history?fetch_seq=2")
+        self.assertTrue(first_batch_finished)
+        self.assertEqual(status, 503)
+        result = json.loads(data)
+        self.assertEqual(set(result), {"error"})
+        self.assertEqual(result["error"]["code"], "server_unavailable")
+        self.assertEqual(result["error"]["failure"]["stage"], "BatchGetObjectMetadata")
+        self.assertEqual(result["error"]["failure"]["category"],
+                         "external_unavailable" if fault == "rpc" else "contract")
+        self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata", "BatchGetObjectMetadata"])
+        self.assertTrue(self.service.fatal.is_set())
+
+    def test_http_second_metadata_batch_rpc_failure_returns_no_partial_history_page(self):
+        self._assert_second_history_metadata_batch_failure("rpc")
+
+    def test_http_second_metadata_batch_bad_count_returns_no_partial_history_page(self):
+        self._assert_second_history_metadata_batch_failure("count")
+
+    def test_http_second_metadata_batch_bad_fields_return_no_partial_history_page(self):
+        self._assert_second_history_metadata_batch_failure("fields")
 
     def test_http_multipart_and_attachment_download(self):
         sid = self.session()
@@ -1324,6 +1895,7 @@ class HTTPTests(unittest.TestCase):
         self.assertFalse(self.service.fatal.is_set())
         page = json.loads(data)
         self.assertEqual(page["next_seq"], "6")
+        self.assertEqual(page["files"], [])
         events = page["events"]
         self.assertEqual(events[1]["payload"]["reply_to_seqs"], ["1"])
         self.assertEqual(events[2]["payload"]["pre_seq"], "2")
@@ -1355,6 +1927,7 @@ class HTTPTests(unittest.TestCase):
         # beyond the standard Python decoder's number and nesting limits.
         page = json.loads(data.replace(raw.encode('utf-8'), b'{}', 1))
         self.assertEqual(page['next_seq'], '2')
+        self.assertEqual(page['files'], [])
         event = page['events'][0]
         self.assertEqual(event['publisher_role'], 'agent')
         self.assertEqual(event['event_seq'], '1')

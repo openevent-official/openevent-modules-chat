@@ -31,7 +31,7 @@ export function fileInfo(value, expectedId = value?.object_id) {
       typeof value.description !== 'string' || !Number.isInteger(value.nbytes) || value.nbytes < 1 || value.nbytes > MAX_FILE_BYTES) {
     throw new Error('Invalid file info');
   }
-  return {name: value.name, type: value.type, description: value.description, nbytes: value.nbytes, state: 'ready'};
+  return {name: value.name, type: value.type, description: value.description, nbytes: value.nbytes};
 }
 
 export function sessionName(value) {
@@ -48,7 +48,7 @@ export function createSession(description) {
   return {
     id: description.session_id, name: sessionName(description.name), channelId: decimal(description.channel_id),
     start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
-    turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new FileInfoStore(), historySerial: 0,
+    turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new Map(), historySerial: 0,
     inventory: null, pending: null, text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
   };
 }
@@ -64,6 +64,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   const additions = new Map();
   const order = [];
   const creationIndex = new Map();
+  const objectIds = new Set();
   let previous = null;
   for (const event of events) {
     const seq = BigInt(decimal(event?.event_seq));
@@ -74,7 +75,10 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     for (const recipient of list(event.recipients, 'message recipients')) {
       if (!['user', 'agent'].includes(recipient)) throw new Error('Invalid message recipient');
     }
-    const attachments = list(event.attachments, 'attachments').map(item => ({object_id: decimal(item?.object_id), event_seq: event.event_seq}));
+    const attachments = list(event.attachments, 'attachments').map(item => {
+      const object_id = decimal(item?.object_id); objectIds.add(object_id);
+      return {object_id, event_seq: event.event_seq};
+    });
     const payload = event.payload;
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid message payload');
     if (payload.kind === 'submission.reserve') {
@@ -139,6 +143,12 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     if (payload.kind !== 'turn.cancel') turn.tailSeq = event.event_seq;
     turns.set(key, turn);
   }
+  const files = list(page.files, 'file information');
+  if (files.length !== objectIds.size) throw new Error('Invalid history file information count');
+  const information = new Map();
+  let fileIndex = 0;
+  for (const id of objectIds) information.set(id, fileInfo(files[fileIndex++], id));
+  // Commit records, information and the cursor only after the complete page validates.
   for (const [key, turn] of turns) {
     const added = additions.get(key);
     if (added) {
@@ -149,6 +159,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   }
   for (const key of order) session.order.push(key);
   for (const [seq, key] of creationIndex) session.creationIndex.set(seq, key);
+  for (const [id, info] of information) if (!session.fileInfo.has(id)) session.fileInfo.set(id, info);
   session.fetchSeq = page.next_seq;
   return turns;
 }
@@ -182,42 +193,6 @@ export function inspectSubmission(session, pending, page = null, requestSerial =
   if (pending.barrier === null && page && requestSerial >= pending.minimumHistorySerial) pending.barrier = decimal(page.last_seq, {zero: true});
   if (pending.barrier !== null && BigInt(session.fetchSeq) > BigInt(pending.barrier)) return 'absent';
   return 'unknown';
-}
-
-export class FileInfoStore {
-  constructor(onChange = () => {}) { this.entries = new Map(); this.generation = 0; this.onChange = onChange; }
-  clear() { this.generation++; this.entries.clear(); this.onChange(); }
-  uploaded(result) {
-    const info = fileInfo(result);
-    this.entries.set(result.object_id, info);
-    this.onChange(result.object_id);
-    return info;
-  }
-  get(objectId) { return this.entries.get(objectId); }
-  ensure(reference, load, retry = false) {
-    const id = decimal(reference.object_id);
-    const existing = this.entries.get(id);
-    if (existing && (existing.state !== 'unavailable' || !retry)) return existing.promise ?? Promise.resolve(existing);
-    const entry = {state: 'loading'};
-    const generation = this.generation;
-    this.entries.set(id, entry);
-    entry.promise = Promise.resolve().then(() => load(reference)).then(result => {
-      const info = fileInfo(result, id);
-      if (generation === this.generation && this.entries.get(id) === entry) {
-        this.entries.set(id, info);
-        this.onChange(id);
-      }
-      return info;
-    }).catch(error => {
-      if (generation === this.generation && this.entries.get(id) === entry) {
-        this.entries.set(id, {state: 'unavailable', error: error.message});
-        this.onChange(id);
-      }
-      return null;
-    });
-    this.onChange(id);
-    return entry.promise;
-  }
 }
 
 // Each activation owns its request, timer, and generation, including A → B → A.

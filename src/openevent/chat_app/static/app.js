@@ -17,13 +17,18 @@ let allocationController = null;
 let allocationTimer = null;
 let allocationGeneration = 0;
 let renderQueued = false;
+let dirtyRegions = 0;
+const DIRECTORY = 1, MESSAGES = 2, DRAFT = 4, STATUS = 8;
+const ALL_REGIONS = DIRECTORY | MESSAGES | DRAFT | STATUS;
 let listing = false;
 let creating = false;
+let maxUserMessageBytes = null;
 let renameEditor = null;
 let nameVersion = 0;
 let pendingCreate = readCreateId();
 let renderedMessages = null;
 let renderedComposer = null;
+let renderedStatus = null;
 const sessionEntries = new Map();
 const API = '/api/chat';
 
@@ -128,6 +133,7 @@ function writeToken(value) {
 
 function logout(reason = '') {
   epoch++; loggedIn = false; activeId = null; listing = false; creating = false;
+  maxUserMessageBytes = null;
   renameEditor = null;
   historyLoop.stop(); stopQuery(); stopAllocation();
   for (const controller of requests) controller.abort();
@@ -172,15 +178,6 @@ function register(description, updateName = true) {
     if (updateName) session.name = candidate.name;
   } else {
     session = candidate; session.canceling = new Map(); session.downloads = new Set();
-    session.fileInfo.onChange = objectId => {
-      if (renderedMessages?.session === session) {
-        const groups = objectId === undefined ? renderedMessages.byObject.values() : [renderedMessages.byObject.get(objectId) || []];
-        for (const attachments of groups) {
-          for (const attachment of attachments) renderedMessages.dirtyAttachments.add(attachment);
-        }
-      }
-      scheduleRender();
-    };
     sessions.set(session.id, session);
   }
   return session;
@@ -189,20 +186,23 @@ function register(description, updateName = true) {
 async function loadSessions() {
   if (listing || !loggedIn) return;
   const version = nameVersion;
-  listing = true; const generation = epoch; $('directory-error').textContent = ''; scheduleRender();
+  listing = true; const generation = epoch; $('directory-error').textContent = ''; scheduleRender(DIRECTORY);
   try {
     const {data} = await request(`${API}/sessions`);
     if (!loggedIn || epoch !== generation) return;
     if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
     // Validate the full list before registering any of it.
     data.sessions.forEach(createSession);
+    // The backend remains authoritative before a limit is available, too.
+    maxUserMessageBytes = Number.isInteger(data.max_user_message_bytes) && data.max_user_message_bytes > 0
+      ? data.max_user_message_bytes : null;
     // A list requested before a rename must not overwrite the saved name.
     for (const description of data.sessions) register(description, version === nameVersion);
     if (!activeId && sessions.size) activate([...sessions.keys()].sort().at(-1));
   } catch (error) {
     if (loggedIn && epoch === generation) $('directory-error').textContent = message(error);
   } finally {
-    if (epoch === generation) { listing = false; scheduleRender(); }
+    if (epoch === generation) { listing = false; scheduleRender(DIRECTORY); }
   }
 }
 
@@ -210,7 +210,7 @@ async function createConversation() {
   if (creating || !loggedIn) return;
   creating = true; const generation = epoch; $('directory-error').textContent = '';
   if (!pendingCreate) setCreateId(ulid());
-  const requestId = pendingCreate; scheduleRender();
+  const requestId = pendingCreate; scheduleRender(DIRECTORY);
   try {
     const {data} = await request(`${API}/sessions`, {method: 'POST', body: {create_request_id: requestId}});
     if (!loggedIn || epoch !== generation) return;
@@ -218,7 +218,7 @@ async function createConversation() {
   } catch (error) {
     if (loggedIn && epoch === generation) $('directory-error').textContent = `${message(error)} Use “Retry create” to finish creating this session.`;
   } finally {
-    if (epoch === generation) { creating = false; scheduleRender(); }
+    if (epoch === generation) { creating = false; scheduleRender(DIRECTORY); }
   }
 }
 
@@ -237,12 +237,12 @@ function editSessionName() {
   if (!loggedIn || !session || session.renaming) return;
   $('session-name').value = session.name;
   renameEditor = {session, originalName: session.name, initialValue: $('session-name').value, error: ''};
-  render(); $('session-name').focus(); $('session-name').select();
+  render(DIRECTORY); $('session-name').focus(); $('session-name').select();
 }
 
 function cancelRename() {
   if (!renameEditor || renameEditor.session.renaming) return;
-  renameEditor = null; render(); $('rename-session').focus();
+  renameEditor = null; render(DIRECTORY); $('rename-session').focus();
 }
 
 async function saveSessionName() {
@@ -252,8 +252,8 @@ async function saveSessionName() {
   let name; let saved = false;
   const input = $('session-name').value;
   try { name = sessionName(input === editor.initialValue ? editor.originalName : input); }
-  catch (error) { editor.error = message(error); scheduleRender(); return; }
-  session.renaming = true; editor.error = ''; scheduleRender();
+  catch (error) { editor.error = message(error); scheduleRender(DIRECTORY); return; }
+  session.renaming = true; editor.error = ''; scheduleRender(DIRECTORY);
   try {
     const {data} = await request(endpoint(session, '/rename'), {method: 'POST', body: {name}});
     if (!valid(session, generation)) return;
@@ -268,7 +268,7 @@ async function saveSessionName() {
     }
   } finally {
     if (valid(session, generation)) {
-      session.renaming = false; render();
+      session.renaming = false; render(DIRECTORY);
       if (saved && current() === session && !renameEditor) $('rename-session').focus();
     }
   }
@@ -281,20 +281,24 @@ const historyLoop = new ActiveLoop({
   },
   apply: (session, page, serial) => {
     const changes = applyPage(session, page);
+    let regions = changes.size ? MESSAGES : 0;
     for (const [key, turn] of changes) {
       if (renderedMessages?.session === session) {
         renderedMessages.dirty.add(key);
       }
-      if (turn.state !== 'open' && session.canceling.has(key)) finishCancellation(session, turn);
+      if (turn.state !== 'open' && session.canceling.has(key)) {
+        finishCancellation(session, turn); regions |= STATUS;
+      }
     }
+    if (session.sync !== 'ready' || session.error) regions |= STATUS;
     session.sync = 'ready'; session.error = '';
     const result = inspectSubmission(session, session.pending, page, serial);
     if (result === 'committed') confirmSend(session, session.pending);
     else if (result === 'absent') rejectSend(session, session.pending, 'This message was not sent.');
-    scheduleRender();
+    scheduleRender(regions, session);
   },
   error: (session, error) => {
-    session.error = message(error); session.sync = temporary(error) ? 'retrying' : 'stopped'; scheduleRender();
+    session.error = message(error); session.sync = temporary(error) ? 'retrying' : 'stopped'; scheduleRender(STATUS, session);
     return temporary(error);
   },
 });
@@ -348,6 +352,9 @@ async function querySubmission(session, pending, generation) {
       // The backend checks the current batch's submission state before looking up attachments.
       for (const file of session.files) { file.status = 'error'; file.error = 'Upload this file again'; }
       rejectSend(session, pending, 'The upload records have expired. Upload again before sending.'); again = false;
+    } else if (error.status === 413 && error.code === 'message_too_long') {
+      // The backend checks existing submission results before rejecting new text.
+      rejectSend(session, pending, message(error)); again = false;
     } else if (temporary(error)) {
       pending.uncertain = true; pending.phase = 'unknown'; pending.detail = 'Delivery is unconfirmed. Retrying…';
     } else if (error.status >= 400 && error.status < 500 && !previouslyUncertain) {
@@ -357,7 +364,7 @@ async function querySubmission(session, pending, generation) {
     }
   } finally {
     if (generation === queryGeneration) {
-      queryController = null; scheduleRender();
+      queryController = null; scheduleRender(STATUS, session);
       if (again && session.pending === pending && current() === session) startQuery(1000);
     }
   }
@@ -367,7 +374,7 @@ function rejectSend(session, pending, reason) {
   if (!pending || session.pending !== pending) return;
   session.pending = null; session.notice = `${reason} Your draft is still here. Edit it and send again.`;
   if (current() === session) stopQuery();
-  scheduleRender();
+  scheduleRender(DRAFT | MESSAGES | STATUS, session);
 }
 
 function confirmSend(session, pending) {
@@ -375,7 +382,7 @@ function confirmSend(session, pending) {
   session.pending = null; session.text = ''; session.replies = []; session.files = [];
   session.notice = 'Message sent';
   if (current() === session) stopQuery();
-  scheduleRender();
+  scheduleRender(DRAFT | MESSAGES | STATUS, session);
 }
 
 function stopAllocation() {
@@ -389,7 +396,7 @@ async function allocateSubmissions() {
   const pending = session.pending;
   const generation = allocationGeneration;
   const controller = new AbortController(); allocationController = controller;
-  pending.detail = ''; scheduleRender();
+  pending.detail = ''; scheduleRender(STATUS, session);
   let retry = false;
   try {
     const {data} = await request(endpoint(session, '/submissions'), {method: 'POST', body: {count: '100'}, signal: controller.signal});
@@ -402,7 +409,7 @@ async function allocateSubmissions() {
     else rejectSend(session, pending, message(error));
   } finally {
     if (generation === allocationGeneration) {
-      allocationController = null; scheduleRender();
+      allocationController = null; scheduleRender(STATUS, session);
       if (retry && current() === session && session.pending === pending && !pageSuspended) allocationTimer = setTimeout(() => {
         allocationTimer = null; allocateSubmissions();
       }, 1000);
@@ -420,50 +427,53 @@ function allocatePending(session) {
 function sendMessage() {
   const session = current();
   if (!session || session.pending || session.files.some(file => file.status !== 'ready')) return;
+  if (maxUserMessageBytes !== null) {
+    const bytes = new TextEncoder().encode(session.text).length;
+    if (bytes > maxUserMessageBytes) {
+      session.notice = `Message is too long (${bytes} UTF-8 bytes; limit ${maxUserMessageBytes} bytes). Shorten it and send again.`;
+      scheduleRender(STATUS, session); return;
+    }
+  }
   if (session.replies.some(seq => {
     const target = session.turns.get(session.creationIndex.get(seq));
     return !target || !['completed', 'cancelled'].includes(target.state);
   })) {
-    session.error = 'Reply targets must be completed or canceled messages'; scheduleRender(); return;
+    session.error = 'Reply targets must be completed or canceled messages'; scheduleRender(STATUS, session); return;
   }
   session.pending = {phase: 'allocating', submissionId: null, text: session.text, replies: session.replies.slice(),
     attachments: session.files.map(file => file.objectId), uncertain: false};
-  session.notice = ''; allocatePending(session); scheduleRender();
+  session.notice = ''; allocatePending(session); scheduleRender(DRAFT | MESSAGES | STATUS, session);
 }
 
 async function upload(session, item) {
   if (!valid(session) || session.pending || !session.files.includes(item) || item.status === 'uploading') return;
-  if (!item.file) { item.status = 'error'; item.error = 'Please select the file again'; scheduleRender(); return; }
+  if (!item.file) { item.status = 'error'; item.error = 'Please select the file again'; scheduleRender(DRAFT, session); return; }
   if (item.file.size === 0 || item.file.size > MAX_FILE_BYTES) {
-    item.status = 'error'; item.error = 'Choose a nonempty file no larger than 4 MiB'; scheduleRender(); return;
+    item.status = 'error'; item.error = 'Choose a nonempty file no larger than 4 MiB'; scheduleRender(DRAFT, session); return;
   }
   const generation = epoch; const controller = new AbortController(); item.controller = controller;
-  item.status = 'uploading'; item.error = ''; scheduleRender();
+  item.status = 'uploading'; item.error = ''; scheduleRender(DRAFT, session);
   const body = new FormData(); body.append('file', item.file, item.file.name);
   try {
     const {data} = await request(endpoint(session, '/attachments'), {method: 'POST', body, signal: controller.signal});
     if (!valid(session, generation) || !session.files.includes(item) || item.controller !== controller) return;
-    fileInfo(data); item.objectId = data.object_id; item.status = 'ready'; session.fileInfo.uploaded(data);
+    const info = fileInfo(data); item.objectId = data.object_id; item.status = 'ready'; session.fileInfo.set(data.object_id, info);
+    if (renderedMessages?.session === session) {
+      for (const attachment of renderedMessages.byObject.get(data.object_id) || []) renderedMessages.dirtyAttachments.add(attachment);
+    }
   } catch (error) {
     if (!valid(session, generation) || !session.files.includes(item) || item.controller !== controller) return;
     item.status = 'error'; item.error = error.code === 'timeout' ? 'Upload is unconfirmed. You can upload again.' : message(error);
   } finally {
-    if (valid(session, generation) && session.files.includes(item) && item.controller === controller) { item.controller = null; scheduleRender(); }
+    if (valid(session, generation) && session.files.includes(item) && item.controller === controller) { item.controller = null; scheduleRender(DRAFT | MESSAGES, session); }
   }
-}
-
-function metadata(session, reference, retry = false) {
-  return session.fileInfo.ensure(reference, async ref => {
-    const {data} = await request(endpoint(session, `/attachments/${ref.object_id}/metadata?event_seq=${ref.event_seq}`));
-    return data;
-  }, retry);
 }
 
 async function download(session, reference) {
   if (!valid(session)) return;
   const key = `${reference.object_id}:${reference.event_seq}`;
   if (session.downloads.has(key)) return;
-  session.downloads.add(key); scheduleRender();
+  session.downloads.add(key); scheduleRender(MESSAGES, session);
   const generation = epoch;
   try {
     const {data, response} = await request(endpoint(session, `/attachments/${reference.object_id}?event_seq=${reference.event_seq}`), {binary: true});
@@ -476,8 +486,8 @@ async function download(session, reference) {
     link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (error) {
-    if (valid(session, generation)) { session.notice = `Download failed: ${message(error)}`; scheduleRender(); }
-  } finally { if (valid(session, generation)) { session.downloads.delete(key); scheduleRender(); } }
+    if (valid(session, generation)) { session.notice = `Download failed: ${message(error)}`; scheduleRender(STATUS, session); }
+  } finally { if (valid(session, generation)) { session.downloads.delete(key); scheduleRender(MESSAGES, session); } }
 }
 
 function finishCancellation(session, turn) {
@@ -488,7 +498,7 @@ function finishCancellation(session, turn) {
 async function cancelTurn(session, turn) {
   const status = session.canceling.get(turn.key);
   if (session.turns.get(turn.key)?.state !== 'open' || (status && status !== 'unknown')) return;
-  const generation = epoch; session.canceling.set(turn.key, 'sending'); session.notice = ''; scheduleRender();
+  const generation = epoch; session.canceling.set(turn.key, 'sending'); session.notice = ''; scheduleRender(MESSAGES | STATUS, session);
   try {
     const {data} = await request(endpoint(session, '/cancellations'), {method: 'POST', body: {target_turn_id: turn.id}});
     if (!valid(session, generation)) return;
@@ -505,7 +515,7 @@ async function cancelTurn(session, turn) {
         session.canceling.set(turn.key, 'unknown'); session.notice = `Cancellation is unconfirmed. You can retry canceling. ${message(error)}`;
       } else finishCancellation(session, latest);
     }
-  } finally { if (valid(session, generation)) scheduleRender(); }
+  } finally { if (valid(session, generation)) scheduleRender(MESSAGES | STATUS, session); }
 }
 
 export function textPrefix(parts, limit) {
@@ -526,8 +536,7 @@ function formatSize(size) { return size >= 1024 * 1024 ? `${(size / 1024 / 1024)
 
 function updateAttachment(session, view) {
   const ref = view.ref;
-  let info = session.fileInfo.get(ref.object_id);
-  if (!info) { metadata(session, ref); info = session.fileInfo.get(ref.object_id); }
+  const info = session.fileInfo.get(ref.object_id);
   const downloading = session.downloads.has(`${ref.object_id}:${ref.event_seq}`);
   if (view.info === info) {
     view.download.disabled = downloading;
@@ -536,12 +545,10 @@ function updateAttachment(session, view) {
   }
   view.info = info;
   const body = node('div', 'attachment-info');
-  body.append(node('strong', '', info?.state === 'ready' ? info.name || 'Attachment' : 'Attachment'));
-  body.append(node('span', 'muted', info?.state === 'ready' ? `${formatSize(info.nbytes)} · ${info.type}` : info?.state === 'unavailable' ? 'File info is unavailable' : 'Loading file info…'));
+  body.append(node('strong', '', info.name || 'Attachment'));
+  body.append(node('span', 'muted', `${formatSize(info.nbytes)} · ${info.type}`));
   if (info?.description) body.append(node('span', 'muted', info.description));
   view.element.replaceChildren(node('span', 'file-icon', '↧'), body);
-  view.retry = info?.state === 'unavailable' ? button('Retry file info', () => metadata(session, ref, true)) : null;
-  if (view.retry) view.element.append(view.retry);
   view.download = button(downloading ? 'Downloading…' : 'Download', () => download(session, ref));
   view.download.disabled = downloading;
   view.element.append(view.download);
@@ -579,7 +586,7 @@ function createTurnView(session, turn) {
     if (session.pending || !target || !['completed', 'cancelled'].includes(target.state)) return;
     if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
     else session.replies.push(turn.creationSeq);
-    scheduleRender(); $('message-input').focus();
+    scheduleRender(DRAFT | MESSAGES, session); $('message-input').focus();
   });
   header.append(reply);
   const cancel = turn.role === 'agent' ? button('Stop generating', () => cancelTurn(session, turn)) : null;
@@ -705,13 +712,12 @@ function renderComposer(session) {
   $('send').disabled = disabled || session.files.some(file => file.status !== 'ready');
   const value = session?.text || ''; if ($('message-input').value !== value) $('message-input').value = value;
   const previous = renderedComposer?.session === session ? renderedComposer : null;
-  renderedComposer = {session, replies: new Map(), files: new Map(),
-    statusText: previous?.statusText || node('span'), retryConfirmation: previous?.retryConfirmation};
+  renderedComposer = {session, replies: new Map(), files: new Map()};
   for (const seq of session?.replies || []) {
     const target = session.turns.get(session.creationIndex.get(seq));
     const chip = previous?.replies.get(seq) || button('', () => {
       if (session.pending) return;
-      session.replies = session.replies.filter(value => value !== seq); scheduleRender();
+      session.replies = session.replies.filter(value => value !== seq); scheduleRender(DRAFT | MESSAGES, session);
     }, 'reply-chip');
     setText(chip, `${snippet(target)} ×`); chip.disabled = draftLocked;
     renderedComposer.replies.set(seq, chip);
@@ -723,10 +729,10 @@ function renderComposer(session) {
     if (!view) {
       view = {row: node('div', 'draft-file'), name: node('span', 'draft-file-name'), status: node('span'),
         retry: button('Upload again', () => upload(session, item)),
-        remove: button('Remove', () => { item.controller?.abort(); session.files = session.files.filter(file => file !== item); scheduleRender(); })};
+        remove: button('Remove', () => { item.controller?.abort(); session.files = session.files.filter(file => file !== item); scheduleRender(DRAFT, session); })};
       view.row.append(node('span', 'file-icon', '↧'), view.name, view.status, view.retry, view.remove);
     }
-    setText(view.name, info?.state === 'ready' ? info.name : item.file?.name || 'File');
+    setText(view.name, info ? info.name : item.file?.name || 'File');
     setText(view.status, item.status === 'ready' ? 'Uploaded' : item.status === 'uploading' ? 'Uploading…' : item.error || 'Waiting to upload');
     view.status.className = item.status === 'error' ? 'error' : 'muted';
     view.retry.hidden = item.status !== 'error';
@@ -734,34 +740,34 @@ function renderComposer(session) {
     view.remove.disabled = disabled; renderedComposer.files.set(item, view);
   }
   updateChildren($('draft-files'), [...renderedComposer.files.values()].map(view => view.row));
+}
+
+function renderStatus(session) {
+  $('sync-status').textContent = session ? ({waiting: 'Connecting', loading: 'Loading', ready: 'Connected', retrying: 'Reconnecting', stopped: 'Updates paused'}[session.sync] || '') : '';
+  $('sync-status').dataset.state = session?.sync || '';
+  $('message-error').textContent = session?.error || ''; $('message-error').hidden = !session?.error;
+  if (session?.sync === 'stopped') $('message-error').append(button('Reload', () => activate(session.id)));
+  if (!renderedStatus || renderedStatus.session !== session) renderedStatus = {session, text: node('span'), retry: null};
   let status = session?.notice || '';
   if (session?.pending) {
     const pending = session.pending;
     status = pending.phase === 'allocating' ? pending.detail || 'Preparing to send…' : pending.phase === 'sending' ? 'Sending…' : pending.detail || 'Delivery is unconfirmed…';
   }
-  setText(renderedComposer.statusText, status);
-  const statusChildren = [renderedComposer.statusText];
+  setText(renderedStatus.text, status);
+  const statusChildren = [renderedStatus.text];
   if (session?.pending?.queryStopped) {
-    renderedComposer.retryConfirmation ||= button('Retry confirmation', () => {
+    renderedStatus.retry ||= button('Retry confirmation', () => {
       if (!session.pending?.queryStopped) return;
-      session.pending.queryStopped = false; startQuery(); scheduleRender();
+      session.pending.queryStopped = false; startQuery(); scheduleRender(STATUS, session);
     });
-    statusChildren.push(renderedComposer.retryConfirmation);
+    statusChildren.push(renderedStatus.retry);
   }
   updateChildren($('submission-status'), statusChildren);
   $('submission-status').hidden = !status;
 }
 
-function render() {
-  $('login').hidden = loggedIn; $('workspace').hidden = !loggedIn;
-  if (!loggedIn) {
-    renderedMessages = null; renderedComposer = null; sessionEntries.clear();
-    for (const id of ['messages', 'sessions', 'reply-selection', 'draft-files', 'submission-status', 'message-error']) $(id).replaceChildren();
-    $('message-input').value = ''; $('file-input').value = ''; $('session-title').textContent = 'Select a session';
-    $('session-name').value = ''; $('session-channel').textContent = '';
-    return;
-  }
-  const session = current(); const list = [];
+function renderDirectory(session) {
+  const list = [];
   let activeTitle = 'Select a session';
   for (const id of [...sessions.keys()].sort().reverse()) {
     const itemTitle = sessions.get(id).name;
@@ -789,17 +795,32 @@ function render() {
   $('save-session-name').textContent = session?.renaming ? 'Saving…' : 'Save';
   $('cancel-rename').disabled = !!session?.renaming;
   $('rename-error').textContent = editing ? renameEditor.error : '';
-  $('sync-status').textContent = session ? ({waiting: 'Connecting', loading: 'Loading', ready: 'Connected', retrying: 'Reconnecting', stopped: 'Updates paused'}[session.sync] || '') : '';
-  $('sync-status').dataset.state = session?.sync || '';
-  $('message-error').textContent = session?.error || ''; $('message-error').hidden = !session?.error;
-  if (session?.sync === 'stopped') $('message-error').append(button('Reload', () => activate(session.id)));
-  renderTurns(session); renderComposer(session);
 }
 
-function scheduleRender() {
+function render(regions = ALL_REGIONS) {
+  regions |= dirtyRegions; dirtyRegions = 0;
+  if (!regions) return;
+  $('login').hidden = loggedIn; $('workspace').hidden = !loggedIn;
+  if (!loggedIn) {
+    renderedMessages = null; renderedComposer = null; renderedStatus = null; sessionEntries.clear();
+    for (const id of ['messages', 'sessions', 'reply-selection', 'draft-files', 'submission-status', 'message-error']) $(id).replaceChildren();
+    $('message-input').value = ''; $('file-input').value = ''; $('session-title').textContent = 'Select a session';
+    $('session-name').value = ''; $('session-channel').textContent = '';
+    return;
+  }
+  const session = current();
+  if (regions & DIRECTORY) renderDirectory(session);
+  if (regions & MESSAGES) renderTurns(session);
+  if (regions & DRAFT) renderComposer(session);
+  if (regions & STATUS) renderStatus(session);
+}
+
+function scheduleRender(regions, session) {
+  if (!regions || (session && session !== current())) return;
+  dirtyRegions |= regions;
   if (renderQueued) return;
   renderQueued = true;
-  queueMicrotask(() => { renderQueued = false; render(); });
+  queueMicrotask(() => { renderQueued = false; render(0); });
 }
 
 $('login-form').addEventListener('submit', event => {
@@ -828,10 +849,16 @@ $('choose-files').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', event => {
   const session = current(); if (!session || session.pending) return;
   for (const file of event.target.files) { const item = {file, objectId: null, status: 'waiting'}; session.files.push(item); upload(session, item); }
-  event.target.value = ''; scheduleRender();
+  event.target.value = ''; scheduleRender(DRAFT, session);
 });
-window.addEventListener('pagehide', () => { pageSuspended = true; historyLoop.stop(); stopQuery(); stopAllocation(); for (const controller of requests) controller.abort(); });
-window.addEventListener('pageshow', event => { pageSuspended = false; if (event.persisted && loggedIn && current()) activate(activeId); });
+window.addEventListener('pagehide', () => {
+  pageSuspended = true; historyLoop.stop(); stopQuery(); stopAllocation();
+  for (const controller of requests) controller.abort();
+});
+window.addEventListener('pageshow', event => {
+  pageSuspended = false;
+  if (event.persisted && loggedIn && current()) activate(activeId);
+});
 
 const token = cookieToken();
 if (token) { writeToken(token); loggedIn = true; render(); loadSessions(); }

@@ -61,7 +61,8 @@ The base protocol supports only text content parts and does not allow event kind
 ## Runtime requirements
 
 - An OpenEvent server supporting Channels, event history, and Fetch.
-- The Python SDK requires `openevent-sdk>=0.11.1` installed in the current environment; the current reference SDK version is `0.12.0`.
+- The Python SDK requires `openevent-sdk>=0.13.0` installed in the current environment; the current reference SDK version is `0.13.0`.
+- The browser application requires OpenEvent server 0.13.0 or later with `BatchGetObjectMetadata` support.
 - An OpenEvent server supporting message UUIDs, as defined in the OpenEvent API documentation.
 - Direct SDK use requires a non-system Channel with `protocol="chat.v1"` created beforehand; the browser application creates Channels automatically.
 

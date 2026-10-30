@@ -154,6 +154,9 @@ def run():
                 result = []
                 while True:
                     page = api('GET', base + f'/history?fetch_seq={cursor}&limit={limit}')
+                    expected_files = list(dict.fromkeys(
+                        item['object_id'] for event in page['events'] for item in event['attachments']))
+                    assert [item['object_id'] for item in page['files']] == expected_files, page
                     result.extend(page['events'])
                     cursor = page['next_seq']
                     if int(cursor) > int(page['last_seq']):
@@ -170,7 +173,9 @@ def run():
                 with process(command, root / 'chat.log') as child:
                     wait_http(child, http_port)
                     api('GET', '/api/chat/sessions', expected=401, auth=False)
-                    assert api('GET', '/api/chat/sessions') == {'sessions': []}
+                    max_user_message_bytes = 65536
+                    assert api('GET', '/api/chat/sessions') == {
+                        'sessions': [], 'max_user_message_bytes': max_user_message_bytes}
                     request_id = new_ulid()
                     api('POST', '/api/chat/sessions', {'create_request_id': request_id},
                         expected=403, request_origin='http://other.invalid')
@@ -186,7 +191,8 @@ def run():
                     assert api('POST', base + '/rename', {'name': session['name']}) == session
                     config = dict(config, name=session['name'])
                     assert json.loads((channels / f'{sid}.json').read_text()) == config
-                    assert api('GET', '/api/chat/sessions') == {'sessions': [session]}
+                    assert api('GET', '/api/chat/sessions') == {
+                        'sessions': [session], 'max_user_message_bytes': max_user_message_bytes}
                     assert api('POST', '/api/chat/sessions', {'create_request_id': request_id}) == session
                     agent = create_client(events, principal=9002, token=agent_token, channel_id=channel_id)
                     # A newly created Channel already has a system event. Chat hides it while
@@ -195,7 +201,7 @@ def run():
                                                limit=1, channels=[channel_id])
                     assert initial_raw.messages and initial_raw.messages[0].principal == 0
                     initial_history = api('GET', base + f'/history?fetch_seq={session["scan_start_seq"]}&limit=1')
-                    assert initial_history == {'events': [], 'next_seq': str(initial_raw.next_seq),
+                    assert initial_history == {'events': [], 'files': [], 'next_seq': str(initial_raw.next_seq),
                                                'last_seq': str(initial_raw.last_seq)}
                     assert int(initial_history['next_seq']) > int(session['scan_start_seq'])
                     assert upload(base, b'x')['nbytes'] == 1
@@ -207,6 +213,13 @@ def run():
                                expected=409)['error']['code'] == 'submission_out_of_range'
                     allocation = api('POST', base + '/submissions', {'count': '3'}, expected=201)
                     assert allocation == {'start': '1', 'end': '3'}
+                    # Count decoded UTF-8 bytes, including whitespace. Rejecting an
+                    # oversized body must leave this submission ID available below.
+                    limit_text = '中😀' * (max_user_message_bytes // 7) + ' ' * (max_user_message_bytes % 7)
+                    assert len(limit_text.encode('utf-8')) == max_user_message_bytes
+                    rejected = api('POST', base + '/turns',
+                                   {'submission_id': '1', 'text': limit_text + '\n'}, expected=413)
+                    assert rejected['error']['code'] == 'message_too_long'
                     # Outcome checks use the same POST; the old GET endpoint is absent.
                     api('GET', base + '/submissions/1', expected=404)
                     upload(base, b'', expected=range(400, 500))
@@ -216,8 +229,11 @@ def run():
                     uploaded = upload(base, file_data)
                     oid = uploaded['object_id']
                     assert uploaded['nbytes'] == len(file_data)
+                    another_data = b'second attachment in the same event'
+                    another_upload = upload(base, another_data)
+                    another_oid = another_upload['object_id']
                     send_body = {'submission_id': '1', 'text': '你好，OpenEvent',
-                                 'attachments': [oid, oid], 'reply_to_seqs': []}
+                                 'attachments': [oid, another_oid, oid], 'reply_to_seqs': []}
                     with ThreadPoolExecutor(max_workers=4) as pool:
                         replies = list(pool.map(lambda _: request('POST', base + '/turns', send_body), range(4)))
                     assert sum(status == 201 for status, _, _ in replies) == 1, replies
@@ -229,9 +245,12 @@ def run():
                                    if event['payload'].get('turn_id') == 'user:1']
                     assert len(user_events) == 1, user_events
                     creation = int(user_events[0]['event_seq'])
-                    api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation + 1}', expected=404)
-                    metadata = api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}')
-                    assert metadata['name'] == 'report.txt' and metadata['nbytes'] == len(file_data)
+                    file_page = api('GET', base + f'/history?fetch_seq={creation}&limit=1')
+                    assert file_page['events'] == user_events, file_page
+                    assert file_page['files'] == [uploaded, another_upload], file_page
+                    # File information now travels with its history page.
+                    api('POST', base + '/attachments/metadata', {'references': []}, expected=404)
+                    api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}', expected=404)
                     status, download, headers = request('GET', base + f'/attachments/{oid}?event_seq={creation}')
                     assert status == 200 and download == file_data
                     assert headers['Content-Type'] == 'application/octet-stream'
@@ -242,7 +261,10 @@ def run():
                                             channels=[channel_id]).messages[0]
                     key = ObjectKey(original.object_keys[0].object_id, original.object_keys[0].object_token)
                     writer = agent.start_turn(turn_id='stream', reply_to_seqs=(creation,))
-                    writer.append(object_keys=(key,))
+                    attachment_seq = writer.append(object_keys=(key,))
+                    attachment_page = api('GET', base + f'/history?fetch_seq={attachment_seq}&limit=1')
+                    assert attachment_page['events'][0]['event_seq'] == str(attachment_seq)
+                    assert attachment_page['files'] == [uploaded], attachment_page
                     writer.append(content=(TextPart('旧输出'),))
                     writer.reset(content=(TextPart('替换输出'),), object_keys=(key,))
                     writer.reset()
@@ -268,7 +290,7 @@ def run():
                     assert stream_records[1]['payload']['content'] == [] and stream_records[1]['attachments']
                     assert stream_records[4]['payload']['content'] == [] and not stream_records[4]['attachments']
                     user_event = next(e for e in records if e['event_seq'] == str(creation))
-                    assert len(user_event['attachments']) == 2
+                    assert [item['object_id'] for item in user_event['attachments']] == [oid, another_oid, oid]
                     large_creation = next(e['event_seq'] for e in records if e['payload'].get('turn_id') == 'user:3')
                     _, large_download, _ = request('GET', base + f'/attachments/{large_upload["object_id"]}?event_seq={large_creation}')
                     assert large_download == large_data
@@ -284,6 +306,12 @@ def run():
                     second_base = f'/api/chat/sessions/{second["session_id"]}'
                     assert api('POST', second_base + '/submissions', {'count': '1'}, expected=201)['start'] == '1'
                     api('POST', second_base + '/turns', {'submission_id': '1', 'text': '', 'attachments': [oid]}, expected=409)
+                    # A body exactly at the advertised limit is accepted unchanged.
+                    api('POST', second_base + '/turns', {'submission_id': '1', 'text': limit_text}, expected=201)
+                    boundary_turns = [event for event in history(second_base, second['scan_start_seq'])
+                                      if event['payload'].get('turn_id') == 'user:1']
+                    assert len(boundary_turns) == 1, boundary_turns
+                    assert boundary_turns[0]['payload']['content'] == [{'type': 'text', 'text': limit_text}]
                     # SDK reads, writer handoff and HTTP forwarding keep extension numbers
                     # and nested JSON intact without decoding them into Python values.
                     opaque_text = ('{ "large":1e400, "precise":0.12345678901234567890123456789, "deep":'
@@ -331,12 +359,12 @@ def run():
                     api('POST', base + '/turns', send_body, expected=409)
                     # Previously committed attachments remain readable before allocating a
                     # batch in this process; only sending a user turn requires an issued ID.
-                    assert api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}')['nbytes'] == len(file_data)
+                    assert api('GET', base + f'/history?fetch_seq={creation}&limit=1')['files'] == [uploaded, another_upload]
                     assert api('GET', base + f'/attachments/{oid}?event_seq={creation}') == file_data
                     fresh = api('POST', base + '/submissions', {'count': '1'}, expected=201)
                     assert fresh == {'start': expected_next, 'end': expected_next}
                     api('POST', base + '/turns', {'submission_id': fresh['start'], 'text': '', 'attachments': [oid]}, expected=409)
-                    assert api('GET', base + f'/attachments/{oid}/metadata?event_seq={creation}')['nbytes'] == len(file_data)
+                    assert api('GET', base + f'/history?fetch_seq={creation}&limit=1')['files'] == [uploaded, another_upload]
                     assert not list((channels / '.pending').iterdir())
                     # Exhaust an actual RPC retry budget and require the whole Chat process to exit.
                     event_process.terminate()

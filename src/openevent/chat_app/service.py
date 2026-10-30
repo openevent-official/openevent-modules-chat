@@ -12,8 +12,10 @@ import grpc
 from openevent.chat_sdk import ObjectKey, TextPart, TurnRef, create_client
 from openevent.chat_sdk.errors import make_failure
 from openevent.sdk import OpenEventClient
+from openevent.sdk.proto import openevent_pb2
 
 from .config import ConfigStore, MAX_UINT64, ServerConfig, SessionConfig, new_ulid, session_name, uint64_string, valid_ulid
+from .sdk_check import check_installed_sdk
 
 LOG = logging.getLogger(__name__)
 MAX_OBJECT_BYTES = 4 * 1024 * 1024
@@ -92,6 +94,8 @@ class SessionWorker:
 class ChatService:
     def __init__(self, config: ServerConfig, events_client=None, *, chat_factory=create_client, on_fatal=None, owns_events=False):
         self.config = config
+        if events_client is None:
+            check_installed_sdk()
         self.events = events_client if events_client is not None else OpenEventClient(config.openevent_target, timeout_ms=config.rpc_timeout_ms)
         self._owns_events = events_client is None or owns_events
         self._events_closing = False
@@ -249,7 +253,8 @@ class ChatService:
     def list_sessions(self):
         self._accepting()
         with self._index_lock:
-            return {"sessions": [self.sessions[key].public_config() for key in sorted(self.sessions)]}
+            return {"sessions": [self.sessions[key].public_config() for key in sorted(self.sessions)],
+                    "max_user_message_bytes": self.config.max_user_message_bytes}
 
     def rename_session(self, session_id, body):
         fields(body, {"name"})
@@ -374,8 +379,9 @@ class ChatService:
         if start < worker.config.scan_start_seq or type(limit) is not int or not 1 <= limit <= 1000:
             raise bad_request("history range is invalid")
         page = self._page(worker, start, limit)
+        files = self._page_files(page.messages, session_id)
         return {"next_seq": str(page.next_seq), "last_seq": str(page.last_seq),
-                "events": [self._public_event(message) for message in page.messages]}
+                "events": [self._public_event(message) for message in page.messages], "files": files}
 
     def allocate(self, session_id, body):
         worker = self._session(session_id)
@@ -433,6 +439,10 @@ class ChatService:
             result = self._submission_result(worker, submission)
             if result is not None:
                 return result
+            if len(text.encode("utf-8")) > self.config.max_user_message_bytes:
+                raise AppError(413, "message_too_long",
+                               f"Message is too long (maximum {self.config.max_user_message_bytes} UTF-8 bytes); "
+                               "shorten it and try again.")
             with self._uploads_lock:
                 keys = []
                 for object_id in objects:
@@ -491,23 +501,33 @@ class ChatService:
             self.uploads[object_id] = (token, session_id)
         return {"object_id": str(object_id), "name": name, "type": content_type, "description": "", "nbytes": len(data)}
 
-    def _attachment(self, session_id, object_id, event_seq):
-        worker = self._session(session_id)
-        object_id, event_seq = number(object_id), number(event_seq)
+    def _attachment_keys(self, worker, event_seq):
         if event_seq < worker.config.scan_start_seq:
             raise bad_request("attachment event precedes this session")
         page = self._page(worker, event_seq, 1)
         for message in page.messages:
             if message.seq == event_seq:
+                keys = {}
                 for key in message.object_keys:
-                    if key.object_id == object_id:
-                        return key
+                    keys.setdefault(key.object_id, key)
+                return keys
+        return {}
+
+    def _attachment(self, session_id, object_id, event_seq):
+        worker = self._session(session_id)
+        object_id, event_seq = number(object_id), number(event_seq)
+        key = self._attachment_keys(worker, event_seq).get(object_id)
+        if key is not None:
+            return key
         raise AppError(404, "attachment_reference_not_found", "event does not reference this attachment")
 
     def _metadata(self, key, session_id, event_seq):
         metadata = self._rpc("GetObjectMetadata", self.events.get_object_metadata,
                              object_id=key.object_id, object_token=key.object_token,
                              session_id=session_id, event_seq=event_seq)
+        return self._metadata_fields(metadata, key.object_id, session_id, event_seq, "GetObjectMetadata")
+
+    def _metadata_fields(self, metadata, object_id, session_id, event_seq, stage):
         try:
             text_value(metadata.name, nonempty=True, max_bytes=255)
             text_value(metadata.type, nonempty=True, max_bytes=255)
@@ -515,13 +535,35 @@ class ChatService:
             if type(metadata.nbytes) is not int or not 1 <= metadata.nbytes <= MAX_OBJECT_BYTES:
                 raise ValueError("invalid object size")
         except (AttributeError, ValueError, AppError):
-            self._contract("GetObjectMetadata", "GetObjectMetadata returned invalid metadata", session_id,
-                           event_seq=event_seq, object_id=key.object_id)
-        return {"object_id": str(key.object_id), "name": metadata.name, "type": metadata.type,
+            self._contract(stage, f"{stage} returned invalid metadata", session_id,
+                           event_seq=event_seq, object_id=object_id)
+        return {"object_id": str(object_id), "name": metadata.name, "type": metadata.type,
                 "description": metadata.description, "nbytes": metadata.nbytes}
 
-    def metadata(self, session_id, object_id, event_seq):
-        return self._metadata(self._attachment(session_id, object_id, event_seq), session_id, event_seq)
+    def _page_files(self, messages, session_id):
+        # Reuse the ObjectKeys from this history page; never fetch it again just
+        # to recover attachment tokens. Deduplication only lasts for this page.
+        objects = {}
+        for message in messages:
+            for key in message.object_keys:
+                objects.setdefault(key.object_id, (key, message.seq))
+        entries, files = list(objects.values()), []
+        for start in range(0, len(entries), 1024):
+            batch = entries[start:start + 1024]
+            response = self._rpc("BatchGetObjectMetadata", self.events.batch_get_object_metadata,
+                                 object_keys=[openevent_pb2.ObjectKey(object_id=key.object_id,
+                                                                     object_token=key.object_token)
+                                              for key, _ in batch], session_id=session_id)
+            try:
+                metadata = tuple(response.metadata)
+            except (AttributeError, TypeError):
+                self._contract("BatchGetObjectMetadata", "BatchGetObjectMetadata returned invalid metadata list", session_id)
+            if len(metadata) != len(batch):
+                self._contract("BatchGetObjectMetadata", "BatchGetObjectMetadata returned an incorrect result count", session_id)
+            files.extend(self._metadata_fields(item, key.object_id, session_id, event_seq,
+                                               "BatchGetObjectMetadata")
+                         for item, (key, event_seq) in zip(metadata, batch))
+        return files
 
     def download(self, session_id, object_id, event_seq):
         key = self._attachment(session_id, object_id, event_seq)

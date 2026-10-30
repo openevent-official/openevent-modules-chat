@@ -17,4 +17,20 @@
 .conversation-heading{min-width:0;flex:1}.session-heading{display:flex;align-items:center;gap:10px;margin-top:7px}.session-heading h1{min-width:0;max-width:none;margin:0}.session-heading .quiet{flex-shrink:0}.session-channel{font-size:11px;margin-top:6px;overflow-wrap:anywhere}.rename-form{margin-top:7px}.rename-controls{display:flex;align-items:center;gap:6px}.rename-controls input{width:100%;min-width:0;border:1px solid #cedad3;border-radius:7px;padding:7px 9px;background:#fafdFA;color:var(--ink)}.rename-form .error:not(:empty){margin-top:6px}
 @media(max-width:560px){.conversation-header{gap:10px}.session-heading{gap:5px;margin-top:0}.session-heading .quiet,.rename-controls .quiet{font-size:11px;padding:6px}.rename-form{margin-top:0}.rename-controls{gap:3px}}
 .session-heading .icon-button{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;color:var(--muted)}.icon-button svg{flex-shrink:0}
+/* Let long selections scroll while keeping the input and send controls on screen. */
+.composer-area{
+  display:flex;
+  flex-direction:column;
+  flex-shrink:0;
+  min-height:0;
+  max-height:65%;
+}
+.composer{display:flex;flex-direction:column;min-height:0}
+.reply-selection,.draft-files{
+  min-height:0;
+  max-height:25dvh;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+}
+.composer-actions,.composer-note{flex-shrink:0}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}.send-button{transition:none}.send-button:hover:enabled,.send-button:active:enabled{transform:none}}

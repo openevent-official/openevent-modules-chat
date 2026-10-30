@@ -9,9 +9,9 @@
 
 The Chat Python SDK provides `chat.v1` publishing, one-page-at-a-time Fetch reads, and stateless message parsing. It does not provide a worker, Agent runtime, UI, role mapping, application authorization, business idempotency, or a persistent application projection.
 
-The SDK requires Python 3.10 or later, `openevent-sdk>=0.11.1` installed in the current environment, and an existing Channel that the caller can read with `protocol="chat.v1"`. It uses an injected public OpenEvent client; it neither installs the SDK from source nor generates protobuf modules.
+The SDK requires Python 3.10 or later, `openevent-sdk>=0.13.0` installed in the current environment, and an existing Channel that the caller can read with `protocol="chat.v1"`. It uses an injected public OpenEvent client; it neither installs the SDK from source nor generates protobuf modules.
 
-`CHAT_PROTOCOL.md` defines payload fields and turn semantics. The OpenEvent API documentation defines authentication, ACL, Fetch, UUID, ObjectKey, and gRPC status semantics. SDK `0.12.0` is the current reference; Python call shapes follow that version's public interfaces.
+`CHAT_PROTOCOL.md` defines payload fields and turn semantics. The OpenEvent API documentation defines authentication, ACL, Fetch, UUID, ObjectKey, and gRPC status semantics. SDK `0.13.0` is the current reference; Python call shapes follow that version's public interfaces.
 
 ## 2. Construction
 

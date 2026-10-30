@@ -98,6 +98,7 @@ class ServerConfig:
     agent_principal: int
     rpc_timeout_ms: float
     max_retries: int
+    max_user_message_bytes: int = 65536
 
     @classmethod
     def load(cls, path: str | Path) -> "ServerConfig":
@@ -105,6 +106,7 @@ class ServerConfig:
         try:
             regular_file(path)
             data = strict_json(path.read_bytes().decode("utf-8", errors="strict"))
+            data.setdefault("max_user_message_bytes", cls.max_user_message_bytes)
             if set(data) != set(cls.__dataclass_fields__):
                 raise ValueError("invalid server configuration fields")
             for name in ("openevent_target", "channels_dir", "web_token", "user_openevent_token"):
@@ -121,6 +123,9 @@ class ServerConfig:
             retries = data["max_retries"]
             if type(retries) is not int or retries < 0:
                 raise ValueError("nonnegative integer max_retries required")
+            message_limit = data["max_user_message_bytes"]
+            if type(message_limit) is not int or message_limit <= 0:
+                raise ValueError("positive integer max_user_message_bytes required")
             directory = Path(data["channels_dir"])
             data["channels_dir"] = directory if directory.is_absolute() else path.absolute().parent / directory
             return cls(**data)

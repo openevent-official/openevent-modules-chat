@@ -10,11 +10,11 @@
 Chat Python SDK 提供 `chat.v1` 写入、一次一页的 Fetch 读取和无状态消息解析。它不提供 worker、Agent runtime、UI、角色映射、应用授权、业务幂等或持久化的应用投影。
 
 SDK 要求 Python 3.10 或更高版本、当前环境已安装
-`openevent-sdk>=0.11.1`，以及一个已存在、调用方可读且
+`openevent-sdk>=0.13.0`，以及一个已存在、调用方可读且
 `protocol="chat.v1"` 的 Channel。SDK 使用注入的 OpenEvent 公开 client，
 不会从源码安装 SDK，也不会生成 protobuf 模块。
 
-`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为 `0.12.0`，Python 调用形态以该版本的公开接口为准。
+`CHAT_PROTOCOL_cn.md` 定义 payload 字段和 turn 语义。OpenEvent API 文档定义认证、ACL、Fetch、UUID、ObjectKey 和 gRPC status 的语义。当前参考 SDK 为 `0.13.0`，Python 调用形态以该版本的公开接口为准。
 
 ## 2. 构造
 
