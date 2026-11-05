@@ -31,6 +31,19 @@ def validate_turn_id(value):
     return _string(value, 'turn_id', nonempty=True, max_bytes=128)
 
 
+def validate_content_seqs(values, start_seq, pre_seq):
+    if not isinstance(values, list) or not values:
+        raise ChatProtocolError('content_seqs must be a nonempty array')
+    previous = start_seq - 1
+    for seq in values:
+        validate_uint64(seq, 'content_seqs item')
+        if seq <= previous:
+            raise ChatProtocolError('content_seqs must increase strictly from start_seq or later')
+        previous = seq
+    if previous != pre_seq:
+        raise ChatProtocolError('content_seqs tail must equal pre_seq')
+
+
 def _fields(value, required, field):
     if not isinstance(value, dict) or set(value) != set(required):
         raise ChatProtocolError(f"{field} has missing or unknown fields")
@@ -65,19 +78,31 @@ def validate_payload(payload, *, object_keys=()):
         'turn.start': {'kind', 'turn_id', 'reply_to_seqs', 'content'},
         'turn.append': {'kind', 'turn_id', 'pre_seq', 'content'},
         'turn.reset': {'kind', 'turn_id', 'pre_seq', 'content'},
-        'turn.end': {'kind', 'turn_id', 'pre_seq'},
-        'turn.cancel': {'kind', 'target_turn'},
+        'turn.end': {'kind', 'turn_id', 'start_seq', 'pre_seq'},
+        'turn.cancel': {'kind', 'target_turn', 'start_seq'},
         'submission.reserve': {'kind', 'reserved_through'},
     }
     if not isinstance(kind, str) or kind not in fields:
         raise ChatProtocolError('kind is not supported')
     required = fields[kind]
+    if kind == 'turn.end':
+        required = required | ({'error'} if 'error' in payload else {'content_seqs'})
     if not required <= payload.keys() or payload.keys() - required - {'extensions'}:
         raise ChatProtocolError('payload has missing or unknown fields')
     if 'turn_id' in payload:
         validate_turn_id(payload['turn_id'])
     if 'pre_seq' in payload:
         validate_uint64(payload['pre_seq'], 'pre_seq')
+    if 'start_seq' in payload:
+        validate_uint64(payload['start_seq'], 'start_seq')
+    if kind == 'turn.end':
+        if payload['pre_seq'] < payload['start_seq']:
+            raise ChatProtocolError('pre_seq must not precede start_seq')
+        if 'error' in payload:
+            if payload['error'] != 'turn_too_long':
+                raise ChatProtocolError('turn.end error must be turn_too_long')
+        else:
+            validate_content_seqs(payload['content_seqs'], payload['start_seq'], payload['pre_seq'])
     if 'reserved_through' in payload:
         validate_uint64(payload['reserved_through'], 'reserved_through')
     if 'target_turn' in payload:
@@ -104,8 +129,8 @@ def validate_payload(payload, *, object_keys=()):
             if part['type'] != 'text':
                 raise ChatProtocolError('content part type must be text')
             _string(part['text'], 'content text', nonempty=True)
-    if kind == 'submission.reserve' and object_keys:
-        raise ChatProtocolError('submission.reserve cannot contain object_keys')
+    if kind in {'submission.reserve', 'turn.end'} and object_keys:
+        raise ChatProtocolError(f'{kind} cannot contain object_keys')
     if 'extensions' in payload:
         if isinstance(payload['extensions'], RawExtensions):
             return payload
@@ -186,6 +211,7 @@ def parse_message(event_message):
         spans = object_fields(text)
         payload = {}
         known_fields = {'kind', 'turn_id', 'reply_to_seqs', 'content', 'pre_seq',
+                        'start_seq', 'content_seqs', 'error',
                         'target_turn', 'reserved_through', 'extensions'}
         if spans.keys() - known_fields:
             raise ChatProtocolError('payload has unknown fields')

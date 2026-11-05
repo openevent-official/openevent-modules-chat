@@ -9,11 +9,10 @@ The application includes a Python backend and a browser page shipped with the pa
 Use Python 3.10 or later, install `openevent-sdk>=0.13.0` in the current environment, then run in this repository:
 
 ```sh
-make check-sdk
 make install
 ```
 
-Running `make install` again updates the installed project to the current build. When using a virtual environment, set `PYTHON` to that environment's Python interpreter.
+Running `make install` again updates the installed project to the current build. Installation resolves the declared dependencies, then checks the installed SDK package metadata, minimum version, and required module imports; a failed check fails the command. After installation, the read-only `make check-sdk` can also be run separately. When using a virtual environment, set `PYTHON` to that environment's Python interpreter.
 The interpreter determines the installation destination. `make install` does not accept `--target`, `--prefix`, or `--root`; this does not affect the isolated verification performed by `make verify-wheel`.
 
 Build and test output goes under `build/`, and packages go under `dist/`; `make clean` removes these files.
@@ -73,7 +72,7 @@ The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Co
 
 ## Using the page
 
-Buttons, prompts, and statuses are in English; chat content, filenames, and saved session names appear as written.
+Buttons, prompts, and statuses are in English. Chat content, filenames, and saved session names appear as written.
 History uses pale blue cards for user messages and pale green cards for Agent replies, with matching borders, avatars, and subtle shadows.
 
 - Create, select, or switch sessions. Only the selected session updates messages automatically. Each tab works independently.
@@ -88,8 +87,9 @@ History uses pale blue cards for user messages and pale green cards for Agent re
   With many files, the draft attachment list scrolls independently while the text input and send button remain visible.
 - If the text is too long, the page asks you to shorten it and preserves the editable draft, attachments, and reply selections. The backend also rejects oversized new messages (HTTP 413, `message_too_long`) without stopping the service; shorten the text and send again.
 - A file or its information failing validation rejects only that upload and does not stop the entire service.
-- Select terminal messages as reply targets; multiple targets are supported. Cancelled messages can also be selected, but streaming messages cannot. See [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
-- Streaming replies append in place. When retrying, the Agent can reset the same reply and replace its interrupted content with new output. It remains visibly in progress and cancellable even with no text or after being reset to empty. Resetting does not change this reply's position or the targets it references; it can only be selected as a reply target after becoming terminal.
+- Select completed messages as reply targets; multiple targets are supported. Cancelled and streaming messages cannot be selected. See [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
+- Streaming replies append in place. When retrying, the Agent can reset the same reply and replace its interrupted content with new output. It remains visibly in progress and cancellable even with no text or after being reset to empty. Resetting does not change this reply's position or the targets it references; it can only be selected as a reply target after normal completion.
+- If a streaming message ends with an error because its end manifest is too large, the page shows “Message is too long to display.” and clears its previous body and attachments. It remains replyable. See [protocol section 9](CHAT_PROTOCOL.md#9-turnend).
 - Select Stop generating while the Agent is producing output. If cancellation is unconfirmed, retry manually; the page does not resend automatically. Stopping the actual work requires support from the Agent service.
 - Each page loads its messages and attachment information together. Temporary failures or timeouts retry the current page while preserving pages already loaded. Files open through downloads and are neither executed nor previewed in the chat page.
 - Ordinary requests wait at most 30 seconds; requesting submission numbers, uploads, and downloads wait at most 120 seconds. Message synchronization and requests for submission numbers retry temporary network failures and timeouts automatically.
@@ -97,14 +97,16 @@ History uses pale blue cards for user messages and pale green cards for Agent re
 - Select the circular up-arrow button at the bottom right of the composer (labelled “Send message”) to send. Once the text passes the length check, this locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
   If a send times out or is still processing, the page automatically checks the original message's outcome. A timeout does not mean the message was not sent. The content stays locked while the outcome is unknown; follow any prompt to confirm it manually.
   Confirmed success clears the submitted content and restores editing. Confirmation that nothing was sent preserves the content and restores editing; use the same send button to send it again.
-  If the backend explicitly reports that an attachment is unavailable, the page ends that send, preserves the content, and restores editing even if an earlier request timed out. Upload the attachment again before sending again.
-  An explicit “message too long” rejection also ends the wait and restores editing; shorten the text before sending again.
+  If the backend explicitly returns the error code `attachment_unavailable`, the page ends that send, preserves the content, and restores editing even if an earlier request timed out. Upload the attachment again before sending again.
+  An explicit rejection with the error code `message_too_long` also ends the wait and restores editing; shorten the text before sending again.
   Switching away pauses automatic confirmation; switching back resumes it. If the page has reported an error and stopped automatic confirmation, follow its instructions.
 
 Refreshing loses drafts; sent chat records and files remain in OpenEvent.
 A reset changes only the currently displayed text and attachments. Earlier events and their files remain in the underlying history; reset neither deletes records nor revokes file access.
 
 ## Agent integration
+
+All readers and writers must adopt the current `chat.v1`; these rules are incompatible with old history and provide no migration. See the [protocol boundary](CHAT_PROTOCOL.md#1-protocol-boundary).
 
 The Agent connects to OpenEvent using the configured `agent_principal` and its own credentials, and reads and writes `chat.v1` as described in the [SDK quick start](SDK_USAGE.md). The deployment obtains the corresponding Channel ID from the session configuration. This project does not provide model calls, Agent task scheduling, or a discovery service.
 

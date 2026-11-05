@@ -3,7 +3,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from urllib.parse import parse_qs, urlsplit
+
+import grpc
 
 
 def run_browser(origin, web_token, events, agent_token, channels):
@@ -84,14 +85,10 @@ def run_browser(origin, web_token, events, agent_token, channels):
             allocations[0].continue_()
         page.unroute('**/submissions', hold_allocation)
         assert len(sends) == 1
-        sends[0].fulfill(status=400, content_type='application/json', body=json.dumps({
-            'error': {'code': 'invalid_request', 'message': 'test request rejection'}}))
-        expect(page.locator('#message-input')).to_be_enabled()
-        expect(page.locator('#message-input')).to_have_value('浏览器发出的消息 <b>按纯文本显示</b>')
-        expect(page.locator('#draft-files')).to_contain_text('Uploaded')
-        page.unroute('**/turns', hold_send)
+        expect(page.locator('#message-input')).to_be_disabled()
         with page.expect_response(lambda response: response.request.method == 'POST' and response.url.endswith('/turns')) as sent:
-            page.locator('#send').click()
+            sends[0].continue_()
+        page.unroute('**/turns', hold_send)
         assert sent.value.status == 201
         expect(page.locator('#message-input')).to_be_enabled()
         expect(page.locator('#message-input')).to_have_value('')
@@ -183,10 +180,8 @@ def run_browser(origin, web_token, events, agent_token, channels):
         expect(agent_turn.locator('.turn-content')).to_have_text('最终输出')
         page.get_by_role('button', name='Stop generating').click()
         expect(page.locator('.turn.agent')).to_contain_text('Canceled')
-        expect(agent_turn.locator('.reply-action')).to_be_enabled()
-        agent_turn.locator('.reply-action').click()
-        expect(page.locator('#reply-selection .reply-chip')).to_contain_text('最终输出')
-        page.locator('#reply-selection .reply-chip').click()
+        expect(agent_turn.locator('.reply-action')).to_be_disabled()
+        expect(agent_turn.locator('.turn-content')).to_have_text('最终输出')
         expect(page.locator('#reply-selection')).to_be_empty()
         del writer  # External cancellation was observed; releasing performs no RPC.
         agent.close()
@@ -207,13 +202,11 @@ def run_browser(origin, web_token, events, agent_token, channels):
         assert len(posts) >= 2 and all(body == posts[0] for body in posts)
         page.unroute('**/turns', lose_first_request)
 
-        # Freeze history so only a duplicate POST can confirm the lost success response.
-        def hold_history(route):
-            cursor = parse_qs(urlsplit(route.request.url).query)['fetch_seq'][0]
-            route.fulfill(status=200, content_type='application/json', body=json.dumps({
-                'events': [], 'next_seq': cursor, 'last_seq': str(int(cursor) - 1), 'files': []}))
-        with page.expect_response(lambda response: '/history?' in response.url):
-            page.route('**/history?*', hold_history)
+        # Make history unavailable so a duplicate POST confirms the lost success response.
+        def fail_history(route):
+            route.abort('failed')
+        with page.expect_event('requestfailed', predicate=lambda request: '/history?' in request.url):
+            page.route('**/history?*', fail_history)
         posts = []
         statuses = []
         def lose_send_response(route):
@@ -232,7 +225,7 @@ def run_browser(origin, web_token, events, agent_token, channels):
         assert len(posts) >= 2 and all(body == posts[0] for body in posts)
         expect(page.locator('.turn.user')).to_have_count(3)
         page.unroute('**/turns', lose_send_response)
-        page.unroute('**/history?*', hold_history)
+        page.unroute('**/history?*', fail_history)
         expect(page.locator('.turn.user')).to_have_count(4)
 
         second = context.new_page()
@@ -324,6 +317,49 @@ def run_browser(origin, web_token, events, agent_token, channels):
         page.screenshot(path=str(screenshot), full_page=True)
         page.locator('#message-input').fill('Ready to send.')
         page.locator('#composer').screenshot(path='build/browser-composer-ready.png', animations='disabled')
+        # Reject one normal end at the public SDK boundary, then publish its real
+        # fallback to OpenEvent. The small-payload server fixture tests actual size rejection.
+        class EndTooLarge(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.RESOURCE_EXHAUSTED
+
+            def details(self):
+                return 'browser fixture: end payload too large'
+
+        class RejectEndOnce:
+            rejected = False
+
+            def __getattr__(self, name):
+                return getattr(events, name)
+
+            def publish_auto_seq(self, **kwargs):
+                payload = json.loads(kwargs['payload'])
+                if payload['kind'] == 'turn.end' and not self.rejected:
+                    self.rejected = True
+                    raise EndTooLarge()
+                return events.publish_auto_seq(**kwargs)
+
+        boundary = RejectEndOnce()
+        with create_client(boundary, principal=9002, token=agent_token, channel_id=int(config['channel_id'])) as error_agent:
+            error_writer = error_agent.start_turn(turn_id='browser-too-long', content=(TextPart('应当清除的正文'),),
+                                                 object_keys=(agent_key,))
+            error_turn = page.locator(f'#message-{error_writer.start_seq}')
+            expect(error_turn.locator('.turn-content')).to_have_text('应当清除的正文')
+            expect(error_turn.locator('.attachment')).to_have_count(1)
+            terminal_seq = error_writer.complete()
+            assert boundary.rejected
+            expect(error_turn.locator('.turn-content')).to_have_text('Message is too long to display.')
+            expect(error_turn.locator('.attachment')).to_have_count(0)
+            expect(error_turn.locator('.reply-action')).to_be_enabled()
+            error_turn.locator('.reply-action').click()
+            expect(page.locator('#reply-selection .reply-chip')).to_contain_text('Message is too long to display.')
+            page.locator('#message-input').fill('回复超长消息')
+            with page.expect_request(lambda request: request.url.endswith('/turns')) as error_reply:
+                page.locator('#send').click()
+            assert error_reply.value.post_data_json['reply_to_seqs'] == [str(terminal_seq)]
+            expect(page.locator('.turn.user')).to_have_count(5)
+            expect(page.locator('.turn.user').last.locator('.quoted-reply')).to_contain_text('Message is too long to display.')
+        page.locator('#message-input').fill('Ready to send.')
         # Check geometry before clicking: locator.click() can scroll an overflow:hidden
         # ancestor and would hide a composer that has already grown off screen.
         page.locator('.turn .reply-action').first.click()

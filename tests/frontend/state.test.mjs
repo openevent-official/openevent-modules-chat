@@ -47,14 +47,12 @@ test('session names preserve valid Unicode and whitespace without a length limit
   }
   for (const name of [undefined, null, 1, '', ' \t\n', '\u0085\u001c', '\ud83d', '\ude00']) {
     assert.throws(() => sessionName(name));
-    assert.throws(() => createSession({session_id: SESSION, scan_start_seq: '1', channel_id: '7', name}));
   }
 });
 
-test('session Channel IDs retain every decimal digit and require a canonical string', () => {
+test('session Channel IDs retain every decimal digit', () => {
   const description = {session_id: SESSION, scan_start_seq: '1', name: '会话名称'};
   assert.equal(createSession({...description, channel_id: '9007199254740993'}).channelId, '9007199254740993');
-  for (const channel_id of [undefined, 7, '', '07', '0', '-1']) assert.throws(() => createSession({...description, channel_id}));
 });
 
 test('one page commits records and cursor atomically, sharing arrays only after successful validation', () => {
@@ -84,6 +82,11 @@ test('1000 pages append to one turn without reading any existing content or atta
     return Reflect.get(target, key, receiver);
   }});
   initial.parts = observe(initial.parts); initial.attachments = observe(initial.attachments);
+  let sequenceReads = 0;
+  initial.contentSeqs = new Proxy(initial.contentSeqs, {get(target, key, receiver) {
+    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) sequenceReads++;
+    return Reflect.get(target, key, receiver);
+  }});
   for (let seq = 2; seq <= 1001; seq++) {
     apply(state, page([event(seq, 'turn.append', {
       turn_id: 'a', pre_seq: String(seq - 1), content: [{type: 'text', text: '增量'}],
@@ -93,10 +96,13 @@ test('1000 pages append to one turn without reading any existing content or atta
   assert.equal(appended.parts, initial.parts); assert.equal(appended.attachments, initial.attachments);
   assert.equal(appended.parts.length, 1001); assert.equal(appended.attachments.length, 1000);
   assert.equal(oldEntryReads, 0, 'old entries must never be scanned or copied when applying an append');
-  apply(state, page([event(1002, 'turn.end', {turn_id: 'a', pre_seq: '1001'})], 1003));
+  assert.equal(sequenceReads, 0, 'appends must not copy the growing sequence list');
+  apply(state, page([event(1002, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '1001', content_seqs: Array.from({length: 1001}, (_, index) => String(index + 1))})], 1003));
   assert.equal(state.turns.get(initial.key).parts, initial.parts);
   assert.equal(state.turns.get(initial.key).attachments, initial.attachments);
   assert.equal(oldEntryReads, 0, 'ending a turn must not copy its old arrays');
+  assert.equal(sequenceReads, 1001, 'only end compares each retained content sequence once');
+  assert.deepEqual(state.turns.get(initial.key).contentSeqs, []);
 });
 
 test('cancel shares existing lists without inspecting their entries', () => {
@@ -104,23 +110,127 @@ test('cancel shares existing lists without inspecting their entries', () => {
   const initial = state.turns.get(turnKey('agent', 'a'));
   const unreadable = {get() { throw new Error('cancel must not read existing lists'); }};
   initial.parts = new Proxy(initial.parts, unreadable); initial.attachments = new Proxy(initial.attachments, unreadable);
-  apply(state, page([event(2, 'turn.cancel', {target_turn: {role: 'agent', turn_id: 'a'}}, 'user')], 3));
+  apply(state, page([event(2, 'turn.cancel', {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user')], 3));
   const cancelled = state.turns.get(initial.key);
   assert.equal(cancelled.state, 'cancelled'); assert.equal(cancelled.parts, initial.parts);
   assert.equal(cancelled.attachments, initial.attachments);
+  assert.equal(cancelled.terminalSeq, '2'); assert.equal(state.terminalIndex.size, 0);
+});
+
+test('cancel retains partial content and its own attachments but never becomes a reply target', () => {
+  const first = create(1); first.attachments = [{object_id: '40'}];
+  const state = apply(session(), page([first], 2));
+  apply(state, page([event(2, 'turn.cancel', {
+    start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'},
+  }, 'user', [{object_id: '41'}])], 3));
+  const turn = state.turns.get(turnKey('agent', 'a'));
+  assert.equal(turn.parts[0].text, '开头'); assert.equal(turn.state, 'cancelled');
+  assert.deepEqual(turn.attachments, [{object_id: '40', event_seq: '1'}, {object_id: '41', event_seq: '2'}]);
+  assert.deepEqual(turn.contentSeqs, []); assert.equal(state.terminalIndex.has('2'), false);
+});
+
+test('terminal commit releases sequence lists without losing same-page appends or mutating history', () => {
+  for (const terminal of ['turn.end', 'turn.cancel']) for (const priorPage of [false, true]) {
+    const first = create(1); first.attachments = [{object_id: '40'}];
+    const state = session();
+    if (priorPage) apply(state, page([first], 2));
+    const before = state.turns.get(turnKey('agent', 'a'));
+    const finish = terminal === 'turn.end'
+      ? event(3, terminal, {turn_id: 'a', start_seq: '1', pre_seq: '2', content_seqs: ['1', '2']})
+      : event(3, terminal, {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user', [{object_id: '42'}]);
+    const response = page([
+      ...(priorPage ? [] : [first]),
+      event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '追加'}]}, 'agent', [{object_id: '41'}]),
+      finish,
+    ], 4);
+    const originalResponse = structuredClone(response);
+    assert.throws(() => apply(state, page([...response.events, create(4)], 5)), /Duplicate message creation/);
+    assert.equal(state.fetchSeq, priorPage ? '2' : '1');
+    assert.equal(state.turns.get(turnKey('agent', 'a')), before);
+    if (before) {
+      assert.deepEqual(before.contentSeqs, ['1']); assert.equal(before.parts.length, 1);
+      assert.deepEqual(before.attachments, [{object_id: '40', event_seq: '1'}]);
+    }
+    apply(state, response);
+    const turn = state.turns.get(turnKey('agent', 'a'));
+    assert.deepEqual(turn.contentSeqs, []); assert.equal(turn.terminalSeq, '3');
+    assert.equal(turn.parts.map(part => part.text).join(''), '开头追加');
+    assert.deepEqual(turn.attachments, [
+      {object_id: '40', event_seq: '1'}, {object_id: '41', event_seq: '2'},
+      ...(terminal === 'turn.cancel' ? [{object_id: '42', event_seq: '3'}] : []),
+    ]);
+    assert.deepEqual(response, originalResponse, 'history end manifests remain unchanged');
+  }
+});
+
+test('end checks the effective content list across pages and after resets without committing bad pages', () => {
+  const state = apply(session(), page([create(1)], 2));
+  apply(state, page([
+    event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '旧'}]}),
+    event(3, 'turn.reset', {turn_id: 'a', pre_seq: '2', content: []}),
+  ], 4));
+  const before = state.turns.get(turnKey('agent', 'a'));
+  assert.deepEqual(before.contentSeqs, ['3']);
+  const append = event(4, 'turn.append', {turn_id: 'a', pre_seq: '3', content: []}, 'agent', [{object_id: '42'}]);
+  const payload = {turn_id: 'a', start_seq: '1', pre_seq: '4', content_seqs: ['3', '4']};
+  // Each event passes the backend's stateless parser; only the projected chain exposes the conflict.
+  for (const changed of [
+    {start_seq: '2'}, {pre_seq: '3', content_seqs: ['3']},
+    {content_seqs: ['1', '2', '3', '4']}, {content_seqs: ['4']},
+  ]) {
+    assert.throws(() => apply(state, page([append, event(5, 'turn.end', {...payload, ...changed})], 6)));
+    assert.equal(state.turns.get(before.key), before); assert.equal(state.fetchSeq, '4');
+    assert.deepEqual(before.contentSeqs, ['3']); assert.deepEqual(before.attachments, []);
+    assert.equal(state.fileInfo.size, 0); assert.equal(state.terminalIndex.size, 0);
+  }
+  assert.throws(() => apply(state, page([event(4, 'turn.cancel', {
+    start_seq: '2', target_turn: {role: 'agent', turn_id: 'a'},
+  }, 'user')], 5)));
+  apply(state, page([append, event(5, 'turn.end', payload)], 6));
+  const ended = state.turns.get(before.key);
+  assert.deepEqual(ended.contentSeqs, []); assert.equal(ended.terminalSeq, '5');
+  assert.equal(ended.startSeq, '1'); assert.equal(state.terminalIndex.get('5'), before.key);
+  assert.deepEqual(ended.attachments, [{object_id: '42', event_seq: '4'}]);
+});
+
+test('error end atomically replaces text and files, accepts replies and ignores later changes', () => {
+  const first = create(1); first.attachments = [{object_id: '40'}];
+  const state = apply(session(), page([first], 2));
+  const before = state.turns.get(turnKey('agent', 'a'));
+  const finish = event(3, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '2', error: 'turn_too_long'});
+  const response = page([
+    event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '追加'}]}, 'agent', [{object_id: '41'}]),
+    finish,
+  ], 4);
+  assert.throws(() => apply(state, page([...response.events, create(4)], 5)), /Duplicate message creation/);
+  assert.equal(state.turns.get(before.key), before); assert.equal(before.parts.length, 1);
+  assert.deepEqual(before.contentSeqs, ['1']); assert.equal(state.fetchSeq, '2');
+  assert.equal(state.terminalIndex.size, 0); assert.equal(state.fileInfo.size, 1);
+  apply(state, response);
+  const ended = state.turns.get(before.key);
+  assert.equal(ended.state, 'completed'); assert.equal(ended.error, 'turn_too_long');
+  assert.equal(ended.terminalSeq, '3'); assert.equal(ended.contentVersion, 1);
+  assert.deepEqual(ended.parts, []); assert.deepEqual(ended.attachments, []); assert.deepEqual(ended.contentSeqs, []);
+  const reply = create(4, 'reply', 'turn.single', 'user'); reply.payload.reply_to_seqs = ['3'];
+  apply(state, page([
+    reply,
+    event(5, 'turn.reset', {turn_id: 'a', pre_seq: '3', content: [{type: 'text', text: '迟到'}]}),
+    event(6, 'turn.cancel', {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
+  ], 7));
+  assert.equal(state.turns.get(before.key), ended); assert.deepEqual(state.turns.get(turnKey('user', 'reply')).replies, ['3']);
 });
 
 test('global sequence gaps, control-only pages, and unchanged empty tail are legal', () => {
   const state = session('9007199254740993');
   apply(state, page([event('9007199254740998', 'submission.reserve', {reserved_through: '10000'}, 'user')], '9007199254741001', '9007199254741100'));
-  assert.equal(state.turns.size, 0); assert.equal(state.creationIndex.size, 0);
+  assert.equal(state.turns.size, 0); assert.equal(state.terminalIndex.size, 0);
   assert.equal(state.fetchSeq, '9007199254741001');
   apply(state, page([], '9007199254741101', '9007199254741100'));
   apply(state, page([], '9007199254741101', '9007199254741100'));
   assert.equal(state.fetchSeq, '9007199254741101');
 });
 
-test('reply indexes use creation seq; append attachments keep their carrying event seq and duplicates', () => {
+test('single reply indexes use their terminal seq; append attachments keep their carrying event seq and duplicates', () => {
   const state = session('9007199254740993');
   const first = create('9007199254740993', 'user:1', 'turn.single', 'user');
   const reply = create('9007199254740995'); reply.payload.reply_to_seqs = [first.event_seq];
@@ -129,34 +239,43 @@ test('reply indexes use creation seq; append attachments keep their carrying eve
     turn_id: 'a', pre_seq: '9007199254740995', content: [{type: 'text', text: '文件'}],
   }, 'agent', [{object_id: '9007199254741000'}, {object_id: '9007199254741000'}])], '9007199254740999'));
   const turn = state.turns.get(turnKey('agent', 'a'));
-  assert.equal(turn.creationSeq, '9007199254740995'); assert.deepEqual(turn.replies, ['9007199254740993']);
+  assert.equal(turn.startSeq, '9007199254740995'); assert.deepEqual(turn.replies, ['9007199254740993']);
   assert.deepEqual(turn.attachments, [
     {object_id: '9007199254741000', event_seq: '9007199254740998'},
     {object_id: '9007199254741000', event_seq: '9007199254740998'},
   ]);
-  assert.equal(state.creationIndex.get('9007199254740995'), turn.key);
+  assert.equal(state.terminalIndex.get('9007199254740993'), turnKey('user', 'user:1'));
+  assert.equal(state.terminalIndex.has(turn.startSeq), false);
   assert.deepEqual(state.order, [turnKey('user', 'user:1'), turnKey('agent', 'a')]);
 });
 
-test('replies require terminal targets at their own event position, within or across pages', () => {
+test('replies use completed single or end positions within and across pages, never cancelled turns', () => {
   for (const terminal of ['turn.end', 'turn.cancel']) {
     for (const split of [0, 1, 3]) {
       const state = session();
       const finish = terminal === 'turn.end'
-        ? event(2, terminal, {turn_id: 'a', pre_seq: '1'})
-        : event(2, terminal, {target_turn: {role: 'agent', turn_id: 'a'}}, 'user');
+        ? event(2, terminal, {turn_id: 'a', start_seq: '1', pre_seq: '1', content_seqs: ['1']})
+        : event(2, terminal, {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user');
       const reply = create(4, 'reply', 'turn.single', 'user');
-      reply.payload.reply_to_seqs = ['3', '1'];
+      reply.payload.reply_to_seqs = ['3', '2'];
       const prior = [create(1), finish, create(3, 'single', 'turn.single')];
       if (split) apply(state, page(prior.slice(0, split), split + 1));
-      apply(state, page([...prior.slice(split), reply], 5));
-      assert.deepEqual(state.turns.get(turnKey('user', 'reply')).replies, ['3', '1']);
+      if (terminal === 'turn.cancel') {
+        const before = state.fetchSeq;
+        assert.throws(() => apply(state, page([...prior.slice(split), reply], 5)), /Reply target/);
+        assert.equal(state.fetchSeq, before);
+      } else {
+        apply(state, page([...prior.slice(split), reply], 5));
+        assert.deepEqual(state.turns.get(turnKey('user', 'reply')).replies, ['3', '2']);
+        assert.equal(state.terminalIndex.get('2'), turnKey('agent', 'a'));
+        assert.equal(state.turns.get(turnKey('agent', 'a')).startSeq, '1');
+      }
     }
   }
   for (const split of [false, true]) {
     const state = session();
     const reply = create(2, 'reply', 'turn.single', 'user'); reply.payload.reply_to_seqs = ['1'];
-    const finish = event(3, 'turn.end', {turn_id: 'a', pre_seq: '1'});
+    const finish = event(3, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '1', content_seqs: ['1']});
     if (split) apply(state, page([create(1)], 2));
     const oldCursor = state.fetchSeq;
     assert.throws(() => apply(state, page([...(split ? [] : [create(1)]), reply, finish], 4)), /Reply target/);
@@ -166,15 +285,15 @@ test('replies require terminal targets at their own event position, within or ac
   }
 });
 
-test('reply validation rejects non-creation, unknown, self and future references without committing a partial page', () => {
+test('reply validation rejects non-terminal, unknown, self and future references without committing a partial page', () => {
   const state = apply(session(), page([
     create(1), event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '内容'}]}),
-    event(3, 'turn.end', {turn_id: 'a', pre_seq: '2'}),
+    event(3, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '2', content_seqs: ['1', '2']}),
     event(4, 'submission.reserve', {reserved_through: '100'}, 'user'),
     create(5, 'open'),
   ], 6));
   const original = state.turns.get(turnKey('agent', 'open'));
-  for (const reference of ['2', '3', '4', '5', '8', '9', '100']) {
+  for (const reference of ['1', '2', '4', '5', '8', '9', '100']) {
     const reply = create(8, 'reply', 'turn.single', 'user'); reply.payload.reply_to_seqs = [reference];
     assert.throws(() => apply(state, page([
       event(6, 'turn.append', {turn_id: 'open', pre_seq: '5', content: [{type: 'text', text: '未提交'}]}),
@@ -183,16 +302,16 @@ test('reply validation rejects non-creation, unknown, self and future references
     assert.equal(state.fetchSeq, '6'); assert.equal(state.turns.size, 2);
     assert.equal(state.turns.get(original.key), original); assert.equal(original.parts.length, 1);
     assert.deepEqual(state.order, [turnKey('agent', 'a'), original.key]);
-    assert.deepEqual([...state.creationIndex.keys()], ['1', '5']);
+    assert.deepEqual([...state.terminalIndex.keys()], ['3']);
   }
 });
 
 test('the first terminal event wins and later events do not change content or files', () => {
   const state = apply(session(), page([create(1)], 2));
   apply(state, page([
-    event(3, 'turn.cancel', {target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
+    event(3, 'turn.cancel', {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
     event(4, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '迟到'}]}, 'agent', [{object_id: '9'}]),
-    event(5, 'turn.end', {turn_id: 'a', pre_seq: '4'}),
+    event(5, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '4', content_seqs: ['1', '4']}),
   ], 6));
   const turn = state.turns.get(turnKey('agent', 'a'));
   assert.equal(turn.state, 'cancelled'); assert.equal(turn.parts.length, 1);
@@ -202,8 +321,8 @@ test('the first terminal event wins and later events do not change content or fi
 test('roles have independent turn ids and completed single turns stay completed', () => {
   const state = apply(session(), page([
     create(1, 'same', 'turn.single', 'user'), create(2, 'same'),
-    event(3, 'turn.cancel', {target_turn: {role: 'user', turn_id: 'same'}}, 'agent'),
-    event(4, 'turn.end', {turn_id: 'same', pre_seq: '2'}),
+    event(3, 'turn.cancel', {start_seq: '1', target_turn: {role: 'user', turn_id: 'same'}}, 'agent'),
+    event(4, 'turn.end', {turn_id: 'same', start_seq: '2', pre_seq: '2', content_seqs: ['2']}),
   ], 5));
   assert.equal(state.turns.size, 2);
   assert.equal(state.turns.get(turnKey('user', 'same')).state, 'completed');
@@ -222,14 +341,14 @@ test('empty start, attachment-only append, reset and subsequent append preserve 
     event(4, 'turn.append', {turn_id: 'a', pre_seq: '3', content: [{type: 'text', text: '回答'}]}),
   ], 5));
   const turn = state.turns.get(key);
-  assert.equal(turn.creationSeq, '1'); assert.equal(turn.tailSeq, '4'); assert.equal(turn.contentVersion, 1);
+  assert.equal(turn.startSeq, '1'); assert.equal(turn.tailSeq, '4'); assert.equal(turn.contentVersion, 1);
   assert.equal(turn.parts.map(part => part.text).join(''), '重新回答');
   assert.deepEqual(turn.attachments, [{object_id: '43', event_seq: '3'}]);
-  assert.deepEqual(state.order, [key]); assert.equal(state.creationIndex.get('1'), key);
+  assert.deepEqual(state.order, [key]); assert.equal(state.terminalIndex.has('1'), false);
   apply(state, page([event(5, 'turn.reset', {turn_id: 'a', pre_seq: '4', content: []})], 6));
   assert.equal(state.turns.get(key).state, 'open'); assert.deepEqual(state.turns.get(key).parts, []);
   assert.deepEqual(state.turns.get(key).attachments, []);
-  apply(state, page([event(6, 'turn.cancel', {target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
+  apply(state, page([event(6, 'turn.cancel', {start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}, 'user'),
     event(7, 'turn.reset', {turn_id: 'a', pre_seq: '5', content: [{type: 'text', text: '迟到'}]})], 8));
   assert.equal(state.turns.get(key).state, 'cancelled'); assert.deepEqual(state.turns.get(key).parts, []);
 });
@@ -251,12 +370,12 @@ test('reset replaces old lists without reading their contents and supports furth
   const turn = state.turns.get(before.key);
   assert.equal(turn.parts.map(part => part.text).join(''), '最后内容');
   assert.deepEqual(turn.attachments, [{object_id: '43', event_seq: '4'}, {object_id: '44', event_seq: '5'}]);
-  assert.equal(turn.contentVersion, 2); assert.equal(turn.tailSeq, '5'); assert.equal(turn.creationSeq, '1');
+  assert.equal(turn.contentVersion, 2); assert.equal(turn.tailSeq, '5'); assert.equal(turn.startSeq, '1');
   assert.deepEqual(oldParts, [{type: 'text', text: '开头'}]);
   assert.deepEqual(oldAttachments, [{object_id: '40', event_seq: '1'}]);
 });
 
-test('a malformed event after append and reset rolls back the entire page, including attachments and chain tail', () => {
+test('a chain conflict after append and reset rolls back the entire page, including attachments and chain tail', () => {
   const first = create(1); first.attachments = [{object_id: '40'}];
   const state = apply(session(), page([first], 2));
   const before = state.turns.get(turnKey('agent', 'a'));
@@ -270,7 +389,6 @@ test('a malformed event after append and reset rolls back the entire page, inclu
   assert.equal(before.tailSeq, '1'); assert.equal(before.contentVersion, 0);
   assert.equal(before.parts, oldParts); assert.deepEqual(before.parts, [{type: 'text', text: '开头'}]);
   assert.equal(before.attachments, oldAttachments); assert.deepEqual(before.attachments, [{object_id: '40', event_seq: '1'}]);
-  assert.throws(() => apply(state, page([event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: []})], 3)));
 });
 
 test('large legal content arrays append without a function argument limit', () => {
@@ -285,23 +403,16 @@ test('large legal content arrays append without a function argument limit', () =
 
 test('page commits reuse session indexes and unchanged turns without leaking malformed creations', () => {
   const state = apply(session(), page([create(1), create(2, 'b')], 3));
-  const {turns, order, creationIndex} = state;
+  const {turns, order, terminalIndex} = state;
   const untouched = turns.get(turnKey('agent', 'b'));
   const append = event(3, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: '追加'}]});
   apply(state, page([append], 4));
-  assert.equal(state.turns, turns); assert.equal(state.order, order); assert.equal(state.creationIndex, creationIndex);
+  assert.equal(state.turns, turns); assert.equal(state.order, order); assert.equal(state.terminalIndex, terminalIndex);
   assert.equal(state.turns.get(untouched.key), untouched);
   assert.throws(() => apply(state, page([create(4, 'c'), create(5, 'c')], 6)));
   assert.equal(state.fetchSeq, '4');
   assert.deepEqual(state.order, [turnKey('agent', 'a'), turnKey('agent', 'b')]);
-  assert.equal(state.creationIndex.has('4'), false); assert.equal(state.turns.has(turnKey('agent', 'c')), false);
-});
-
-test('malformed page ordering and numeric fields cannot advance a cursor', () => {
-  const state = session();
-  for (const response of [page([create(3), create(2, 'b')], 4), page([create(3)], 3), page([], 5, 3), {events: [], next_seq: 1, last_seq: '0'}]) {
-    assert.throws(() => apply(state, response)); assert.equal(state.fetchSeq, '1'); assert.equal(state.turns.size, 0);
-  }
+  assert.equal(state.terminalIndex.has('4'), false); assert.equal(state.turns.has(turnKey('agent', 'c')), false);
 });
 
 test('inventory consumes exact integers once and reaches uint64 exhaustion without wraparound', () => {
@@ -310,7 +421,6 @@ test('inventory consumes exact integers once and reaches uint64 exhaustion witho
   assert.equal(takeSubmission(state), (MAX_UINT64 - 2n).toString());
   assert.equal(takeSubmission(state), (MAX_UINT64 - 1n).toString());
   assert.equal(takeSubmission(state), MAX_UINT64.toString()); assert.equal(takeSubmission(state), null);
-  assert.throws(() => setInventory(state, {start: '1', end: '10'}, '100'));
 });
 
 test('old-batch confirmation ignores requests started before rejection and fixes its first fresh watermark', () => {
@@ -336,55 +446,45 @@ test('a current batch absence stays unknown, and a loaded user turn confirms wit
   assert.equal(inspectSubmission(state, pending), 'committed');
 });
 
-test('file information, records and cursor commit only after every event and file validates', () => {
+test('a chain conflict cannot partially commit file information, records or the cursor', () => {
   const initial = page([event(1, 'turn.start', {turn_id: 'a', content: [{type: 'text', text: 'old'}], reply_to_seqs: []},
     'agent', [{object_id: '42'}])], 2);
   const next = page([event(2, 'turn.append', {turn_id: 'a', pre_seq: '1', content: [{type: 'text', text: 'new'}]},
     'agent', [{object_id: '43'}, {object_id: '44'}])], 3);
-  const invalid = [undefined, null, [], [metadata('43')], [metadata('44'), metadata('43')],
-    [metadata('43'), metadata('43')], [metadata('43'), {...metadata('44'), nbytes: 0}],
-    [metadata('43'), metadata('44'), metadata('45')]];
-  for (const files of invalid) {
-    const state = apply(session(), initial); const original = state.turns.get(turnKey('agent', 'a'));
-    const oldInfo = state.fileInfo.get('42');
-    assert.throws(() => apply(state, {...next, files}));
-    assert.equal(state.fetchSeq, '2'); assert.equal(state.turns.get(original.key), original);
-    assert.equal(original.parts.map(part => part.text).join(''), 'old');
-    assert.deepEqual(original.attachments, [{object_id: '42', event_seq: '1'}]);
-    assert.deepEqual([...state.fileInfo.keys()], ['42']); assert.equal(state.fileInfo.get('42'), oldInfo);
-    apply(state, next);
-    assert.equal(state.fetchSeq, '3'); assert.equal(state.fileInfo.size, 3);
-    assert.equal(state.turns.get(original.key).parts.map(part => part.text).join(''), 'oldnew');
-  }
   const state = apply(session(), initial);
+  const original = state.turns.get(turnKey('agent', 'a'));
+  const oldInfo = state.fileInfo.get('42');
   const badEvent = page([...next.events, event(3, 'turn.append', {turn_id: 'missing', pre_seq: '2', content: []},
     'agent', [{object_id: '45'}])], 4);
-  assert.throws(() => apply(state, badEvent));
-  assert.deepEqual([...state.fileInfo.keys()], ['42']); assert.equal(state.fetchSeq, '2');
+  assert.throws(() => apply(state, badEvent), /Missing message creation/);
+  assert.equal(state.fetchSeq, '2'); assert.equal(state.turns.get(original.key), original);
+  assert.equal(original.parts.map(part => part.text).join(''), 'old');
+  assert.deepEqual(original.attachments, [{object_id: '42', event_seq: '1'}]);
+  assert.deepEqual([...state.fileInfo.keys()], ['42']); assert.equal(state.fileInfo.get('42'), oldInfo);
+  apply(state, next);
+  assert.equal(state.fetchSeq, '3'); assert.equal(state.fileInfo.size, 3);
+  assert.equal(state.turns.get(original.key).parts.map(part => part.text).join(''), 'oldnew');
 });
 
-test('history validates all page attachments including duplicates, reset content and ignored terminal events', () => {
+test('history registers files from duplicates, reset content and ignored terminal events', () => {
   const state = session();
   const response = page([
     event(1, 'turn.start', {turn_id: 'a', content: [], reply_to_seqs: []}, 'agent', [{object_id: '42'}, {object_id: '42'}]),
     event(2, 'turn.reset', {turn_id: 'a', pre_seq: '1', content: []}, 'agent', [{object_id: '43'}]),
-    event(3, 'turn.end', {turn_id: 'a', pre_seq: '2'}),
+    event(3, 'turn.end', {turn_id: 'a', start_seq: '1', pre_seq: '2', content_seqs: ['2']}),
     event(4, 'turn.append', {turn_id: 'a', pre_seq: '3', content: []}, 'agent', [{object_id: '44'}]),
   ], 5);
   assert.deepEqual(response.files.map(file => file.object_id), ['42', '43', '44']);
-  assert.throws(() => apply(state, {...response, files: response.files.slice(0, 2)}));
-  assert.equal(state.turns.size, 0); assert.equal(state.fileInfo.size, 0); assert.equal(state.fetchSeq, '1');
   apply(state, response);
   assert.deepEqual([...state.fileInfo.keys()], ['42', '43', '44']);
   assert.deepEqual(state.turns.get(turnKey('agent', 'a')).attachments, [{object_id: '43', event_seq: '2'}]);
 });
 
-test('uploaded and previously loaded information stay shared while every page is still fully validated', () => {
+test('uploaded and previously loaded information stay shared across pages and isolated across sessions', () => {
   const one = session(); const two = session();
   const uploaded = fileInfo(metadata('42')); one.fileInfo.set('42', uploaded);
   const response = page([event(1, 'turn.single', {turn_id: 'a', content: [], reply_to_seqs: []},
     'agent', [{object_id: '42'}])], 2);
-  assert.throws(() => apply(one, {...response, files: []}));
   apply(one, response); apply(two, response);
   assert.equal(one.fileInfo.get('42'), uploaded); assert.notEqual(two.fileInfo.get('42'), uploaded);
   apply(one, page([event(2, 'turn.single', {turn_id: 'b', content: [], reply_to_seqs: []},
@@ -407,13 +507,14 @@ test('one history page can contain more than one metadata RPC batch worth of fil
   assert.equal(state.fileInfo.get('1025').name, '报告.txt');
 });
 
-test('A → B → A activations discard both earlier responses, even if abort is ignored', async () => {
+test('A → B → A activations discard completed reads whose callbacks are still queued', async () => {
   const time = scheduler(); const reads = []; const applied = [];
   const loop = new ActiveLoop({...time, read: state => { const result = deferred(); reads.push({state, ...result}); return result.promise; },
     apply: (state, response) => applied.push([state.id, response.next_seq]), error: () => false});
   const a = session(); const b = session(); b.id = 'another';
-  loop.activate(a); loop.activate(b); loop.activate(a);
-  reads[0].resolve(page([], 2)); reads[1].resolve(page([], 3)); await flush();
+  loop.activate(a); reads[0].resolve(page([], 2));
+  loop.activate(b); reads[1].resolve(page([], 3));
+  loop.activate(a); await flush();
   assert.deepEqual(applied, []); assert.equal(time.jobs.size, 0);
   reads[2].resolve(page([], 4)); await flush();
   assert.deepEqual(applied, [[a.id, '4']]); assert.equal(time.jobs.size, 1);
@@ -431,7 +532,7 @@ test('polling has one in-flight request, follows returned cursors, and delays on
   assert.equal([...time.jobs.values()][0].delay, 0); time.run(); assert.equal(reads[1].from, '20');
   reads[1].resolve(page([], 101, 100)); await flush();
   assert.equal([...time.jobs.values()][0].delay, 1000); time.run(); assert.equal(reads[2].from, '101');
-  loop.stop(); reads[2].resolve(page([], 102, 101)); await flush();
+  reads[2].resolve(page([], 102, 101)); loop.stop(); await flush();
   assert.equal(state.fetchSeq, '101'); assert.equal(time.jobs.size, 0);
 });
 

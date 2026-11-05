@@ -48,7 +48,7 @@ export function createSession(description) {
   return {
     id: description.session_id, name: sessionName(description.name), channelId: decimal(description.channel_id),
     start: decimal(description.scan_start_seq), fetchSeq: description.scan_start_seq,
-    turns: new Map(), order: [], creationIndex: new Map(), fileInfo: new Map(), historySerial: 0,
+    turns: new Map(), order: [], terminalIndex: new Map(), fileInfo: new Map(), historySerial: 0,
     inventory: null, pending: null, text: '', replies: [], files: [], error: '', notice: '', sync: 'waiting',
   };
 }
@@ -63,7 +63,7 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
   const turns = new Map();
   const additions = new Map();
   const order = [];
-  const creationIndex = new Map();
+  const terminalIndex = new Map();
   const objectIds = new Set();
   let previous = null;
   for (const event of events) {
@@ -88,24 +88,25 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     }
     if (payload.kind === 'turn.single' || payload.kind === 'turn.start') {
       const key = turnKey(event.publisher_role, payload.turn_id);
-      if (turns.has(key) || session.turns.has(key) || creationIndex.has(event.event_seq) || session.creationIndex.has(event.event_seq)) throw new Error('Duplicate message creation event');
+      if (turns.has(key) || session.turns.has(key)) throw new Error('Duplicate message creation event');
       const replyTo = list(payload.reply_to_seqs, 'reply references').map(seq => decimal(seq));
       if (new Set(replyTo).size !== replyTo.length) throw new Error('Duplicate reply reference');
       for (const reference of replyTo) {
-        const targetKey = creationIndex.get(reference) ?? session.creationIndex.get(reference);
+        const targetKey = terminalIndex.get(reference) ?? session.terminalIndex.get(reference);
         const target = turns.get(targetKey) ?? session.turns.get(targetKey);
-        if (BigInt(reference) >= seq || !target || !['completed', 'cancelled'].includes(target.state)) {
-          throw new Error('Reply target must be an earlier completed or canceled message');
+        if (BigInt(reference) >= seq || !target || target.state !== 'completed') {
+          throw new Error('Reply target must be an earlier completed message');
         }
       }
       const content = parts(payload.content);
       turns.set(key, {
-        key, role: event.publisher_role, id: payload.turn_id, creationSeq: event.event_seq,
-        replies: replyTo, tailSeq: event.event_seq, contentVersion: 0,
+        key, role: event.publisher_role, id: payload.turn_id, startSeq: event.event_seq,
+        replies: replyTo, tailSeq: event.event_seq, contentVersion: 0, contentSeqs: [event.event_seq],
+        terminalSeq: payload.kind === 'turn.single' ? event.event_seq : null, error: null,
         parts: content, attachments, state: payload.kind === 'turn.single' ? 'completed' : 'open',
       });
       order.push(key);
-      creationIndex.set(event.event_seq, key);
+      if (payload.kind === 'turn.single') terminalIndex.set(event.event_seq, key);
       continue;
     }
     let key;
@@ -114,31 +115,65 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
       key = turnKey(event.publisher_role, payload.turn_id);
       decimal(payload.pre_seq);
     } else throw new Error('Unknown message type');
+    let endSeqs;
+    if (payload.kind === 'turn.end' || payload.kind === 'turn.cancel') decimal(payload.start_seq);
+    if (payload.kind === 'turn.end') {
+      if ('content' in payload || attachments.length) throw new Error('Message end cannot contain content or attachments');
+      if ('error' in payload) {
+        if (payload.error !== 'turn_too_long' || 'content_seqs' in payload) throw new Error('Invalid message end error');
+      } else {
+        endSeqs = list(payload.content_seqs, 'message content sequences').map(value => decimal(value));
+        if (!endSeqs.length || endSeqs.at(-1) !== payload.pre_seq || endSeqs.some((value, index) =>
+          BigInt(value) >= seq || (index > 0 && BigInt(value) <= BigInt(endSeqs[index - 1])))) {
+          throw new Error('Invalid message content sequences');
+        }
+      }
+    }
     const original = turns.get(key) ?? session.turns.get(key);
     if (!original) throw new Error('Missing message creation event');
     const content = ['turn.append', 'turn.reset'].includes(payload.kind) ? parts(payload.content) : [];
     if (payload.kind === 'turn.append' && !content.length && !attachments.length) throw new Error('Message append has no content or attachments');
     if (original.state !== 'open') continue;
+    if ((payload.kind === 'turn.end' || payload.kind === 'turn.cancel') && payload.start_seq !== original.startSeq) {
+      throw new Error('Invalid message creation reference');
+    }
     if (payload.kind !== 'turn.cancel' && payload.pre_seq !== original.tailSeq) throw new Error('Invalid previous message reference');
+    if (endSeqs) {
+      const addedSeqs = additions.get(key)?.contentSeqs || [];
+      const count = original.contentSeqs.length;
+      if (endSeqs.length !== count + addedSeqs.length || endSeqs.some((value, index) =>
+        value !== (index < count ? original.contentSeqs[index] : addedSeqs[index - count]))) {
+        throw new Error('Message content sequences do not match the active content');
+      }
+    }
     let turn;
     if (payload.kind === 'turn.reset') {
-      turn = {...original, parts: content, attachments, contentVersion: original.contentVersion + 1};
+      turn = {...original, parts: content, attachments, contentSeqs: [event.event_seq], contentVersion: original.contentVersion + 1};
+      additions.delete(key);
+    } else if (payload.kind === 'turn.end' && payload.error) {
+      turn = {...original, parts: [], attachments: [], contentSeqs: [], contentVersion: original.contentVersion + 1,
+        state: 'completed', error: payload.error};
       additions.delete(key);
     } else {
       turn = turns.get(key);
       if (!turn) {
         turn = {...original};
-        additions.set(key, {parts: [], attachments: []});
+        additions.set(key, {parts: [], attachments: [], contentSeqs: []});
       }
       // Grow shared arrays only after the whole page has passed validation.
       // New and reset turns already own their arrays and can grow while staging.
       const target = additions.get(key) ?? turn;
       if (payload.kind === 'turn.append') {
         for (const part of content) target.parts.push(part);
+        target.contentSeqs.push(event.event_seq);
       } else {
         turn.state = payload.kind === 'turn.cancel' ? 'cancelled' : 'completed';
       }
       for (const attachment of attachments) target.attachments.push(attachment);
+    }
+    if (payload.kind === 'turn.end' || payload.kind === 'turn.cancel') {
+      turn.terminalSeq = event.event_seq;
+      if (turn.state === 'completed') terminalIndex.set(event.event_seq, key);
     }
     if (payload.kind !== 'turn.cancel') turn.tailSeq = event.event_seq;
     turns.set(key, turn);
@@ -154,11 +189,15 @@ export function applyPage(session, page, requestedSeq = session.fetchSeq) {
     if (added) {
       for (const part of added.parts) turn.parts.push(part);
       for (const attachment of added.attachments) turn.attachments.push(attachment);
+      if (turn.state === 'open') for (const seq of added.contentSeqs) turn.contentSeqs.push(seq);
     }
+    // Terminal turns no longer validate a growing content chain. Replace the
+    // list only on commit; failed pages must leave the previous list intact.
+    if (turn.state !== 'open') turn.contentSeqs = [];
     session.turns.set(key, turn);
   }
   for (const key of order) session.order.push(key);
-  for (const [seq, key] of creationIndex) session.creationIndex.set(seq, key);
+  for (const [seq, key] of terminalIndex) session.terminalIndex.set(seq, key);
   for (const [id, info] of information) if (!session.fileInfo.has(id)) session.fileInfo.set(id, info);
   session.fetchSeq = page.next_seq;
   return turns;

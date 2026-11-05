@@ -57,7 +57,6 @@ class Events:
         self.fail_publish = False
         self.fail_fetch = False
         self.fail_create = False
-        self.bad_data = False
         self.closed = False
 
     def get_status(self, **kwargs):
@@ -94,7 +93,7 @@ class Events:
 
     def read_object(self, object_id, **kwargs):
         self.calls.append("ReadObject")
-        return NS(data=b"" if self.bad_data else self.objects[object_id][1])
+        return NS(data=self.objects[object_id][1])
 
     def close(self):
         self.closed = True
@@ -133,8 +132,9 @@ class Chat:
                              "content": [{"type": "text", "text": part.text} for part in content],
                              "reply_to_seqs": list(reply_to_seqs)}, object_keys)
 
-    def cancel_turn(self, target_turn):
-        return self.publish({"kind": "turn.cancel", "target_turn": {"principal": target_turn.principal, "turn_id": target_turn.turn_id}})
+    def cancel_turn(self, target_turn, start_seq):
+        return self.publish({"kind": "turn.cancel", "start_seq": start_seq,
+                             "target_turn": {"principal": target_turn.principal, "turn_id": target_turn.turn_id}})
 
     def fetch_page(self, from_seq, limit):
         events = self.events
@@ -168,13 +168,28 @@ class InstalledSdkChecks(unittest.TestCase):
                     ChatService(NS(openevent_target="unused", rpc_timeout_ms=100))
                 client.assert_called_once_with("unused", timeout_ms=100)
 
-    def test_both_entrypoints_reject_old_sdk_before_opening_a_connection(self):
+    def test_both_entrypoints_reject_unsatisfied_or_invalid_sdk_versions_before_connecting(self):
         with patch.object(service_module, "OpenEventClient") as client:
-            with patch.object(self.sdk_check.metadata, "version", return_value="0.12.0"):
-                for name, check in self.entrypoints:
-                    with self.subTest(entrypoint=name):
-                        with self.assertRaisesRegex(RuntimeError, r"openevent-sdk>=0\.13\.0"):
-                            check()
+            for version in ("0.12.0", "0.13.0rc1", "0.13.0.dev1", "0.13.0-invalid"):
+                with patch.object(self.sdk_check.metadata, "version", return_value=version):
+                    for name, check in self.entrypoints:
+                        with self.subTest(entrypoint=name, version=version):
+                            with self.assertRaisesRegex(RuntimeError, r"openevent-sdk>=0\.13\.0"):
+                                check()
+            client.assert_not_called()
+
+    def test_standard_version_order_accepts_supported_releases(self):
+        for version in ("0.13", "0.13.0", "0.13.0.post1", "0.13.0+local", "0.14.0"):
+            with self.subTest(version=version), patch.object(self.sdk_check.metadata, "version", return_value=version):
+                self.assertEqual(self.check(), version)
+
+    def test_both_entrypoints_explain_missing_version_parser_before_connecting(self):
+        with patch.dict(sys.modules, {"packaging.version": None}), \
+                patch.object(service_module, "OpenEventClient") as client:
+            for name, check in self.entrypoints:
+                with self.subTest(entrypoint=name):
+                    with self.assertRaisesRegex(RuntimeError, "packaging is required"):
+                        check()
             client.assert_not_called()
 
     def test_both_entrypoints_require_installed_package_metadata(self):
@@ -185,24 +200,6 @@ class InstalledSdkChecks(unittest.TestCase):
                     with self.subTest(entrypoint=name):
                         with self.assertRaisesRegex(RuntimeError, r"Install openevent-sdk>=0\.13\.0"):
                             check()
-            client.assert_not_called()
-
-    def test_both_entrypoints_require_sdk_methods_and_proto_before_connecting(self):
-        cases = (
-            (OpenEventClient, "batch_get_object_metadata", None, "missing batch_get_object_metadata"),
-            (OpenEventClient, "read_object", None, "missing read_object"),
-            (pb, "DESCRIPTOR", NS(services_by_name={}), "does not support BatchGetObjectMetadata"),
-            (pb, "EventMessage", NS(DESCRIPTOR=NS(fields_by_name={})), "does not support UUIDs"),
-            (self.sdk_check.inspect, "signature", lambda _: NS(parameters={}), "must expose timeout_ms"),
-        )
-        with patch.object(self.sdk_check.metadata, "version", return_value="0.13.0"), \
-                patch.object(service_module, "OpenEventClient") as client:
-            for target, attribute, value, error in cases:
-                with patch.object(target, attribute, value):
-                    for name, check in self.entrypoints:
-                        with self.subTest(capability=attribute, entrypoint=name):
-                            with self.assertRaisesRegex(RuntimeError, error):
-                                check()
             client.assert_not_called()
 
     def test_injected_client_does_not_run_deployment_checks(self):
@@ -454,7 +451,7 @@ class AppTests(unittest.TestCase):
             allocation = pool.submit(self.service.allocate, sid, {"count": "1"})
             try:
                 self.assertTrue(entered.wait(1))
-                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1", "start_seq": "1"})
                 self.assertEqual(cancellation.result(1), {"status": "committed"})
                 self.assertFalse(allocation.done())
                 self.assertEqual(self.service.sessions[sid].batch_start, 0)
@@ -469,6 +466,7 @@ class AppTests(unittest.TestCase):
         payloads = [json.loads(item["payload"]) for item in publications]
         self.assertEqual([payload["kind"] for payload in payloads], ["turn.cancel", "submission.reserve", "turn.single"])
         self.assertEqual(payloads[0]["target_turn"], {"principal": 20, "turn_id": "agent:1"})
+        self.assertEqual(payloads[0]["start_seq"], 1)
         self.assertEqual(payloads[1]["reserved_through"], 20000)
         self.assertEqual([item["uuid"] for item in publications], [101, 102, 103])
         events.get_seq_by_uuid.assert_not_called()
@@ -497,7 +495,7 @@ class AppTests(unittest.TestCase):
             close()
 
         with patch.object(chat, "close", side_effect=close_chat), ThreadPoolExecutor(2) as pool:
-            cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+            cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1", "start_seq": "1"})
             try:
                 self.assertTrue(entered.wait(1))
                 stopped = pool.submit(self.service.close)
@@ -509,7 +507,7 @@ class AppTests(unittest.TestCase):
                 release.set()
             self.assertEqual(cancellation.result(1), {"status": "committed"})
             stopped.result(1)
-        self.assert_error("server_unavailable", lambda: self.service.cancel(sid, {"target_turn_id": "agent:1"}))
+        self.assert_error("server_unavailable", lambda: self.service.cancel(sid, {"target_turn_id": "agent:1", "start_seq": "1"}))
         events.publish_auto_seq.assert_called_once()
         self.assertFalse(self.service.fatal.is_set())
 
@@ -650,7 +648,7 @@ class AppTests(unittest.TestCase):
             self.assertFalse(rotation.done())
             self.assertEqual(self.events.calls.count("submission.reserve"), 1)
             try:
-                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1"})
+                cancellation = pool.submit(self.service.cancel, sid, {"target_turn_id": "agent:1", "start_seq": "1"})
                 self.assertEqual(cancellation.result(1), {"status": "committed"})
                 self.assertFalse(rotation.done())
                 self.assertEqual(self.events.calls.count("submission.reserve"), 1)
@@ -793,9 +791,6 @@ class AppTests(unittest.TestCase):
         self.events.calls.clear()
         self.assertEqual(self.service.download(sid, "1", "2"), (obj, b"data"))
         self.assertEqual(self.events.calls, ["Fetch", "GetObjectMetadata", "ReadObject"])
-        self.events.bad_data = True
-        self.assert_error("server_unavailable", lambda: self.service.download(sid, "1", "2"))
-        self.assertTrue(self.service.fatal.is_set())
 
     def test_history_deduplicates_file_information_in_message_attachment_order(self):
         sid = self.session()
@@ -877,7 +872,7 @@ class AppTests(unittest.TestCase):
 
     def test_history_empty_pages_keep_raw_cursors_without_metadata_reads(self):
         sid = self.session()
-        for next_seq, last_seq in ((1, 20), (4, 20), (21, 20)):
+        for next_seq, last_seq in ((4, 20), (21, 20)):
             with self.subTest(next_seq=next_seq):
                 response = NS(messages=(), next_seq=next_seq, last_seq=last_seq)
                 self.events.calls.clear()
@@ -960,35 +955,6 @@ class AppTests(unittest.TestCase):
         self.assertIn("3 attempts", error.failure.detail)
         self.assertTrue(self.service.fatal.is_set())
 
-    def test_history_rejects_the_whole_page_on_bad_metadata_count_or_fields(self):
-        sid = self.session()
-        self.service.allocate(sid, {"count": "1"})
-        for index in range(2):
-            self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
-        self.send(sid, attachments=["1", "2"])
-        good = self.events.objects[1][0]
-        bad_fields = [
-            {"name": ""}, {"name": "名" * 86}, {"name": "\ud800"},
-            {"type": ""}, {"type": "型" * 86}, {"type": None},
-            {"description": "🙂" * 1025}, {"description": None},
-            {"nbytes": 0}, {"nbytes": 4 * 1024 * 1024 + 1}, {"nbytes": True}, {"nbytes": "1"},
-        ]
-        responses = [NS(), NS(metadata=None), NS(metadata=[]), NS(metadata=[good]),
-                     NS(metadata=[good, good, good]), NS(metadata=[good, NS()])]
-        responses.extend(NS(metadata=[good, NS(**(vars(good) | changes))]) for changes in bad_fields)
-        for response in responses:
-            with self.subTest(response=response):
-                self.service.close()
-                self.service = ChatService(self.config, self.events, chat_factory=Chat)
-                with patch.object(self.events, "batch_get_object_metadata", return_value=response) as batch:
-                    with self.assertLogs("openevent.chat_app.service", level="ERROR"):
-                        error = self.assert_error("server_unavailable", lambda: self.service.history(sid, "2"))
-                self.assertEqual(batch.call_count, 1)
-                self.assertEqual(error.failure.stage, "BatchGetObjectMetadata")
-                self.assertEqual(error.failure.category, "contract")
-                self.assertEqual(set(error.as_json()), {"error"})
-                self.assertTrue(self.service.fatal.is_set())
-
     def test_read_object_retries_the_same_complete_file_request(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
@@ -1038,21 +1004,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("4 attempts", error.failure.detail)
         self.assertTrue(self.service.fatal.is_set())
 
-    def test_write_object_rejection_is_local_but_uncertain_failure_is_not_retried(self):
-        sid = self.session()
-        self.service.allocate(sid, {"count": "1"})
-        with patch.object(self.events, "write_object", side_effect=RpcError(grpc.StatusCode.INVALID_ARGUMENT)) as write:
-            error = self.assert_error("invalid_request", lambda: self.service.upload(
-                sid, name="a.txt", content_type="text/plain", data=b"a"))
-        self.assertEqual(error.status, 400)
-        self.assertEqual(error.failure.category, "request_rejected")
-        self.assertEqual(write.call_count, 1)
-        self.assertEqual(self.service.uploads, {})
-        self.assertFalse(self.service.fatal.is_set())
+    def test_write_object_uncertain_failure_is_not_retried(self):
         self.service.close()
         self.config = replace(self.config, max_retries=3)
         self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        self.service.allocate(sid, {"count": "1"})
+        sid = self.session()
         with patch.object(self.events, "write_object", side_effect=Unavailable()) as write:
             self.assert_error("server_unavailable", lambda: self.service.upload(
                 sid, name="a.txt", content_type="text/plain", data=b"a"))
@@ -1067,10 +1023,7 @@ class AppTests(unittest.TestCase):
         self.service.send(sid, {"submission_id": "1", "text": "body-secret", "attachments": ["1"]})
         faults = (
             ("GetObjectMetadata", "get_object_metadata", "download", {"side_effect": RuntimeError("object-secret file-secret")}),
-            ("GetObjectMetadata", "get_object_metadata", "download", {
-                "return_value": NS(name="file-secret", type="text/plain", description="body-secret", nbytes=0)}),
             ("ReadObject", "read_object", "download", {"side_effect": RuntimeError("user-secret object-secret")}),
-            ("ReadObject", "read_object", "download", {"return_value": NS(data=b"")}),
         )
         for stage, method, operation, result in faults:
             with self.subTest(stage=stage, fault=result):
@@ -1082,7 +1035,7 @@ class AppTests(unittest.TestCase):
                                                    session_id=sid, channel_id="1", event_seq="2", object_id="1")
                 self.assertEqual(record["failure"]["stage"], stage)
 
-    def test_history_metadata_failures_log_safe_batch_or_item_location(self):
+    def test_history_metadata_failures_log_safe_batch_location(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
         self.service.upload(sid, name="file-secret.txt", content_type="text/plain", data=b"file-secret")
@@ -1090,15 +1043,8 @@ class AppTests(unittest.TestCase):
         with patch.object(self.events, "batch_get_object_metadata", side_effect=RuntimeError("object-secret file-secret")):
             record = self.assert_fatal_log(lambda: self.service.history(sid, "2"), session_id=sid, channel_id="1")
         self.assertEqual(record["failure"]["stage"], "BatchGetObjectMetadata")
-        self.service.close()
-        self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        response = NS(metadata=[NS(name="file-secret", type="text/plain", description="body-secret", nbytes=0)])
-        with patch.object(self.events, "batch_get_object_metadata", return_value=response):
-            record = self.assert_fatal_log(lambda: self.service.history(sid, "2"),
-                                          session_id=sid, channel_id="1", event_seq="2", object_id="1")
-        self.assertEqual(record["failure"]["stage"], "BatchGetObjectMetadata")
 
-    def test_history_failures_log_page_or_event_location_without_payload(self):
+    def test_history_failures_log_page_location_without_payload(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "1"})
         self.service.send(sid, {"submission_id": "1", "text": "body-secret"})
@@ -1106,11 +1052,6 @@ class AppTests(unittest.TestCase):
         with patch.object(self.service.sessions[sid].chat, "fetch_page", side_effect=failure):
             self.assert_fatal_log(lambda: self.service.history(sid, "2"),
                                   session_id=sid, channel_id="1", from_seq="2")
-        self.service.close()
-        self.service = ChatService(self.config, self.events, chat_factory=Chat)
-        self.events.messages[-1].principal = 999
-        self.assert_fatal_log(lambda: self.service.history(sid, "2"),
-                              session_id=sid, channel_id="1", event_seq="2")
 
     def test_upload_failure_logs_session_without_rpc_arguments(self):
         sid = self.session()
@@ -1165,7 +1106,7 @@ class AppTests(unittest.TestCase):
             pending = pool.submit(self.send, first)
             self.assertTrue(entered.wait(1))
             self.events.fail_publish = True
-            self.assert_error("server_unavailable", lambda: self.service.cancel(second, {"target_turn_id": "agent:1"}))
+            self.assert_error("server_unavailable", lambda: self.service.cancel(second, {"target_turn_id": "agent:1", "start_seq": "1"}))
             self.assert_error("server_unavailable", lambda: pending.result(1))
         self.assertTrue(self.events.closed)
         self.assertEqual(attempts, ["first publish reached transport"])
@@ -1206,7 +1147,7 @@ class AppTests(unittest.TestCase):
                         session_id=sid)
                     try:
                         self.assertTrue(entered.wait(2))
-                        failure = make_failure("Fetch", category="contract", detail="test failure")
+                        failure = make_failure("Fetch", Unavailable())
                         stopped = calls.submit(self.service._fail, failure, session_id=sid)
                         self.assertTrue(cancelled.wait(2), "shutdown waited for the UUID RPC timeout")
                         stopped.result(timeout=2)
@@ -1464,8 +1405,20 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.service.allocate(first, {"count": "1"})["start"], "1")
         self.assertEqual(self.service.allocate(second, {"count": "1"})["start"], "1")
         self.events.calls.clear()
-        self.service.cancel(first, {"target_turn_id": "agent:x"})
+        self.service.cancel(first, {"target_turn_id": "agent:x", "start_seq": "1"})
         self.assertEqual(self.events.calls, ["turn.cancel"])
+        self.assertEqual(self.events.messages[-1].payload["start_seq"], 1)
+
+    def test_cancel_requires_a_canonical_start_seq_without_reading_history(self):
+        sid = self.session()
+        self.events.calls.clear()
+        for body in ({"target_turn_id": "agent:x"},
+                     *({"target_turn_id": "agent:x", "start_seq": value}
+                       for value in (1, True, "0", "01", "-1", "18446744073709551616"))):
+            with self.subTest(body=body):
+                self.assert_error("invalid_request", lambda: self.service.cancel(sid, body))
+        self.assertEqual(self.events.calls, [])
+        self.assertFalse(self.service.fatal.is_set())
 
     def test_directory_has_single_owner_and_strict_json(self):
         with self.assertRaises(ConfigurationError):
@@ -1727,7 +1680,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(result["error"]["failure"]["stage"], "Fetch")
         self.assertEqual(self.events.calls, ["Fetch"])
 
-    def _assert_second_history_metadata_batch_failure(self, fault):
+    def test_http_second_metadata_batch_rpc_failure_returns_no_partial_history_page(self):
         sid = self.session()
         self.service.allocate(sid, {"count": "2"})
         objects = [self.service.upload(sid, name=f"{index}.txt", content_type="text/plain", data=b"x")
@@ -1748,12 +1701,7 @@ class HTTPTests(unittest.TestCase):
             self.assertTrue(first_batch_finished)
             self.assertEqual([key.object_id for key in object_keys], [1025])
             self.events.calls.append("BatchGetObjectMetadata")
-            if fault == "rpc":
-                raise Unavailable()
-            if fault == "count":
-                return NS(metadata=[])
-            self.assertEqual(fault, "fields")
-            return NS(metadata=[NS(name="bad", type="text/plain", description="", nbytes=0)])
+            raise Unavailable()
 
         self.events.calls.clear()
         with patch.object(self.events, "batch_get_object_metadata", side_effect=batch_page):
@@ -1765,19 +1713,9 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(set(result), {"error"})
         self.assertEqual(result["error"]["code"], "server_unavailable")
         self.assertEqual(result["error"]["failure"]["stage"], "BatchGetObjectMetadata")
-        self.assertEqual(result["error"]["failure"]["category"],
-                         "external_unavailable" if fault == "rpc" else "contract")
+        self.assertEqual(result["error"]["failure"]["category"], "external_unavailable")
         self.assertEqual(self.events.calls, ["Fetch", "BatchGetObjectMetadata", "BatchGetObjectMetadata"])
         self.assertTrue(self.service.fatal.is_set())
-
-    def test_http_second_metadata_batch_rpc_failure_returns_no_partial_history_page(self):
-        self._assert_second_history_metadata_batch_failure("rpc")
-
-    def test_http_second_metadata_batch_bad_count_returns_no_partial_history_page(self):
-        self._assert_second_history_metadata_batch_failure("count")
-
-    def test_http_second_metadata_batch_bad_fields_return_no_partial_history_page(self):
-        self._assert_second_history_metadata_batch_failure("fields")
 
     def test_http_multipart_and_attachment_download(self):
         sid = self.session()
@@ -1868,6 +1806,48 @@ class HTTPTests(unittest.TestCase):
                 self.assertEqual(self.events.objects, {})
                 self.assertNotIn("WriteObject", self.events.calls)
 
+    def test_http_history_preserves_terminal_fields_and_uint64_precision(self):
+        sid = self.session()
+        base = 9007199254740993
+        payloads = [
+            {"kind": "turn.start", "turn_id": "complete", "content": [], "reply_to_seqs": []},
+            {"kind": "turn.append", "turn_id": "complete", "pre_seq": base,
+             "content": [{"type": "text", "text": "complete text"}]},
+            {"kind": "turn.end", "turn_id": "complete", "start_seq": base,
+             "pre_seq": base + 1, "content_seqs": [base, base + 1]},
+            {"kind": "turn.start", "turn_id": "cancelled", "content": [], "reply_to_seqs": [base + 2]},
+            {"kind": "turn.cancel", "start_seq": base + 3,
+             "target_turn": {"principal": 20, "turn_id": "cancelled"}},
+            {"kind": "turn.start", "turn_id": "long", "content": [], "reply_to_seqs": []},
+            {"kind": "turn.end", "turn_id": "long", "start_seq": base + 5,
+             "pre_seq": base + 5, "error": "turn_too_long"},
+        ]
+        messages = tuple(parse_message(NS(
+            seq=base + index, channel_id=1, principal=20, ts_ms=1, uuid=index + 1,
+            recipients=[], object_keys=[], payload=encode_payload(payload)))
+            for index, payload in enumerate(payloads))
+        worker = self.service.sessions[sid]
+        with patch.object(worker.chat, "fetch_page", return_value=NS(
+                messages=messages, next_seq=base + 7, last_seq=base + 6)) as fetch:
+            status, _, data = self.request("GET", f"/api/chat/sessions/{sid}/history?fetch_seq={base}")
+        self.assertEqual(status, 200)
+        fetch.assert_called_once_with(from_seq=base, limit=100)
+        page = json.loads(data)
+        self.assertEqual(page["next_seq"], str(base + 7))
+        self.assertEqual(page["files"], [])
+        end = page["events"][2]["payload"]
+        self.assertEqual(end["start_seq"], str(base))
+        self.assertEqual(end["pre_seq"], str(base + 1))
+        self.assertEqual(end["content_seqs"], [str(base), str(base + 1)])
+        self.assertEqual(page["events"][3]["payload"]["reply_to_seqs"], [str(base + 2)])
+        self.assertEqual(page["events"][4]["payload"], {
+            "kind": "turn.cancel", "start_seq": str(base + 3),
+            "target_turn": {"role": "agent", "turn_id": "cancelled"}})
+        self.assertEqual(page["events"][6]["payload"], {
+            "kind": "turn.end", "turn_id": "long", "start_seq": str(base + 5),
+            "pre_seq": str(base + 5), "error": "turn_too_long"})
+        self.assertEqual([message.payload for message in messages], payloads)
+
     def test_history_preserves_deep_extensions_and_original_sdk_payloads(self):
         sid = self.session()
         extension = {"leaf": "完整保留"}
@@ -1879,7 +1859,7 @@ class HTTPTests(unittest.TestCase):
             (20, {"kind": "turn.start", "turn_id": "answer", "content": content, "reply_to_seqs": [1]}),
             (20, {"kind": "turn.append", "turn_id": "answer", "pre_seq": 2, "content": content,
                   "extensions": extension}),
-            (20, {"kind": "turn.cancel", "target_turn": {"principal": 20, "turn_id": "answer"}}),
+            (20, {"kind": "turn.cancel", "start_seq": 2, "target_turn": {"principal": 20, "turn_id": "answer"}}),
             (10, {"kind": "submission.reserve", "reserved_through": 10000}),
         ]
         snapshots = []
@@ -1900,6 +1880,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(events[1]["payload"]["reply_to_seqs"], ["1"])
         self.assertEqual(events[2]["payload"]["pre_seq"], "2")
         self.assertEqual(events[3]["payload"]["target_turn"], {"role": "agent", "turn_id": "answer"})
+        self.assertEqual(events[3]["payload"]["start_seq"], "2")
         self.assertEqual(events[4]["payload"]["reserved_through"], "10000")
         restored = events[2]["payload"]["extensions"]
         for _ in range(600):

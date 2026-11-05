@@ -36,6 +36,10 @@ class FetchPageError(_FailureError):
     pass
 
 
+class TurnContentError(_FailureError):
+    pass
+
+
 class UuidAllocationError(_FailureError):
     pass
 

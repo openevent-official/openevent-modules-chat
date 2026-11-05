@@ -12,6 +12,7 @@ dependencies = [
     "openevent-sdk>=0.13.0",
     "multipart>=2.0,<3",
     "filelock>=3.16,<4",
+    "packaging>=23.2",
 ]
 
 [project.scripts]

@@ -5,7 +5,7 @@
 本文只给出最小调用示例。完整的公开 API、重试和生命周期规则见
 [CHAT_SDK_cn.md](CHAT_SDK_cn.md)。
 
-以下示例使用按创建事件 seq 回复、独立写入对象、从已知状态继续 turn、空内容 start 与 reset 接口。
+以下示例使用正常终态 seq 回复、定点内容读取、独立写入对象、从已知状态继续 turn、空内容 start 与 reset 接口。
 
 ## 运行前提
 
@@ -34,7 +34,7 @@ OpenEvent client 或它的 gRPC channel。
 ## 写入与读取
 
 ```python
-user_creation_seq = chat.single_turn(
+user_start_seq = chat.single_turn(
     turn_id="user-1",
     reply_to_seqs=(),
     content=(TextPart("你好"),),
@@ -42,10 +42,9 @@ user_creation_seq = chat.single_turn(
 
 writer = chat.start_turn(
     turn_id="reply-1",
-    reply_to_seqs=(user_creation_seq,),
+    reply_to_seqs=(user_start_seq,),
     content=(TextPart("你好"),),
 )
-reply_creation_seq = writer.creation_seq
 writer.append(content=(TextPart("，很高兴见到你。"),))
 reply_end_seq = writer.complete()
 del writer
@@ -65,23 +64,38 @@ while True:
 持续读取也由应用组织读取和处理循环；
 到达尾部后的等待和停止条件见[单页读取契约](CHAT_SDK_cn.md#32-一次读取一页)。
 
-保存 `single_turn` 返回的 seq，或 `start_turn` 返回对象的 `creation_seq`；确认目标已结束后，回复时传入 `reply_to_seqs`。
+保存 `single_turn` 或 `writer.complete()` 返回的 seq；确认它是目标的有效 completed 终态后，回复时传入 `reply_to_seqs`。不能引用 start 或取消事件。
 SDK 只检查字段形状，不读取历史核验目标；调用方按 [协议第 12 节](CHAT_PROTOCOL_cn.md#12-回复关系) 选择合法目标。
 
 流式 turn 使用 `start_turn` 取得写入对象，然后零次或多次调用它的 `append()`，最后调用 `complete()`。
-写入对象保存自己的链尾，client 不保存 turn 状态；完成后可释放对象。使用 `cancel_turn` 记录对既有 TurnRef 的取消；正常读取观察到有效取消后，
+写入对象保存自己的链尾，client 不保存 turn 状态；完成后可释放对象。使用 `cancel_turn(target_turn=..., start_seq=...)` 记录取消；正常读取观察到有效取消后，
 调用方停止续写并释放对应对象，释放本身不发布事件或撤销在途请求。
 输出中途生成文件时，参见[写入 API 的追加附件示例](CHAT_SDK_cn.md#5-写入-api)。
 
+## 按终态位置读取内容
+
+已通过正常读取确认 `reply_end_seq` 是有效结束位置时，可以单独取得该 turn：
+
+```python
+turn = chat.get_turn_content(reply_end_seq)
+print(turn.state, turn.error, "".join(part.text for part in turn.content))
+for attachment in turn.attachments:
+    print(attachment.event_seq, attachment.object_key.object_id)
+```
+
+single、end 和 cancel 均可读取；读取范围和结果字段见[定点读取契约](CHAT_SDK_cn.md#33-按终态位置读取内容)。
+它不读取附件文件信息或文件内容，也不替代未结束 turn 的恢复。
+
 ## 继续未结束的 turn
 
-应用已经通过自己的读取器确认 turn 尚未结束，并知道创建位置和当前链尾时，可以直接构造写入对象：
+应用已经通过自己的读取器确认 turn 尚未结束，并知道创建位置、当前链尾和有效内容事件位置时，可以直接构造写入对象：
 
 ```python
 from openevent.chat_sdk import TurnWriter
 
 # 已从应用投影确认该 turn 的状态，并完成旧写入交接。
-writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+writer = TurnWriter(chat, turn_id="unfinished-1", start_seq=210, last_seq=217,
+                    content_seqs=(210, 214, 217))
 writer.append(content=(TextPart("继续之前的回复。"),))
 writer.complete()
 ```
@@ -97,7 +111,7 @@ writer.complete()
 ```python
 writer = chat.start_turn(
     turn_id="retryable-reply-1",
-    reply_to_seqs=(user_creation_seq,),
+    reply_to_seqs=(user_start_seq,),
     content=(),
 )
 writer.append(content=(TextPart("中断前的部分内容"),))

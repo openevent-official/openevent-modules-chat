@@ -30,13 +30,9 @@ must not change base turn semantics.
 OpenEvent does not parse JSON payloads. This document defines protocol conformance without requiring applications to reject, skip, display, or stop processing
 invalid or conflicting history in any particular way.
 
-This specification uses `reply_to_seqs`; the old `reply_to_turns` field is not part of it. The original `chat.v1` name remains in use. There is no dual reading
-of old fields, automatic conversion, or migration of old history.
-
-The protocol includes `turn.reset` and the empty-content writing rules in Section 4; Section 8 defines reset completely.
-Channels continue to use `chat.v1`, and existing valid history retains its original meaning. Before sending events using these extensions, operators must ensure
-that the relevant SDKs, backends, browsers, and other readers support this specification. This specification provides no capability negotiation and does not
-guarantee that older readers can process the new kind or the new empty-content conditions.
+This specification retains the `chat.v1` name but is incompatible with older creation-event reply references, ends without content manifests, and cancels without creation positions. The old `reply_to_turns` field is also excluded.
+There is no dual reading, automatic conversion, migration of old history, or capability negotiation. All SDKs, backends, browsers, and other readers and writers in a deployment must adopt this specification together.
+Sections 8, 9, and 12 respectively define streaming reset, end manifests, and reply targets.
 
 ## 2. Channels and OpenEvent Fields
 
@@ -60,9 +56,9 @@ OpenEvent top-level fields retain their native semantics:
   a reply reference, or a payload field. UUID allocation, consumption, duplicate rejection, and uncertain outcomes are defined solely by the OpenEvent API contract.
 - `EventMessage.recipients` may carry application semantics freely within OpenEvent server-side publish validation rules.
   `chat.v1` does not require it to be empty, constant within a turn, or consistent with reply relationships.
-- Turn events may have nonempty `EventMessage.object_keys`; object contents and their presentation meaning are application-defined. The base protocol does not
+- Turn events other than `turn.end` may have nonempty `EventMessage.object_keys`; object contents and their presentation meaning are application-defined. The base protocol does not
   associate an ObjectKey with a particular content part. Section 8 defines how reset replaces the current attachment set without changing ObjectKey access
-  or retention semantics. `submission.reserve` must have empty `object_keys`.
+  or retention semantics. `turn.end` and `submission.reserve` must have empty `object_keys`.
 
 OpenEvent recipients are a filter, not an ACL. Readers that need to reconstruct a complete conversation should read the Channel with
 `only_my_recipient=false`.
@@ -100,12 +96,12 @@ TurnRef uses exact `(principal, turn_id)` comparison. The event location already
 storage index is `(channel_id, principal, turn_id)`. Writers must not create two turns with the same `turn_id` under the same principal in the same Channel.
 Different principals may use the same `turn_id`; those are different turns.
 
-Payload positions that reference OpenEvent seq include `pre_seq` and each element of `reply_to_seqs`. All use JSON integers in the range
+Payload positions that reference OpenEvent seq include `start_seq`, `pre_seq`, and each element of `content_seqs` and `reply_to_seqs`. All use JSON integers in the range
 `1..18446744073709551615`, a nonzero `uint64`; strings, booleans, and fractional numbers are not allowed. `pre_seq` points to the preceding node in a streaming
 turn chain. Section 12 defines reply targets and reply semantics.
 
 Unknown top-level payload fields are not part of `chat.v1`. Application data must be placed in `extensions`. Extension values may be any JSON value, but must
-remain participant-visible metadata and must not redefine `kind`, `turn_id`, `pre_seq`, `reply_to_seqs`, `reserved_through`, TurnRef, reply, content, terminal-state,
+remain participant-visible metadata and must not redefine `kind`, `turn_id`, `start_seq`, `pre_seq`, `content_seqs`, `error`, `reply_to_seqs`, `reserved_through`, TurnRef, reply, content, terminal-state,
 or number-reservation semantics.
 Base readers need only establish that extensions form a valid JSON object; they need not convert its values into their language's numbers or objects. Forwarding
 must preserve extension data, whose interpretation belongs to the application.
@@ -172,7 +168,7 @@ Rules:
   another creation event of either kind is a protocol conflict.
 
 `turn.single` permanently determines TurnRef, owner, `reply_to_seqs`, complete content, and the completed terminal state. It has no `pre_seq`; its OpenEvent
-`seq` is simultaneously the turn's `creation_seq`, `start_seq`, and `terminal_seq`. A later `turn.end` is neither needed nor able to complete it again.
+`seq` is simultaneously the turn's `start_seq` and `terminal_seq`. A later `turn.end` is neither needed nor able to complete it again.
 
 ## 6. `turn.start`
 
@@ -201,8 +197,8 @@ Rules:
 - Only one creation event may exist for the same owner principal and `turn_id` in a Channel. If an earlier `turn.single` or `turn.start` exists,
   another creation event of either kind is a protocol conflict.
 
-`turn.start` permanently determines the turn's TurnRef, owner, and `reply_to_seqs`. It has no `pre_seq`; its OpenEvent `seq` is the turn's `creation_seq`
-and `start_seq`, and the starting point for the subsequent append/reset/end chain.
+`turn.start` permanently determines the turn's TurnRef, owner, and `reply_to_seqs`. It has no `pre_seq`; its OpenEvent `seq` is the turn's `start_seq`
+and the starting point for the subsequent append/reset/end chain.
 
 ## 7. `turn.append`
 
@@ -267,8 +263,8 @@ Current-content replacement rules:
   and presentation of later events, but must not reincorporate attachments from events preceding reset into the current set. `object_keys` remains an OpenEvent
   top-level field; no payload field with that name is added.
 - `content` and top-level `object_keys` may both be empty. The turn still exists and remains streaming; it simply has no current text or attachments.
-- Reset does not change owner, TurnRef, `creation_seq`, `start_seq`, or the creation event's `reply_to_seqs`. Ordering and reference positions based on the
-  creation seq remain unchanged. Once this turn is terminal, replies to it still reference its original creation event; reset's seq cannot become a new reply target.
+- Reset does not change owner, TurnRef, `start_seq`, or the creation event's `reply_to_seqs`, nor ordering by creation position.
+  A reset seq is not a reply target; Section 12 defines reply targets after completion.
 - Old start, append, and reset events and their object references remain in immutable history. Reset deletes no objects, revokes no access, and undoes no
   application side effects that have already occurred. Live reading and replay from the beginning must derive the same current text, attachment boundary,
   chain tail, and terminal state from the same event prefix.
@@ -287,29 +283,52 @@ If cancel already took effect at seq 104, the reset and later events in this tab
 
 ## 9. `turn.end`
 
-`turn.end` normally completes a turn owned by the publishing principal.
+`turn.end` completes a streaming turn owned by the publishing principal. A normal end records effective content-event positions, without repeating the body or attachments:
 
 ```json
 {
   "kind": "turn.end",
   "turn_id": "turn-user-1",
-  "pre_seq": 123403
+  "start_seq": 123401,
+  "pre_seq": 123403,
+  "content_seqs": [123401, 123402, 123403]
 }
 ```
 
 Rules:
 
-- To affect turn state, the target TurnRef must have been created by an earlier `turn.start` in the same Channel and must not be terminal.
-  A turn created by `turn.single` is already completed, so later `turn.end` events have no turn-state effect.
-- For a nonterminal streaming turn, `pre_seq` must be present and equal the OpenEvent `seq` of its current valid chain tail: `turn.start`, `turn.append`, or `turn.reset`.
-- Except for optional `extensions`, the payload must contain exactly `kind`, `turn_id`, and `pre_seq`; therefore it must not contain
-  `content`, `reply_to_seqs`, or `target_turn`.
-- The event records completion only; it does not repeat a final content snapshot.
+- Apart from optional `extensions`, the common required fields are `kind`, `turn_id`, `start_seq`, and `pre_seq`, plus exactly one of
+  `content_seqs` or `error`. Neither `content`, `reply_to_seqs`, nor `target_turn` is allowed, and top-level `object_keys` must be empty.
+- To affect state, the target must be an earlier, nonterminal streaming turn in the same Channel, and the publisher must be its owner.
+  `start_seq` must equal its `turn.start.seq`; `pre_seq` must equal the current effective start, append, or reset chain tail.
+- A normal end's `content_seqs` must be a nonempty, strictly increasing array of nonzero uint64 JSON integers.
+  Every entry satisfies `start_seq <= seq <= pre_seq`, and the final entry must equal `pre_seq`.
+- The list must exactly identify all events contributing current content: start and all subsequent effective appends if there was no effective reset,
+  or the last effective reset and all subsequent effective appends otherwise. Events replaced by reset are excluded; an empty start or reset must still appear,
+  even when it has neither content nor attachments. Listed events must belong to this TurnRef and follow its effective chain, with no missing or extra events.
+  A first entry naming start equals `start_seq`; otherwise it must name this turn's effective reset.
+- There is no separate item-count limit; the complete payload remains subject to OpenEvent's size limit. The
+  [SDK writer contract](CHAT_SDK.md#51-independent-writers) defines handling when a normal end manifest is too large.
+
+When an oversized normal end manifest cannot be committed, a small error end can be used:
+
+```json
+{
+  "kind": "turn.end",
+  "turn_id": "turn-user-1",
+  "start_seq": 123401,
+  "pre_seq": 123403,
+  "error": "turn_too_long"
+}
+```
+
+The only allowed `error` value is the string `turn_too_long`; `content_seqs` must be absent. This end also enters completed and may be replied to.
+Its final body and attachments are empty; readers must not continue presenting previously accumulated partial content as its final content. Historical events and objects remain.
+Error ends follow the same owner, chain-tail, and earliest-terminal rules as normal ends.
 
 ## 10. `turn.cancel`
 
-`turn.cancel` independently cancels an existing turn. Because the cancelling principal need not be the owner, the payload identifies the target with a full
-`target_turn` TurnRef.
+`turn.cancel` independently terminates an existing turn without waiting for its owner to send end. Since the canceller need not be the owner, it carries both the full target identity and its creation position:
 
 ```json
 {
@@ -317,76 +336,57 @@ Rules:
   "target_turn": {
     "principal": 9002,
     "turn_id": "turn-agent-1"
-  }
+  },
+  "start_seq": 123401
 }
 ```
 
-Rules:
-
-- `target_turn` must be present and be a valid TurnRef, and its target must already have been created in the same Channel by an earlier `turn.single` or `turn.start`.
-- Except for optional `extensions`, the payload must contain exactly `kind` and `target_turn`; therefore it must not contain top-level `turn_id`, `pre_seq`,
-  `content`, or `reply_to_seqs`.
-- Any principal permitted by OpenEvent to publish to the Channel may publish it. The publisher need not equal `target_turn.principal`, and the protocol
-  need not know whether it is a user or Agent.
-- Cancel is itself a terminal event and requires no later `turn.end` confirmation.
+- Apart from optional `extensions`, the payload must contain exactly `kind`, `target_turn`, and `start_seq`.
+  It contains no `pre_seq`, `content`, `content_seqs`, `error`, or `reply_to_seqs`.
+- `target_turn` must be a valid TurnRef, and `start_seq` must equal that target's earlier single/start creation-event seq in the same Channel.
+- Any principal permitted to publish to the Channel may cancel; it need not be the owner, and no user or Agent role is required.
+- Cancel contains no effective-content manifest and participates immediately in Section 11's earliest-terminal decision. When effective, it retains prior effective content and includes its own top-level attachments.
+  A cancel targeting an already terminal turn has no state effect.
 
 ## 11. Chain and Terminal-State Semantics
 
-Turns have two content and terminal-state forms:
+A `turn.single` is both its creation event and completed terminal event. A streaming turn's start, effective appends/resets, and effective end form a single `pre_seq` chain:
 
-- A turn created by `turn.single` has no append chain; the event supplies all content and normally completes the turn at the same seq.
-- A streaming turn created by `turn.start` uses the following `pre_seq` single chain and is terminated by a later `turn.end` or `turn.cancel`.
+- Start is the head, without a predecessor, and its seq is the first chain tail.
+- Each subsequent append, reset, or end points to the current tail; before the earliest terminal event, a predecessor cannot have multiple successors.
+- Cancel identifies the target using `target_turn` and `start_seq`; it is not a chain successor and has no `pre_seq`.
 
-For one TurnRef created by `turn.start`, the `turn.start`, valid `turn.append` and `turn.reset` events preceding the earliest terminal event, and the valid
-`turn.end` when it is that earliest terminal event form a single chain through `pre_seq`:
+A streaming turn's effective terminal event is its end/cancel with the smallest OpenEvent global seq: an effective end means completed, and an effective cancel means cancelled.
+Concurrent ends and cancels therefore yield the same outcome for every reader. `terminal_seq` is that effective terminal-event position, not the creation or last-content position;
+it is derived and adds no same-named payload field.
 
-- `turn.start` is the head and has no predecessor. Its OpenEvent `seq` is the first chain tail, not the turn ID.
-- Each later append, reset, or normal end points to the current chain tail.
-- Before the earliest terminal event, at most one append, reset, or end may use a given `pre_seq` as its predecessor. Multiple successors form a fork and violate the protocol.
-- `turn.cancel` relates to the turn through `target_turn`, is not a chain successor, and never contains `pre_seq`.
+Process events in ascending seq order. After termination, later append/reset/end/cancel events cannot change the terminal state, final content, attachments, or preterminal tail, even if committed.
+No additional parsing or validation order is required for such late events, and applications need not assess their dynamic validity against the terminal state.
+Effective preterminal start/append/reset events aggregate content under Section 8. A normal end's manifest must match that aggregate; an error end clears the final body and attachments under Section 9.
+Cancel retains the aggregate at cancellation plus its own attachments. A single turn retains its own body and attachments.
 
-The terminal event of `turn.single` is the event itself. For a turn created by `turn.start`, the terminal event is the correctly formatted `turn.end` or
-`turn.cancel` for that TurnRef with the smallest OpenEvent global `seq`. Concurrent completion and cancellation therefore produce a deterministic result
-shared by all readers.
-
-Events are processed in ascending OpenEvent `seq` order. Once a TurnRef becomes terminal, later append, reset, end, or cancel events targeting it cannot change
-its determined terminal state, final content, or preterminal chain tail. Such events have no turn-state effect even if committed. The protocol requires no
-special parsing, field-extraction, or validation order for postterminal events; applications need not decide whether they are "valid" relative to the terminal
-event. Only valid start/append/reset events preceding the earliest terminal `seq` participate in reconstructing a streaming turn's final content, with reset
-replacement as specified in Section 8. A single turn's final content is fixed by `turn.single.content`.
-
-Different TurnRefs may remain open and receive concurrent appends. Their events may interleave in the OpenEvent global order; each turn's `pre_seq` chain
-determines its local content order.
+Different turns may remain open concurrently and interleave in the global sequence; each chain determines its local content order.
 
 ## 12. Reply Relationships
 
-`reply_to_seqs` references replied-to turns by their creation-event positions. It expresses causal context, not routing or authorization. Complete reply-field rules:
+`reply_to_seqs` references the effective normal-completion positions of replied-to turns, expressing causal context rather than routing or authorization:
 
-- `turn.single` and `turn.start` must contain `reply_to_seqs`, a JSON array that may be empty. Other events must not contain it.
-- Elements must satisfy the nonzero `uint64` JSON integer rules in Section 3 and must not repeat within the array. The list preserves writer-supplied order and
-  need not be sorted by seq. Its order adds no priority, routing, or execution-order semantics. An empty array means no protocol-level parent turn; multiple
-  elements mean a response to multiple earlier turns.
-- Each seq must equal the OpenEvent `EventMessage.seq` of an earlier committed `turn.single` or `turn.start` in the same Channel. It must not reference append,
-  reset, end, cancel, `submission.reserve`, another Channel's message, the current creation event itself, or an uncommitted event.
-- The referenced turn must already be completed or cancelled before the current creation event: its effective terminal seq, determined by Section 11, must be
-  strictly less than the current creation event's seq. Streaming turns cannot be referenced. A `turn.single` is completed at creation; a streaming turn must
-  first have an effective end or cancel.
-- This document calls a turn's creation-event seq its `creation_seq`. It is derived directly from the top-level `EventMessage.seq` of `turn.single` or `turn.start`;
-  no payload field is added. `turn_id` and the full TurnRef still identify the turn. The `pre_seq` of append/reset/end and the `target_turn` of cancel retain
-  their own semantics; UUIDs are not reply references.
-- A reference points to the whole terminal turn, not a particular append. Its final text and attachments are fixed by the terminal state, and later events
-  cannot change the referenced content. Cancelled turns can also be referenced, using the final content retained when cancellation took effect.
-- The creation event fixes the reply list, which cannot later change. The list implies no OpenEvent `recipients` value.
+- Only single/start must contain this JSON array; it may be empty. Elements are nonzero uint64 JSON integers under Section 3, without duplicates.
+  Writer order is preserved, sorting is not required, and order adds no priority.
+- Each entry must be an earlier committed single or end seq in the same Channel that actually became a completed terminal event.
+  Start, append, reset, cancel, reservations, messages in other Channels, the current event, and uncommitted events are not valid targets.
+  An earlier effective cancel disqualifies a later end as a reply target.
+- Cancelled turns cannot be replied to. An effective end with `error="turn_too_long"` is completed and may be replied to.
+- A reference names the whole completed turn. Its creation event fixes its original reply list permanently; reply relationships imply no OpenEvent recipients.
+- `start_seq` is the single/start position used to locate creation information; `terminal_seq` is the reply target.
+  These are equal for single and different for streaming turns. TurnRef still identifies the turn; UUIDs are not reply references.
 
-Writers must provide creation-event seq values satisfying these conditions and use only targets confirmed terminal. The protocol does not
-require SDKs or applications to fetch, scan history, or maintain a separate index merely to verify reply targets. Readers may map creation-event seq to TurnRef
-while reading history normally. SDK local validation and call behavior are defined by [`CHAT_SDK.md`](CHAT_SDK.md). Missing targets or invalid references
-are still invalid history; Section 14 describes responsibility for handling them.
+Writers supply terminal positions satisfying these conditions. The protocol does not require extra SDK history reads when publishing replies; normal history reading can map completed terminal positions to turns.
+To read content by a target terminal position, use the [SDK targeted-read contract](CHAT_SDK.md#33-read-content-by-terminal-position); it does not replace the valid-target precondition.
 
-For example, in one Channel, seq `100` is turn A's start, seq `101` is A's append, seq `102` is A's effective end, and seq `110` is turn B's single.
-A new turn C at seq `111` may use `"reply_to_seqs": [100, 110]`. Before A ends, `100` cannot be referenced. Neither `101` nor `102` can be a reply target,
-because neither created a turn. If A instead has an effective cancel at `102`, `100` can also be referenced afterward. The causal graph has edges `C → A` and `C → B`.
-Every reply edge points to an earlier creation event, so the graph cannot contain a cycle.
+For example, A starts at 100, appends at 101, and has an effective end at 102; B is a single at 110. New turn C at 111 may reference
+`[102, 110]`, but neither 100 nor 101. If A was cancelled at 102 instead, it cannot be replied to. Every reply edge points to a normal terminal event preceding the current creation event,
+so the causal graph cannot contain a cycle.
 
 ## 13. `submission.reserve`
 

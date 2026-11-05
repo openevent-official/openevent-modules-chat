@@ -1,6 +1,6 @@
 """Value objects shared by the stateless parser and Chat client."""
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ._json_spans import validate_object
 
@@ -36,6 +36,24 @@ class TurnRef:
 class ObjectKey:
     object_id: int
     object_token: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class TurnAttachment:
+    object_key: ObjectKey
+    event_seq: int
+
+
+@dataclass(frozen=True)
+class TurnContent:
+    turn_ref: TurnRef
+    start_seq: int
+    terminal_seq: int
+    state: Literal['completed', 'cancelled']
+    content: tuple[TextPart, ...]
+    attachments: tuple[TurnAttachment, ...]
+    reply_to_seqs: tuple[int, ...]
+    error: str | None = None
 
 
 @dataclass(frozen=True)

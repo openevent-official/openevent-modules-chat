@@ -76,6 +76,53 @@ def wait_http(child, port):
     raise AssertionError('Chat HTTP server did not become ready')
 
 
+def check_terminal_overflow(binary):
+    """Use the real write limit so a growing seq list, not a mock, rejects end."""
+    import grpc
+    from openevent.sdk import AdminClient, OpenEventClient
+    from openevent.chat_sdk import TextPart, create_client
+
+    with fixture_directory() as root:
+        event_port, admin_port = free_port(), free_port()
+        target = f'127.0.0.1:{event_port}'
+        config = root / 'openevent.yaml'
+        config.write_text(
+            f'grpc:\n  listen_addr: "{target}"\n'
+            f'admin:\n  listen_addr: "127.0.0.1:{admin_port}"\n'
+            f'storage:\n  path: "{root / "data"}"\n'
+            'limits:\n  max_payload_bytes: 256\n', encoding='utf-8')
+        with process([binary, str(config)], root / 'openevent.log'):
+            ready = grpc.insecure_channel(f'127.0.0.1:{admin_port}')
+            try:
+                grpc.channel_ready_future(ready).result(timeout=15)
+            finally:
+                ready.close()
+            with AdminClient(f'127.0.0.1:{admin_port}') as admin:
+                token = admin.add_token(9001).token
+            with OpenEventClient(target, timeout_ms=2000) as events:
+                channel = events.create_channel(principal=9001, token=token, name='overflow',
+                    members=(), visibility=2, protocol='chat.v1', description='').channel
+                with create_client(events, principal=9001, token=token,
+                                   channel_id=channel.channel_id) as chat:
+                    writer = chat.start_turn(turn_id='overflow', content=(TextPart('partial'),))
+                    for _ in range(80):
+                        writer.append(content=(TextPart('x'),))
+                    end_seq = writer.complete()
+                    end = chat.fetch_page(end_seq, limit=1).messages[0]
+                    assert end.seq == end_seq and end.payload['kind'] == 'turn.end'
+                    assert end.payload['error'] == 'turn_too_long'
+                    assert 'content_seqs' not in end.payload and not end.object_keys
+                    assert end.payload['start_seq'] == writer.start_seq
+                    result = chat.get_turn_content(end_seq)
+                    assert result.state == 'completed' and result.error == 'turn_too_long'
+                    assert result.content == () and result.attachments == ()
+                    assert result.terminal_seq == end_seq and result.start_seq == writer.start_seq
+                    following = chat.single_turn(turn_id='following', content=(TextPart('still usable'),),
+                                                 reply_to_seqs=(end_seq,))
+                    assert chat.get_turn_content(following).reply_to_seqs == (end_seq,)
+    print('PASS: real payload limit produces one error end, empty turn content, and a usable client')
+
+
 def run():
     check()
     binary = os.environ.get('OPENEVENT_SERVER_BIN')
@@ -206,7 +253,7 @@ def run():
                     assert int(initial_history['next_seq']) > int(session['scan_start_seq'])
                     assert upload(base, b'x')['nbytes'] == 1
                     early_writer = agent.start_turn(turn_id='before-allocation')
-                    assert api('POST', base + '/cancellations', {'target_turn_id': early_writer.turn_id},
+                    assert api('POST', base + '/cancellations', {'target_turn_id': early_writer.turn_id, 'start_seq': str(early_writer.start_seq)},
                                expected=201) == {'status': 'committed'}
                     del early_writer  # The external cancellation ends this turn.
                     assert api('POST', base + '/turns', {'submission_id': '1', 'text': 'not ready'},
@@ -269,20 +316,39 @@ def run():
                     writer.reset(content=(TextPart('替换输出'),), object_keys=(key,))
                     writer.reset()
                     writer.append(content=(TextPart('最终输出'),))
-                    writer.complete()
+                    stream_end = writer.complete()
+                    completed = agent.get_turn_content(stream_end)
+                    assert completed.state == 'completed' and completed.error is None
+                    assert completed.start_seq == writer.start_seq and completed.terminal_seq == stream_end
+                    assert ''.join(part.text for part in completed.content) == '最终输出'
+                    assert completed.attachments == () and completed.reply_to_seqs == (creation,)
+                    single = agent.get_turn_content(creation)
+                    assert single.state == 'completed' and single.start_seq == single.terminal_seq == creation
+                    assert [item.object_key.object_id for item in single.attachments] == [int(oid), int(another_oid), int(oid)]
+                    assert all(item.event_seq == creation for item in single.attachments)
+                    agent.single_turn(turn_id='terminal-reply', content=(TextPart('回复完整输出'),),
+                                      reply_to_seqs=(stream_end,))
                     resumable = agent.start_turn(turn_id='resume', content=(TextPart('一'),))
-                    resume_seq = resumable.creation_seq
+                    resume_seq = resumable.start_seq
                     resume_tail = resumable.reset(content=(TextPart('重置后'),))
                     del resumable
-                    resumed = TurnWriter(agent, 'resume', resume_seq, resume_tail)
-                    assert resumed.creation_seq == resume_seq
-                    resumed.append(content=(TextPart('二'),))
-                    api('POST', base + '/cancellations', {'target_turn_id': 'resume'}, expected=201)
+                    resumed = TurnWriter(agent, 'resume', resume_seq, resume_tail, content_seqs=(resume_tail,))
+                    assert resumed.start_seq == resume_seq
+                    resume_append = resumed.append(content=(TextPart('二'),), object_keys=(key,))
+                    api('POST', base + '/cancellations', {'target_turn_id': 'resume', 'start_seq': str(resume_seq)}, expected=201)
                     large_data = b'\x00\xff' * (2 * 1024 * 1024)
                     large_upload = upload(base, large_data)
                     large_body = {'submission_id': '3', 'text': '', 'attachments': [large_upload['object_id']]}
                     api('POST', base + '/turns', large_body, expected=201)
                     records = history(base, session['scan_start_seq'])
+                    cancel_seq = int(next(event['event_seq'] for event in records
+                        if event['payload']['kind'] == 'turn.cancel' and
+                        event['payload']['target_turn']['turn_id'] == 'resume'))
+                    cancelled = agent.get_turn_content(cancel_seq)
+                    assert cancelled.state == 'cancelled' and cancelled.error is None
+                    assert cancelled.start_seq == resume_seq and cancelled.terminal_seq == cancel_seq
+                    assert ''.join(part.text for part in cancelled.content) == '重置后二'
+                    assert [(item.event_seq, item.object_key.object_id) for item in cancelled.attachments] == [(resume_append, int(oid))]
                     assert {'turn.single', 'turn.start', 'turn.append', 'turn.reset', 'turn.end', 'turn.cancel',
                             'submission.reserve'} <= {e['payload']['kind'] for e in records}
                     stream_records = [e for e in records if e['payload'].get('turn_id') == 'stream']
@@ -320,11 +386,11 @@ def run():
                     with create_client(events, principal=9002, token=agent_token,
                                        channel_id=int(second_config['channel_id'])) as opaque_chat:
                         opaque_writer = opaque_chat.start_turn(turn_id='opaque', extensions=RawExtensions(opaque_text))
-                        opaque_seq = opaque_writer.creation_seq
+                        opaque_seq = opaque_writer.start_seq
                         del opaque_writer
                         parsed = opaque_chat.fetch_page(opaque_seq, limit=1).messages[0]
                         assert parsed.payload['extensions'].json_text == opaque_text
-                        resumed_opaque = TurnWriter(opaque_chat, 'opaque', opaque_seq, opaque_seq)
+                        resumed_opaque = TurnWriter(opaque_chat, 'opaque', opaque_seq, opaque_seq, content_seqs=(opaque_seq,))
                         resumed_opaque.complete()
                         status, raw_page, _ = request('GET', second_base + f'/history?fetch_seq={opaque_seq}&limit=1',
                                                      decode_json=False)
@@ -375,7 +441,8 @@ def run():
                     except (OSError, http.client.HTTPException):
                         pass  # Shutdown may close the HTTP connection before an error is returned.
                     assert child.wait(timeout=15) != 0, 'RPC exhaustion must exit the Chat process unsuccessfully'
-    print('PASS: real OpenEvent + built Chat wheel: initialization, persistent session names, duplicate sends, reset, files, allocation, pending recovery, fatal RPC exhaustion')
+    check_terminal_overflow(binary)
+    print('PASS: real OpenEvent + built Chat wheel: initialization, persistent session names, duplicate sends, reset, completed/cancelled turn reads, files, allocation, pending recovery, fatal RPC exhaustion')
 
 
 if __name__ == '__main__':

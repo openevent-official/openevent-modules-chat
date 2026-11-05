@@ -39,6 +39,17 @@ class Element {
   }
 }
 
+function abortable(signal, operation) {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener('abort', abort, {once: true});
+    const finish = callback => value => { signal.removeEventListener('abort', abort); callback(value); };
+    try { Promise.resolve(operation()).then(finish(resolve), finish(reject)); }
+    catch (error) { finish(reject)(error); }
+  });
+}
+
 function environment(handler) {
   const elements = new Map();
   const document = {
@@ -54,7 +65,17 @@ function environment(handler) {
     sessionStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key)},
     setTimeout: (callback, delay) => { timers.set(++timerId, {callback, delay, due: now + delay}); return timerId; },
     clearTimeout: id => timers.delete(id),
-    fetch: async (url, options) => { const call = {url, ...options}; calls.push(call); return handler(call); },
+    fetch: (url, options) => {
+      const call = {url, ...options}; calls.push(call);
+      return abortable(call.signal, () => handler(call)).then(response => {
+        // Native fetch aborts both the response wait and an unfinished body read.
+        for (const method of ['text', 'blob']) if (typeof response[method] === 'function') {
+          const read = response[method].bind(response);
+          response[method] = () => abortable(call.signal, read);
+        }
+        return response;
+      });
+    },
   });
   return {elements, document, timers, calls, storage, get: document.getElementById,
     async advance(milliseconds) {
@@ -130,38 +151,38 @@ test('a history response displays messages and all file information together wit
   ui.get('logout').click();
 });
 
-test('invalid history file information leaves the previous page intact until manual reload', async () => {
-  const invalidFiles = [undefined, null, [], [attachmentInfo('42')],
-    [attachmentInfo('44'), attachmentInfo('43')], [attachmentInfo('43'), attachmentInfo('43')],
-    [attachmentInfo('43'), {...attachmentInfo('44'), nbytes: 0}]];
-  for (const [index, files] of invalidFiles.entries()) {
-    let histories = 0; const urls = [];
-    const next = historyPage([historyEvent(2, {
-      kind: 'turn.append', turn_id: 'answer', pre_seq: '1', content: [{type: 'text', text: '新正文'}],
-    }, 'agent', [{object_id: '43'}, {object_id: '44'}])], 3);
-    const ui = environment(call => {
-      if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
-      if (call.url.includes('/history?')) {
-        urls.push(call.url);
-        if (++histories === 1) return ok(historyPage([historyEvent(1, {
-          kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '旧正文'}], reply_to_seqs: [],
-        }, 'agent', [{object_id: '42'}])], 2));
-        return ok(histories === 2 ? {...next, files} : next);
-      }
-      throw new Error(`unexpected request ${call.url}`);
-    });
-    await load(`invalid-history-files-${index}`); await until(() => ui.get('messages').textContent.includes('42.txt'));
-    const article = ui.get('messages').children[0];
-    ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === 'Updates paused');
-    assert.equal(ui.get('messages').children[0], article);
-    assert.ok(article.textContent.includes('旧正文')); assert.ok(article.textContent.includes('42.txt'));
-    assert.equal(article.textContent.includes('新正文'), false); assert.equal(article.textContent.includes('43.txt'), false);
-    assert.equal(ui.calls.some(call => call.url.includes('/attachments/metadata')), false);
-    findElement(ui.get('message-error'), element => element.textContent === 'Reload').click();
-    await until(() => article.textContent.includes('新正文') && article.textContent.includes('44.txt'));
-    assert.equal(urls[1], urls[2], 'the rejected page must not advance the cursor');
-    ui.get('logout').click();
-  }
+test('a cross-event history conflict preserves the previous page and cursor on manual retry', async () => {
+  let histories = 0; const urls = [];
+  // The backend validates individual events, while the browser detects duplicate turn creation.
+  const next = historyPage([
+    historyEvent(2, {kind: 'turn.append', turn_id: 'answer', pre_seq: '1', content: [{type: 'text', text: '新正文'}]},
+      'agent', [{object_id: '43'}, {object_id: '44'}]),
+    historyEvent(3, {kind: 'turn.start', turn_id: 'answer', content: [], reply_to_seqs: []}),
+  ], 4);
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) {
+      urls.push(call.url);
+      if (++histories === 1) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '旧正文'}], reply_to_seqs: [],
+      }, 'agent', [{object_id: '42'}])], 2));
+      return ok(next);
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('history-chain-conflict'); await until(() => ui.get('messages').textContent.includes('42.txt'));
+  const article = ui.get('messages').children[0];
+  ui.runTimer(1000); await until(() => ui.get('sync-status').textContent === 'Updates paused');
+  assert.equal(ui.get('messages').children[0], article);
+  assert.ok(article.textContent.includes('旧正文')); assert.ok(article.textContent.includes('42.txt'));
+  assert.equal(article.textContent.includes('新正文'), false); assert.equal(article.textContent.includes('43.txt'), false);
+  assert.equal(ui.calls.some(call => call.url.includes('/attachments/metadata')), false);
+  findElement(ui.get('message-error'), element => element.textContent === 'Reload').click();
+  await until(() => histories === 3 && ui.get('sync-status').textContent === 'Updates paused');
+  assert.equal(urls[1], urls[2], 'the rejected page must not advance the cursor');
+  assert.equal(ui.get('messages').children[0], article);
+  assert.equal(article.textContent.includes('新正文'), false); assert.equal(article.textContent.includes('43.txt'), false);
+  ui.get('logout').click();
 });
 
 test('temporary history failures and timeouts retry the whole page with its files from the same cursor', async () => {
@@ -219,21 +240,27 @@ test('pagehide and logout discard late pages together with their file informatio
   assert.equal(ui.get('messages').textContent, ''); assert.equal(ui.get('workspace').hidden, true);
 });
 
-test('preview prefixes preserve whitespace and UTF-16 slicing without reading unnecessary parts', async () => {
+test('preview prefixes preserve whole Unicode code points and whitespace without reading unnecessary parts', async () => {
   const ui = environment(() => ok({sessions: []}));
   const {textPrefix} = await load('prefix');
   const cases = [
-    [], [''], [' \t\n', '\u00a0\ufeff', '中文', '  '],
-    ['x'.repeat(34), ' ', '\t \u00a0', 'tail'],
-    ['x'.repeat(34), ' ', '\t \u00a0'],
-    ['x'.repeat(34), ' \t \u00a0 tail'],
-    ['😀'.repeat(17), '😀tail'], ['\ud83d', '\ude00', 'a'.repeat(100)],
-    ['', ' \t', 'αβ'.repeat(50), '\n'], [' \t', '\n', '\ufeff'],
+    [[], ''], [[''], ''],
+    [[' \t\n', '\u00a0\ufeff', '中文', '  '], ' \t\n\u00a0\ufeff中文  '],
+    [['x'.repeat(34), ' ', '\t \u00a0', 'tail'], 'x'.repeat(34) + ' \t \u00a0tail'],
+    [['x'.repeat(34), ' ', '\t \u00a0'], 'x'.repeat(34) + ' \t \u00a0'],
+    [['x'.repeat(34), ' \t \u00a0 tail'], 'x'.repeat(34) + ' \t \u00a0 tail'],
+    [['😀'.repeat(81)], '😀'.repeat(80)],
+    [['a'.repeat(79) + '😀tail'], 'a'.repeat(79) + '😀'],
+    [['x'.repeat(78), '😀', '界tail'], 'x'.repeat(78) + '😀界'],
+    [['😀'.repeat(79), '界', 'tail'], '😀'.repeat(79) + '界'],
+    [['', ' \t', 'αβ'.repeat(50), '\n'], ' \t' + 'αβ'.repeat(39)],
+    [[' \t', '\n', '\ufeff'], ' \t\n\ufeff'],
   ];
-  for (const texts of cases) {
+  for (const [texts, expected] of cases) {
     const parts = texts.map(text => ({text}));
-    assert.equal(textPrefix(parts, 80), texts.join('').slice(0, 80));
+    assert.equal(textPrefix(parts, 80), expected);
   }
+  assert.equal(textPrefix([{get text() { throw new Error('unused text was read'); }}], 0), '');
   for (const limit of [35, 80]) {
     let reads = 0;
     const parts = Array.from({length: 100000}, () => ({get text() { reads++; return 'x'; }}));
@@ -242,6 +269,9 @@ test('preview prefixes preserve whitespace and UTF-16 slicing without reading un
     assert.equal(textPrefix([
       {text: 'x'.repeat(limit)}, {get text() { throw new Error('unused text was read'); }},
     ], limit), 'x'.repeat(limit));
+    assert.equal(textPrefix([
+      {text: '😀'.repeat(limit)}, {get text() { throw new Error('unused text was read'); }},
+    ], limit), '😀'.repeat(limit));
   }
   ui.get('logout').click();
 });
@@ -326,6 +356,54 @@ test('rename saves the displayed name, preserves drafts and history, and survive
   assert.equal(reloaded.get('session-channel').textContent, 'Channel ID: 9007199254740993');
   assert.equal(reloaded.get('sessions').children[0].textContent, nextName);
   reloaded.get('logout').click();
+});
+
+test('a concurrent local rename preserves only its own name while refresh updates other sessions', async () => {
+  const a = {...description, name: 'Session A'};
+  let b = {...description, session_id: '01ARZ3NDEKTSV4RRFFQ69G5FAW', channel_id: '9007199254740994', name: 'Session B'};
+  let savedA = a;
+  let lists = 0;
+  let finishList;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') {
+      const snapshot = {sessions: [{...savedA}, {...b}], max_user_message_bytes: 65536};
+      if (++lists === 2) return new Promise(resolve => { finishList = () => resolve(ok(snapshot)); });
+      return ok(snapshot);
+    }
+    if (call.url.includes('/history?')) return ok(empty());
+    if (call.url === `/api/chat/sessions/${a.session_id}/rename`) {
+      savedA = {...savedA, name: JSON.parse(call.body).name};
+      return ok(savedA);
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('refresh-concurrent-session-rename');
+  try {
+    const aEntry = ui.get('sessions').children.find(element => element.textContent === a.name);
+    const bEntry = ui.get('sessions').children.find(element => element.textContent === b.name);
+    aEntry.click(); await flush();
+
+    // Another tab finished renaming B before this page requested its list snapshot.
+    b = {...b, name: 'Session B renamed by another tab'};
+    ui.get('refresh-sessions').click(); await until(() => !!finishList);
+    ui.get('rename-session').click();
+    ui.get('session-name').value = 'Session A renamed locally';
+    ui.get('rename-form').dispatch('submit');
+    await until(() => ui.get('session-title').textContent === savedA.name && savedA.name !== a.name);
+    finishList(); await until(() => !ui.get('refresh-sessions').disabled);
+
+    assert.equal(aEntry.textContent, savedA.name, 'the older list must preserve the completed local A rename');
+    assert.equal(bEntry.textContent, b.name, 'the same list must apply B\'s already committed name');
+    assert.equal(ui.get('directory-error').textContent, '');
+
+    savedA = {...savedA, name: 'Session A renamed later by another tab'};
+    ui.get('refresh-sessions').click();
+    await until(() => aEntry.textContent === savedA.name);
+    assert.equal(ui.get('session-title').textContent, savedA.name);
+    assert.equal(bEntry.textContent, b.name);
+    assert.equal(ui.get('directory-error').textContent, '');
+    assert.equal(lists, 3, 'later refreshes must still update a previously renamed session');
+  } finally { ui.get('logout').click(); }
 });
 
 test('rename validation, cancel and server failure preserve the saved name and allow a manual retry', async () => {
@@ -711,7 +789,7 @@ test('uncertain cancellation allows a manual retry without an automatic POST, th
       if (histories === 1) return ok(historyPage([historyEvent(1, {
         kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '正在回答'}], reply_to_seqs: [],
       })], 2));
-      if (committed) return ok(historyPage([historyEvent(2, {kind: 'turn.cancel', target_turn: {role: 'agent', turn_id: 'answer'}}, 'user')], 3));
+      if (committed) return ok(historyPage([historyEvent(2, {kind: 'turn.cancel', start_seq: '1', target_turn: {role: 'agent', turn_id: 'answer'}}, 'user')], 3));
       return ok(empty('2', '1'));
     }
     if (call.url.endsWith('/cancellations')) {
@@ -739,7 +817,7 @@ test('uncertain cancellation allows a manual retry without an automatic POST, th
   assert.equal(cancel.hidden, true); assert.equal(cancel.disabled, false); assert.equal(cancel.textContent, 'Stop generating');
   assert.equal(ui.get('submission-status').textContent, 'Generation canceled.');
   assert.deepEqual(ui.calls.filter(call => call.url.endsWith('/cancellations')).map(call => JSON.parse(call.body)), [
-    {target_turn_id: 'answer'}, {target_turn_id: 'answer'},
+    {target_turn_id: 'answer', start_seq: '1'}, {target_turn_id: 'answer', start_seq: '1'},
   ]);
   ui.get('logout').click();
 });
@@ -753,7 +831,7 @@ test('late cancellation responses keep the terminal message and cleared button s
         if (++histories === 1) return ok(historyPage([historyEvent(1, {
           kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '回答'}], reply_to_seqs: [],
         })], 2));
-        return ok(historyPage([historyEvent(2, {kind: 'turn.end', turn_id: 'answer', pre_seq: '1'})], 3));
+        return ok(historyPage([historyEvent(2, {kind: 'turn.end', turn_id: 'answer', start_seq: '1', pre_seq: '1', content_seqs: ['1']})], 3));
       }
       if (call.url.endsWith('/cancellations')) return new Promise((resolve, reject) => {
         completeCancellation = () => fails ? reject(new TypeError('offline')) : resolve(ok({status: 'committed'}, 201));
@@ -773,7 +851,7 @@ test('late cancellation responses keep the terminal message and cleared button s
   }
 });
 
-test('open reply controls reject clicks and use current state after end or cancel, preserving selection order', async () => {
+test('only completed messages enable replies, using end positions in selection order', async () => {
   for (const terminal of ['turn.end', 'turn.cancel']) {
     let histories = 0; let sent;
     const ui = environment(call => {
@@ -787,9 +865,9 @@ test('open reply controls reject clicks and use current state after end or cance
         ], 4));
         if (histories === 2) return ok(historyPage([
           historyEvent(4, terminal === 'turn.end'
-            ? {kind: terminal, turn_id: 'a', pre_seq: '1'}
-            : {kind: terminal, target_turn: {role: 'agent', turn_id: 'a'}}),
-          historyEvent(5, {kind: 'turn.end', turn_id: 'b', pre_seq: '2'}),
+            ? {kind: terminal, turn_id: 'a', start_seq: '1', pre_seq: '1', content_seqs: ['1']}
+            : {kind: terminal, start_seq: '1', target_turn: {role: 'agent', turn_id: 'a'}}),
+          historyEvent(5, {kind: 'turn.end', turn_id: 'b', start_seq: '2', pre_seq: '2', content_seqs: ['2']}),
         ], 6));
         return ok(empty('6', '5'));
       }
@@ -805,13 +883,63 @@ test('open reply controls reject clicks and use current state after end or cance
     assert.equal(replies[0].disabled, true); assert.equal(replies[1].disabled, true);
     replies[0].click(); replies[1].click(); await flush();
     assert.equal(ui.get('reply-selection').children.length, 0, 'even a dispatched disabled click must not select an open turn');
-    ui.runTimer(1000); await until(() => !replies[0].disabled && !replies[1].disabled);
+    ui.runTimer(1000); await until(() => !replies[1].disabled);
+    assert.equal(replies[0].disabled, terminal === 'turn.cancel');
     replies[1].click(); replies[0].click(); replies[2].click(); await flush();
-    assert.equal(ui.get('reply-selection').children.length, 3, 'existing handlers must use the updated terminal state');
+    assert.equal(ui.get('reply-selection').children.length, terminal === 'turn.end' ? 3 : 2);
     typeAndSend(ui, '引用终态消息'); await until(() => !!sent);
-    assert.deepEqual(sent.reply_to_seqs, ['2', '1', '3']);
+    assert.deepEqual(sent.reply_to_seqs, terminal === 'turn.end' ? ['5', '4', '3'] : ['5', '3']);
     ui.get('logout').click();
   }
+});
+
+test('error end replaces old text and attachments in place and replies use its end position', async () => {
+  let histories = 0; let sent;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '101', end: '200'}, 201);
+    if (call.url.includes('/history?')) {
+      if (++histories === 1) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.start', turn_id: 'answer', content: [{type: 'text', text: '旧正文'}], reply_to_seqs: [],
+      }, 'agent', [{object_id: '42'}])], 2));
+      if (histories === 2) return ok(historyPage([historyEvent(2, {
+        kind: 'turn.end', turn_id: 'answer', start_seq: '1', pre_seq: '1', error: 'turn_too_long',
+      })], 3));
+      if (sent) return ok(historyPage([historyEvent(3, {
+        kind: 'turn.single', turn_id: 'user:101', content: [{type: 'text', text: sent.text}], reply_to_seqs: sent.reply_to_seqs,
+      }, 'user')], 4));
+      return ok(empty('3', '2'));
+    }
+    if (call.url.endsWith('/turns')) {
+      sent = JSON.parse(call.body);
+      return ok({status: 'committed', submission_id: sent.submission_id,
+        turn_ref: {role: 'user', turn_id: `user:${sent.submission_id}`}}, 201);
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('error-terminal-reply');
+  const article = ui.get('messages').children[0];
+  const content = findElement(article, element => element.className === 'turn-content');
+  const text = content.children[0];
+  assert.ok(article.textContent.includes('42.txt')); assert.equal(text.data, '旧正文');
+  ui.runTimer(1000); await until(() => text.data === 'Message is too long to display.');
+  assert.equal(ui.get('messages').children[0], article); assert.equal(content.children[0], text);
+  assert.equal(findElement(article, element => element.className === 'attachment'), undefined);
+  const reply = findElement(article, element => element.className.includes('reply-action'));
+  assert.equal(reply.disabled, false); reply.click(); await flush();
+  assert.ok(ui.get('reply-selection').textContent.includes('Message is too long to display.'));
+  typeAndSend(ui, '回复错误消息'); await until(() => !!sent);
+  assert.deepEqual(sent.reply_to_seqs, ['2']);
+  await until(() => ui.get('message-input').value === ''); ui.runTimer(1000);
+  await until(() => ui.get('messages').children.length === 2);
+  const quote = findElement(ui.get('messages').children[1], element => element.className === 'quoted-reply');
+  assert.ok(quote.textContent.includes('Message is too long to display.'));
+  let anchor;
+  const get = ui.document.getElementById;
+  ui.document.getElementById = id => { if (id.startsWith('message-')) anchor = id; return get(id); };
+  quote.click(); assert.equal(anchor, 'message-1', 'reply references the end but jumps to the creation DOM anchor');
+  assert.equal(ui.calls.some(call => call.url.endsWith('/attachments/metadata')), false);
+  ui.get('logout').click();
 });
 
 test('sending rechecks every selected target before consuming a submission number', async () => {
@@ -832,14 +960,14 @@ test('sending rechecks every selected target before consuming a submission numbe
   // Capture the real registered session, without exporting application internals.
   const set = Map.prototype.set;
   Map.prototype.set = function(key, value) {
-    if (key === SID && value?.creationIndex instanceof Map) state = value;
+    if (key === SID && value?.terminalIndex instanceof Map) state = value;
     return set.call(this, key, value);
   };
   try { await load('send-reply-validation'); await until(() => !ui.get('send').disabled); }
   finally { Map.prototype.set = set; }
   const reply = findElement(ui.get('messages').children[0], element => element.textContent === 'Reply');
   reply.click(); await flush();
-  const key = state.creationIndex.get('1'); const original = state.turns.get(key);
+  const key = state.terminalIndex.get('1'); const original = state.turns.get(key);
   for (const replacement of [undefined, {...original, state: 'open'}]) {
     if (replacement) state.turns.set(key, replacement); else state.turns.delete(key);
     typeAndSend(ui, '保留草稿');
@@ -847,7 +975,7 @@ test('sending rechecks every selected target before consuming a submission numbe
     assert.equal(sent, undefined); assert.equal(state.pending, null); assert.equal(state.inventory, null);
     assert.equal(ui.calls.some(call => call.url.endsWith('/submissions')), false);
     assert.equal(ui.get('message-input').value, '保留草稿');
-    assert.match(ui.get('message-error').textContent, /Reply targets must be completed or canceled/);
+    assert.match(ui.get('message-error').textContent, /Reply targets must be completed/);
   }
   typeAndSend(ui, '引用完整消息'); await until(() => !!sent);
   assert.equal(sent.submission_id, '101'); assert.deepEqual(sent.reply_to_seqs, ['1']);
@@ -1078,7 +1206,8 @@ test('a lower refreshed text limit does not block confirmation of an uncertain s
 test('a server text-limit rejection preserves an editable draft when no local limit was loaded', async () => {
   let sends = 0;
   const ui = environment(call => {
-    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url === '/api/chat/sessions') return call.method === 'POST'
+      ? ok(description, 201) : err(503, 'temporarily_unavailable');
     if (call.url.includes('/history?')) return ok(empty());
     if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
     if (call.url.endsWith('/turns')) {
@@ -1088,7 +1217,9 @@ test('a server text-limit rejection preserves an editable draft when no local li
     }
     throw new Error(`unexpected request ${call.url}`);
   });
-  await load('text-limit-backend'); typeAndSend(ui, 'too long');
+  await load('text-limit-backend');
+  ui.get('new-session').click(); await until(() => !ui.get('send').disabled);
+  typeAndSend(ui, 'too long');
   await until(() => ui.get('submission-status').textContent.includes('Message is too long'));
   assert.equal(ui.get('message-input').value, 'too long'); assert.equal(ui.get('message-input').disabled, false);
   assert.equal(ui.get('send').disabled, false);
@@ -1391,44 +1522,38 @@ test('manual confirmation keeps its button through idle polling and retries the 
   ui.get('logout').click();
 });
 
-test('a first fatal or malformed send response remains uncertain until fresh old-batch history confirms it', async () => {
-  for (const failure of ['contract', 'invalid-json', 'null-json']) {
-    let sends = 0; let histories = 0; let allocations = 0; let finishHistory;
-    const ui = environment(call => {
-      if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
-      if (call.url.includes('/history?')) {
-        if (++histories === 1) return ok(empty());
-        return new Promise(resolve => { finishHistory = resolve; });
-      }
-      if (call.url.endsWith('/submissions')) {
-        return ok(++allocations === 1 ? {start: '1', end: '100'} : {start: '10001', end: '10100'}, 201);
-      }
-      if (call.url.endsWith('/turns')) {
-        if (++sends === 1) {
-          if (failure === 'invalid-json') return new Response('<html>proxy failure</html>', {status: 200});
-          if (failure === 'null-json') return ok(null);
-          return ok({error: {code: 'server_unavailable', message: 'publication outcome unknown', failure: {category: 'contract'}}}, 503);
-        }
-        return err(409, 'submission_out_of_range');
-      }
-      throw new Error(`unexpected request ${call.url}`);
-    });
-    await load(`first-send-${failure}`); typeAndSend(ui, '原消息');
-    await until(() => !!findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation'));
-    assert.equal(ui.get('message-input').disabled, true); assert.equal(sends, 1);
-    findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation').click();
-    await until(() => !!finishHistory); await flush();
-    assert.equal(allocations, 1);
-    assert.equal(sends, 2); assert.equal(ui.get('message-input').disabled, true);
-    assert.equal(ui.get('message-input').value, '原消息');
-    finishHistory(ok(historyPage([historyEvent(1, {
-      kind: 'turn.single', turn_id: 'user:1', content: [{type: 'text', text: '原消息'}], reply_to_seqs: [],
-    }, 'user')], 2)));
-    await until(() => ui.get('submission-status').textContent === 'Message sent');
-    assert.equal(ui.get('message-input').value, ''); assert.equal(ui.get('message-input').disabled, false);
-    assert.deepEqual(ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body).submission_id), ['1', '1']);
-    ui.get('logout').click();
-  }
+test('a first fatal send response remains uncertain until fresh old-batch history confirms it', async () => {
+  let sends = 0; let histories = 0; let allocations = 0; let finishHistory;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) {
+      if (++histories === 1) return ok(empty());
+      return new Promise(resolve => { finishHistory = resolve; });
+    }
+    if (call.url.endsWith('/submissions')) {
+      return ok(++allocations === 1 ? {start: '1', end: '100'} : {start: '10001', end: '10100'}, 201);
+    }
+    if (call.url.endsWith('/turns')) {
+      if (++sends === 1) return ok({error: {code: 'server_unavailable', message: 'publication outcome unknown', failure: {category: 'contract'}}}, 503);
+      return err(409, 'submission_out_of_range');
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('first-send-fatal'); typeAndSend(ui, '原消息');
+  await until(() => !!findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation'));
+  assert.equal(ui.get('message-input').disabled, true); assert.equal(sends, 1);
+  findElement(ui.get('submission-status'), element => element.textContent === 'Retry confirmation').click();
+  await until(() => !!finishHistory); await flush();
+  assert.equal(allocations, 1);
+  assert.equal(sends, 2); assert.equal(ui.get('message-input').disabled, true);
+  assert.equal(ui.get('message-input').value, '原消息');
+  finishHistory(ok(historyPage([historyEvent(1, {
+    kind: 'turn.single', turn_id: 'user:1', content: [{type: 'text', text: '原消息'}], reply_to_seqs: [],
+  }, 'user')], 2)));
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
+  assert.equal(ui.get('message-input').value, ''); assert.equal(ui.get('message-input').disabled, false);
+  assert.deepEqual(ui.calls.filter(call => call.url.endsWith('/turns')).map(call => JSON.parse(call.body).submission_id), ['1', '1']);
+  ui.get('logout').click();
 });
 
 test('hiding a page pauses the same-id POST until a back-forward-cache restore', async () => {
@@ -1569,38 +1694,40 @@ test('upload and cancel work without inventory; allocation only locks the frozen
   ui.get('logout').click();
 });
 
-test('HTTP deadlines cover incomplete bodies and finish even when abort is ignored', async () => {
-  let finishBody;
+test('HTTP deadlines abort incomplete bodies and pending allocation requests', async () => {
+  let bodyStarted = false;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: []});
-    if (call.url === '/test-body') return {status: 200, ok: true, text: () => new Promise(resolve => { finishBody = resolve; })};
+    if (call.url === '/test-body') return {status: 200, ok: true, text: () => { bodyStarted = true; return new Promise(() => {}); }};
     if (call.url.endsWith('/submissions')) return new Promise(() => {});
     throw new Error(`unexpected request ${call.url}`);
   });
   const {request} = await load('body-deadline');
   const body = request('/test-body'); const bodyRejected = assert.rejects(body, error => error.code === 'timeout');
-  await until(() => !!finishBody); ui.runTimer(30000); await bodyRejected;
-  finishBody('{"late":true}'); await flush(); assert.equal(ui.timers.size, 0);
+  await until(() => bodyStarted); ui.runTimer(30000); await bodyRejected;
+  assert.equal(ui.calls.find(call => call.url === '/test-body').signal.aborted, true);
+  assert.equal(ui.timers.size, 0);
   const allocation = request('/test/submissions', {method: 'POST', body: {count: '100'}});
   const allocationRejected = assert.rejects(allocation, error => error.code === 'timeout');
   assert.ok([...ui.timers.values()].some(timer => timer.delay === 120000));
   ui.runTimer(120000); await allocationRejected;
+  assert.equal(ui.calls.find(call => call.url === '/test/submissions').signal.aborted, true);
   ui.get('logout').click();
 });
 
-test('send body timeout retries the frozen POST and a late success cannot clear the next draft', async () => {
-  let sends = 0; let finishBody;
+test('send body timeout retries the frozen POST and stops confirmation after success', async () => {
+  let sends = 0; let bodyStarted = false;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
     if (call.url.includes('/history?')) return ok(empty());
     if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
     if (call.url.endsWith('/turns')) {
-      if (++sends === 1) return {status: 201, ok: true, text: () => new Promise(resolve => { finishBody = resolve; })};
+      if (++sends === 1) return {status: 201, ok: true, text: () => { bodyStarted = true; return new Promise(() => {}); }};
       return ok({submission_id: '1', status: 'committed', turn_ref: {role: 'user', turn_id: 'user:1'}}, 200);
     }
     throw new Error(`unexpected request ${call.url}`);
   });
-  await load('send-body-timeout'); typeAndSend(ui, '原始请求'); await until(() => !!finishBody);
+  await load('send-body-timeout'); typeAndSend(ui, '原始请求'); await until(() => bodyStarted);
   assert.equal(ui.get('message-input').disabled, true);
   ui.runTimer(30000); await flush();
   assert.equal(ui.get('message-input').disabled, true);
@@ -1608,7 +1735,6 @@ test('send body timeout retries the frozen POST and a late success cannot clear 
   await until(() => ui.get('submission-status').textContent === 'Message sent');
   assert.equal(ui.get('message-input').value, ''); assert.equal(ui.get('message-input').disabled, false);
   ui.get('message-input').value = '编辑下一条'; ui.get('message-input').dispatch('input');
-  finishBody(JSON.stringify({submission_id: '1', status: 'committed', turn_ref: {role: 'user', turn_id: 'user:1'}})); await flush();
   const bodies = ui.calls.filter(call => call.url.endsWith('/turns')).map(call => call.body);
   assert.equal(bodies.length, 2); assert.equal(bodies[0], bodies[1]);
   assert.equal(ui.get('message-input').value, '编辑下一条'); assert.equal(ui.get('send').disabled, false);
@@ -1678,23 +1804,25 @@ test('reset replaces text and attachments in the original bubble while reusing f
   ui.get('logout').click();
 });
 
-test('downloads validate headers, wait for the complete body, and never save a partial file', async () => {
-  let finishBody; let saved = 0;
+test('downloads reject HTTP errors, wait for the complete body, and never save a partial file', async () => {
+  let bodyStarted = false; let saved = 0;
   const headers = {'Content-Type': 'application/octet-stream', 'Content-Disposition': "attachment; filename*=UTF-8''report.txt",
     'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store'};
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return ok({sessions: []});
-    if (call.url === '/bad-download') return new Response('<html>proxy</html>', {headers: {'Content-Type': 'text/html'}});
-    if (call.url === '/slow-download') return {ok: true, status: 200, headers: new Headers(headers), blob: () => new Promise(resolve => { finishBody = resolve; })};
+    if (call.url === '/bad-download') return new Response('<html>proxy</html>', {status: 502, headers: {'Content-Type': 'text/html'}});
+    if (call.url === '/slow-download') return {ok: true, status: 200, headers: new Headers(headers),
+      blob: () => { bodyStarted = true; return new Promise(() => {}); }};
     if (call.url === '/good-download') return new Response('file', {headers});
     throw new Error(`unexpected request ${call.url}`);
   });
   const {request} = await load('download-deadline');
-  await assert.rejects(request('/bad-download', {binary: true}), /Invalid download response/);
+  await assert.rejects(request('/bad-download', {binary: true}), error => error.status === 502);
   const slow = request('/slow-download', {binary: true}).then(() => saved++);
   const rejected = assert.rejects(slow, error => error.code === 'timeout');
-  await until(() => !!finishBody); ui.runTimer(120000); await rejected;
-  finishBody(new Blob(['partial'])); await flush(); assert.equal(saved, 0);
+  await until(() => bodyStarted); ui.runTimer(120000); await rejected;
+  assert.equal(ui.calls.find(call => call.url === '/slow-download').signal.aborted, true);
+  assert.equal(saved, 0);
   const result = await request('/good-download', {binary: true}); assert.equal(await result.data.text(), 'file');
   ui.get('logout').click();
 });
@@ -1724,6 +1852,44 @@ test('upload timeout retains the local file, never retries automatically and ign
   assert.equal(uploadCalls[0].body.get('file').name, file.name); assert.equal(uploadCalls[1].body.get('file').name, file.name);
   assert.deepEqual(JSON.parse(ui.calls.find(call => call.url.endsWith('/turns')).body).attachments, ['42']);
   ui.get('logout').click();
+});
+
+test('old allocation and send cleanup cannot clear a replacement request after immediate session switches', async () => {
+  for (const phase of ['allocation', 'confirmation']) {
+    const other = {...description, session_id: '01ARZ3NDEKTSV4RRFFQ69G5FAT'};
+    const suffix = phase === 'allocation' ? '/submissions' : '/turns';
+    const pending = [];
+    const ui = environment(call => {
+      if (call.url === '/api/chat/sessions') return ok({sessions: [description, other]});
+      if (call.url.includes('/history?')) return ok(empty());
+      if (call.url.endsWith(suffix)) { pending.push(call); return new Promise(() => {}); }
+      if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+      throw new Error(`unexpected request ${call.url}`);
+    });
+    await load(`immediate-switch-${phase}`);
+    try {
+      typeAndSend(ui, '切换期间保留的原文'); await until(() => pending.length === 1);
+      const [a, b] = ui.get('sessions').children;
+      // Start the replacement before the aborted request can reach its finally block.
+      b.click(); a.click();
+      assert.equal(pending.length, 2);
+      assert.equal(pending[0].signal.aborted, true);
+      assert.equal(pending[1].signal.aborted, false);
+      await flush();
+      assert.equal(pending[1].signal.aborted, false);
+      assert.equal(pending[0].url, pending[1].url);
+      assert.equal(pending[0].body, pending[1].body);
+      assert.equal(ui.get('message-input').value, '切换期间保留的原文');
+      assert.equal(ui.get('send').disabled, true);
+      b.click();
+      assert.equal(pending[1].signal.aborted, true, `${phase}: the replacement must remain cancellable after old cleanup`);
+      await ui.advance(2000);
+      assert.equal(pending.length, 2, `${phase}: stopped requests must not restart in the background`);
+    } finally {
+      ui.get('logout').click(); await flush();
+    }
+    assert.equal(ui.timers.size, 0);
+  }
 });
 
 test('A → B → A send confirmation ignores the earlier response and retains the same frozen id', async () => {
@@ -1886,7 +2052,7 @@ test('one long turn touches only new or changed attachments during text, reply a
       }, 'agent', Array.from({length: 1000}, () => ({object_id: '42'})))], 2));
       return ok(historyPage([historyEvent(histories, {
         kind: histories === 4 ? 'turn.end' : 'turn.append', turn_id: 'answer', pre_seq: String(histories - 1),
-        ...(histories === 4 ? {} : {content: [{type: 'text', text: '追加'}]}),
+        ...(histories === 4 ? {start_seq: '1', content_seqs: ['1', '2', '3']} : {content: [{type: 'text', text: '追加'}]}),
       }, 'agent', histories === 2 ? [{object_id: '43'}] : histories === 3 ? [{object_id: '44'}] : [])], histories + 1));
     }
     throw new Error(`unexpected request ${call.url}`);

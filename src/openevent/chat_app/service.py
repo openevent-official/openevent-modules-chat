@@ -228,17 +228,13 @@ class ChatService:
             session_id=record.session_id, channel_id=record.channel_id, filename=record.session_id + ".json")
         return SessionWorker(record, chat)
 
-    def _check_channel(self, channel, session_id, channel_id=None):
+    def _check_channel(self, channel, session_id, channel_id):
         expected = {self.config.user_principal, self.config.agent_principal}
-        try:
-            valid = (type(channel.channel_id) is int and 0 < channel.channel_id <= MAX_UINT64
-                     and (channel_id is None or channel.channel_id == channel_id)
-                     and channel.name == "chat-" + session_id and channel.protocol == "chat.v1"
-                     and channel.visibility == 2 and channel.description == ""
-                     and channel.creator == self.config.user_principal
-                     and len(channel.members) == 2 and set(channel.members) == expected)
-        except (AttributeError, TypeError):
-            valid = False
+        valid = (channel.channel_id == channel_id
+                 and channel.name == "chat-" + session_id and channel.protocol == "chat.v1"
+                 and channel.visibility == 2 and channel.description == ""
+                 and channel.creator == self.config.user_principal
+                 and len(channel.members) == 2 and set(channel.members) == expected)
         if not valid:
             raise ValueError("ChannelInfo does not match immutable session configuration")
 
@@ -305,7 +301,7 @@ class ChatService:
         try:
             status = self._rpc("GetStatus", self.events.get_status, principal=self.config.user_principal,
                                token=self.config.user_openevent_token, session_id=sid)
-            maximum = self._status_seq(status, sid)
+            maximum = status.max_seq
             if maximum == MAX_UINT64:
                 raise AppError(503, "sequence_exhausted", "no session scan position remains")
             pending = self.store.begin(sid, request_id, maximum + 1)
@@ -313,8 +309,6 @@ class ChatService:
                                principal=self.config.user_principal, token=self.config.user_openevent_token,
                                name="chat-" + sid, visibility=2, protocol="chat.v1", description="",
                                members=(self.config.agent_principal,), session_id=sid, filename=sid + ".json")
-            self._call("CreateChannel", lambda: self._check_channel(result.channel, sid),
-                       session_id=sid, filename=sid + ".json")
             channel_id = result.channel.channel_id
             pending = self.store.record_channel(pending, channel_id)
             record = self.store.commit(pending)
@@ -332,12 +326,6 @@ class ChatService:
         except Exception as exc:
             raise self._fail(make_failure("CreateSession", exc, detail="session configuration transaction failed"),
                              session_id=sid, channel_id=channel_id, filename=sid + ".json") from exc
-
-    def _status_seq(self, status, session_id):
-        value = getattr(status, "max_seq", None)
-        if type(value) is not int or not 0 <= value <= MAX_UINT64:
-            self._contract("GetStatus", "GetStatus returned invalid max_seq", session_id)
-        return value
 
     def _page(self, worker, start, limit):
         page = self._call("Fetch", lambda: worker.chat.fetch_page(from_seq=start, limit=limit),
@@ -360,11 +348,12 @@ class ChatService:
     def _public_event(self, message):
         # Only replace top-level fields; content and extensions stay read-only.
         payload = dict(message.payload)
-        for name in ("pre_seq", "reserved_through"):
+        for name in ("start_seq", "pre_seq", "reserved_through"):
             if name in payload:
                 payload[name] = str(payload[name])
-        if "reply_to_seqs" in payload:
-            payload["reply_to_seqs"] = [str(value) for value in payload["reply_to_seqs"]]
+        for name in ("reply_to_seqs", "content_seqs"):
+            if name in payload:
+                payload[name] = [str(value) for value in payload[name]]
         if "target_turn" in payload:
             target = payload["target_turn"]
             payload["target_turn"] = {"role": self._role(target["principal"]), "turn_id": target["turn_id"]}
@@ -392,7 +381,7 @@ class ChatService:
             if worker.batch_start == 0:
                 status = self._rpc("GetStatus", self.events.get_status, principal=self.config.user_principal,
                                    token=self.config.user_openevent_token, session_id=session_id)
-                boundary = self._status_seq(status, session_id)
+                boundary = status.max_seq
                 cursor, upper = worker.config.scan_start_seq, 0
                 while cursor <= boundary:
                     page = self._page(worker, cursor, 1000)
@@ -478,10 +467,12 @@ class ChatService:
 
     def cancel(self, session_id, body):
         worker = self._session(session_id)
-        fields(body, {"target_turn_id"})
+        fields(body, {"target_turn_id", "start_seq"})
         target = text_value(body["target_turn_id"], nonempty=True, max_bytes=128)
+        start_seq = number(body["start_seq"])
         self._accepting()
-        self._call("PublishAutoSeq", lambda: worker.chat.cancel_turn(target_turn=TurnRef(self.config.agent_principal, target)),
+        self._call("PublishAutoSeq", lambda: worker.chat.cancel_turn(
+            target_turn=TurnRef(self.config.agent_principal, target), start_seq=start_seq),
                    session_id=session_id)
         return {"status": "committed"}
 
@@ -494,12 +485,9 @@ class ChatService:
         result = self._rpc("WriteObject", self.events.write_object,
                            principal=self.config.user_principal, token=self.config.user_openevent_token,
                            name=name, type=content_type, data=data, description="", session_id=session_id)
-        object_id, token = getattr(result, "object_id", None), getattr(result, "object_token", None)
-        if type(object_id) is not int or not 0 < object_id <= MAX_UINT64 or not isinstance(token, str) or not token:
-            self._contract("WriteObject", "WriteObject returned an invalid ObjectKey", session_id)
         with self._uploads_lock:
-            self.uploads[object_id] = (token, session_id)
-        return {"object_id": str(object_id), "name": name, "type": content_type, "description": "", "nbytes": len(data)}
+            self.uploads[result.object_id] = (result.object_token, session_id)
+        return {"object_id": str(result.object_id), "name": name, "type": content_type, "description": "", "nbytes": len(data)}
 
     def _attachment_keys(self, worker, event_seq):
         if event_seq < worker.config.scan_start_seq:
@@ -525,18 +513,10 @@ class ChatService:
         metadata = self._rpc("GetObjectMetadata", self.events.get_object_metadata,
                              object_id=key.object_id, object_token=key.object_token,
                              session_id=session_id, event_seq=event_seq)
-        return self._metadata_fields(metadata, key.object_id, session_id, event_seq, "GetObjectMetadata")
+        return self._metadata_fields(metadata, key.object_id)
 
-    def _metadata_fields(self, metadata, object_id, session_id, event_seq, stage):
-        try:
-            text_value(metadata.name, nonempty=True, max_bytes=255)
-            text_value(metadata.type, nonempty=True, max_bytes=255)
-            text_value(metadata.description, max_bytes=4096)
-            if type(metadata.nbytes) is not int or not 1 <= metadata.nbytes <= MAX_OBJECT_BYTES:
-                raise ValueError("invalid object size")
-        except (AttributeError, ValueError, AppError):
-            self._contract(stage, f"{stage} returned invalid metadata", session_id,
-                           event_seq=event_seq, object_id=object_id)
+    @staticmethod
+    def _metadata_fields(metadata, object_id):
         return {"object_id": str(object_id), "name": metadata.name, "type": metadata.type,
                 "description": metadata.description, "nbytes": metadata.nbytes}
 
@@ -546,23 +526,16 @@ class ChatService:
         objects = {}
         for message in messages:
             for key in message.object_keys:
-                objects.setdefault(key.object_id, (key, message.seq))
+                objects.setdefault(key.object_id, key)
         entries, files = list(objects.values()), []
         for start in range(0, len(entries), 1024):
             batch = entries[start:start + 1024]
             response = self._rpc("BatchGetObjectMetadata", self.events.batch_get_object_metadata,
                                  object_keys=[openevent_pb2.ObjectKey(object_id=key.object_id,
                                                                      object_token=key.object_token)
-                                              for key, _ in batch], session_id=session_id)
-            try:
-                metadata = tuple(response.metadata)
-            except (AttributeError, TypeError):
-                self._contract("BatchGetObjectMetadata", "BatchGetObjectMetadata returned invalid metadata list", session_id)
-            if len(metadata) != len(batch):
-                self._contract("BatchGetObjectMetadata", "BatchGetObjectMetadata returned an incorrect result count", session_id)
-            files.extend(self._metadata_fields(item, key.object_id, session_id, event_seq,
-                                               "BatchGetObjectMetadata")
-                         for item, (key, event_seq) in zip(metadata, batch))
+                                              for key in batch], session_id=session_id)
+            files.extend(self._metadata_fields(item, key.object_id)
+                         for item, key in zip(response.metadata, batch))
         return files
 
     def download(self, session_id, object_id, event_seq):
@@ -571,11 +544,7 @@ class ChatService:
         response = self._rpc("ReadObject", self.events.read_object, object_id=key.object_id,
                              object_token=key.object_token, offset=0, nbytes=metadata["nbytes"],
                              session_id=session_id, event_seq=event_seq)
-        data = getattr(response, "data", None)
-        if not isinstance(data, bytes) or len(data) != metadata["nbytes"]:
-            self._contract("ReadObject", "ReadObject returned an incomplete object", session_id,
-                           event_seq=event_seq, object_id=key.object_id)
-        return metadata, data
+        return metadata, response.data
 
     def close(self):
         with self._close_lock:

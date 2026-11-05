@@ -10,12 +10,8 @@ let activeId = null;
 let epoch = 0;
 let loggedIn = false;
 let pageSuspended = false;
-let queryController = null;
-let queryTimer = null;
-let queryGeneration = 0;
-let allocationController = null;
-let allocationTimer = null;
-let allocationGeneration = 0;
+const querySchedule = createRequestSchedule();
+const allocationSchedule = createRequestSchedule();
 let renderQueued = false;
 let dirtyRegions = 0;
 const DIRECTORY = 1, MESSAGES = 2, DRAFT = 4, STATUS = 8;
@@ -79,39 +75,22 @@ export async function request(url, {method = 'GET', body, signal, binary = false
     headers['Content-Type'] = 'application/json'; body = JSON.stringify(body);
   }
   try {
-    const cancelled = new Promise((_, reject) => {
-      const rejectAbort = () => reject(new DOMException('Aborted', 'AbortError'));
-      if (controller.signal.aborted) rejectAbort();
-      else controller.signal.addEventListener('abort', rejectAbort, {once: true});
-    });
-    const operation = async () => {
-      const response = await fetch(url, {method, body, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store'});
-      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
-      if (binary && response.ok) {
-        const disposition = response.headers.get('Content-Disposition') || '';
-        const cache = response.headers.get('Cache-Control') || '';
-        if (response.headers.get('Content-Type')?.toLowerCase() !== 'application/octet-stream' ||
-            !/^attachment(?:;|$)/i.test(disposition) || response.headers.get('X-Content-Type-Options')?.toLowerCase() !== 'nosniff' ||
-            !/(?:^|,)\s*private\s*(?:,|$)/i.test(cache) || !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(cache)) {
-          throw new Error('Invalid download response');
-        }
-        return {data: await response.blob(), response};
-      }
-      return {text: await response.text(), response};
-    };
-    const result = await Promise.race([operation(), cancelled]);
-    const {response} = result;
+    const response = await fetch(url, {method, body, headers, signal: controller.signal, credentials: 'same-origin', cache: 'no-store'});
+    if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (binary && response.ok) {
+      return {data: await response.blob(), response};
+    }
+    const text = await response.text();
     if (response.status === 401) {
       if (epoch === generation && loggedIn) logout('Invalid access token. Please enter it again.');
       throw new ApiError(401, 'unauthenticated', 'Invalid access token. Please enter it again.');
     }
     if (!response.ok) {
       let data;
-      try { data = JSON.parse(result.text); } catch { /* A proxy may return a non-JSON failure. */ }
+      try { data = JSON.parse(text); } catch { /* A proxy may return a non-JSON failure. */ }
       throw new ApiError(response.status, data?.error?.code || 'request_failed', data?.error?.message || `Request failed (${response.status})`, data?.error?.failure);
     }
-    if (binary) return result;
-    const data = JSON.parse(result.text);
+    const data = JSON.parse(text);
     return {data, status: response.status};
   } catch (error) {
     if (timedOut) throw new ApiError(0, 'timeout', 'The request timed out. Please try again.');
@@ -135,7 +114,7 @@ function logout(reason = '') {
   epoch++; loggedIn = false; activeId = null; listing = false; creating = false;
   maxUserMessageBytes = null;
   renameEditor = null;
-  historyLoop.stop(); stopQuery(); stopAllocation();
+  historyLoop.stop(); stopQuery(); allocationSchedule.stop();
   for (const controller of requests) controller.abort();
   requests.clear();
   for (const session of sessions.values()) session.fileInfo.clear();
@@ -169,15 +148,14 @@ function ulid() {
   return result;
 }
 
-function register(description, updateName = true) {
-  const candidate = createSession(description);
+function register(candidate, updateName = true) {
   let session = sessions.get(candidate.id);
   if (session) {
     if (session.start !== candidate.start) throw new Error('The session history start has changed');
     if (session.channelId !== candidate.channelId) throw new Error('The session Channel has changed');
     if (updateName) session.name = candidate.name;
   } else {
-    session = candidate; session.canceling = new Map(); session.downloads = new Set();
+    session = candidate; session.nameVersion = 0; session.canceling = new Map(); session.downloads = new Set();
     sessions.set(session.id, session);
   }
   return session;
@@ -192,12 +170,14 @@ async function loadSessions() {
     if (!loggedIn || epoch !== generation) return;
     if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
     // Validate the full list before registering any of it.
-    data.sessions.forEach(createSession);
+    const candidates = data.sessions.map(createSession);
     // The backend remains authoritative before a limit is available, too.
     maxUserMessageBytes = Number.isInteger(data.max_user_message_bytes) && data.max_user_message_bytes > 0
       ? data.max_user_message_bytes : null;
-    // A list requested before a rename must not overwrite the saved name.
-    for (const description of data.sessions) register(description, version === nameVersion);
+    // Protect only names saved after this request; other sessions still refresh.
+    for (const candidate of candidates) {
+      register(candidate, (sessions.get(candidate.id)?.nameVersion ?? 0) <= version);
+    }
     if (!activeId && sessions.size) activate([...sessions.keys()].sort().at(-1));
   } catch (error) {
     if (loggedIn && epoch === generation) $('directory-error').textContent = message(error);
@@ -214,7 +194,7 @@ async function createConversation() {
   try {
     const {data} = await request(`${API}/sessions`, {method: 'POST', body: {create_request_id: requestId}});
     if (!loggedIn || epoch !== generation) return;
-    const session = register(data, false); setCreateId(null); activate(session.id);
+    const session = register(createSession(data), false); setCreateId(null); activate(session.id);
   } catch (error) {
     if (loggedIn && epoch === generation) $('directory-error').textContent = `${message(error)} Use “Retry create” to finish creating this session.`;
   } finally {
@@ -225,7 +205,7 @@ async function createConversation() {
 function activate(id) {
   if (!loggedIn || !sessions.has(id)) return;
   if (renameEditor?.session.id !== id) renameEditor = null;
-  stopQuery(); stopAllocation(); activeId = id;
+  stopQuery(); allocationSchedule.stop(); activeId = id;
   const session = current(); session.sync = 'loading'; session.error = '';
   render(); historyLoop.activate(session);
   if (session.pending?.phase === 'allocating') allocatePending(session);
@@ -259,7 +239,7 @@ async function saveSessionName() {
     if (!valid(session, generation)) return;
     const renamed = createSession(data);
     if (renamed.id !== session.id || renamed.start !== session.start || renamed.channelId !== session.channelId) throw new Error('Session details do not match');
-    session.name = renamed.name; nameVersion++; saved = true;
+    session.name = renamed.name; session.nameVersion = ++nameVersion; saved = true;
     if (renameEditor === editor) renameEditor = null;
   } catch (error) {
     if (valid(session, generation)) {
@@ -303,34 +283,53 @@ const historyLoop = new ActiveLoop({
   },
 });
 
+function createRequestSchedule() {
+  return {
+    controller: null, timer: null, generation: 0,
+    stop() {
+      this.generation++;
+      clearTimeout(this.timer); this.timer = null;
+      this.controller?.abort(); this.controller = null;
+    },
+    schedule(callback, delay = 0) {
+      if (this.controller || this.timer) return;
+      const generation = this.generation;
+      const run = () => {
+        if (generation !== this.generation) return;
+        this.timer = null;
+        callback(generation);
+      };
+      if (delay) this.timer = setTimeout(run, delay);
+      else run();
+    },
+  };
+}
+
 function stopQuery() {
-  if (queryController && ['sending', 'unknown'].includes(current()?.pending?.phase)) {
+  if (querySchedule.controller && ['sending', 'unknown'].includes(current()?.pending?.phase)) {
     current().pending.uncertain = true;
     if (current().pending.phase === 'sending') current().pending.phase = 'unknown';
   }
-  queryGeneration++; clearTimeout(queryTimer); queryTimer = null;
-  queryController?.abort(); queryController = null;
+  querySchedule.stop();
 }
 
 function startQuery(delay = 0) {
   const session = current();
   if (pageSuspended || !session?.pending || !['unknown', 'sending'].includes(session.pending.phase) ||
-      session.pending.queryStopped || queryController || queryTimer) return;
-  const generation = queryGeneration;
-  if (delay) queryTimer = setTimeout(() => { queryTimer = null; querySubmission(session, session.pending, generation); }, delay);
-  else querySubmission(session, session.pending, generation);
+      session.pending.queryStopped) return;
+  querySchedule.schedule(generation => querySubmission(session, session.pending, generation), delay);
 }
 
 async function querySubmission(session, pending, generation) {
-  if (!pending || current() !== session || generation !== queryGeneration || session.pending !== pending) return;
-  const controller = new AbortController(); queryController = controller;
+  if (!pending || current() !== session || generation !== querySchedule.generation || session.pending !== pending) return;
+  const controller = new AbortController(); querySchedule.controller = controller;
   const previouslyUncertain = !!pending.uncertain;
   let again = true;
   try {
     const {data, status} = await request(endpoint(session, '/turns'), {method: 'POST', signal: controller.signal, body: {
       submission_id: pending.submissionId, text: pending.text, reply_to_seqs: pending.replies, attachments: pending.attachments,
     }});
-    if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
+    if (current() !== session || generation !== querySchedule.generation || session.pending !== pending) return;
     pending.uncertain = true;
     if (data?.submission_id !== pending.submissionId) throw new Error('The send result has a different submission ID');
     if (status === 202 && data.status === 'processing') {
@@ -340,7 +339,7 @@ async function querySubmission(session, pending, generation) {
       confirmSend(session, pending); again = false;
     } else throw new Error('Invalid send response');
   } catch (error) {
-    if (current() !== session || generation !== queryGeneration || session.pending !== pending) return;
+    if (current() !== session || generation !== querySchedule.generation || session.pending !== pending) return;
     if (error.status === 409 && error.code === 'submission_out_of_range') {
       session.inventory = null;
       if (previouslyUncertain) {
@@ -363,8 +362,8 @@ async function querySubmission(session, pending, generation) {
       pending.uncertain = true; pending.phase = 'unknown'; pending.detail = message(error); pending.queryStopped = true; again = false;
     }
   } finally {
-    if (generation === queryGeneration) {
-      queryController = null; scheduleRender(STATUS, session);
+    if (generation === querySchedule.generation) {
+      querySchedule.controller = null; scheduleRender(STATUS, session);
       if (again && session.pending === pending && current() === session) startQuery(1000);
     }
   }
@@ -385,34 +384,29 @@ function confirmSend(session, pending) {
   scheduleRender(DRAFT | MESSAGES | STATUS, session);
 }
 
-function stopAllocation() {
-  allocationGeneration++; clearTimeout(allocationTimer); allocationTimer = null;
-  allocationController?.abort(); allocationController = null;
-}
-
 async function allocateSubmissions() {
   const session = current();
-  if (!session || session.pending?.phase !== 'allocating' || pageSuspended || !loggedIn || allocationController || allocationTimer) return;
+  if (!session || session.pending?.phase !== 'allocating' || pageSuspended || !loggedIn || allocationSchedule.controller || allocationSchedule.timer) return;
   const pending = session.pending;
-  const generation = allocationGeneration;
-  const controller = new AbortController(); allocationController = controller;
+  const generation = allocationSchedule.generation;
+  const controller = new AbortController(); allocationSchedule.controller = controller;
   pending.detail = ''; scheduleRender(STATUS, session);
   let retry = false;
   try {
     const {data} = await request(endpoint(session, '/submissions'), {method: 'POST', body: {count: '100'}, signal: controller.signal});
-    if (current() !== session || generation !== allocationGeneration || session.pending !== pending) return;
+    if (current() !== session || generation !== allocationSchedule.generation || session.pending !== pending) return;
     setInventory(session, data); allocatePending(session);
   } catch (error) {
-    if (current() !== session || generation !== allocationGeneration || session.pending !== pending) return;
+    if (current() !== session || generation !== allocationSchedule.generation || session.pending !== pending) return;
     retry = temporary(error) && error.code !== 'submission_id_exhausted';
     if (retry) pending.detail = 'Preparing to send. Retrying…';
     else rejectSend(session, pending, message(error));
   } finally {
-    if (generation === allocationGeneration) {
-      allocationController = null; scheduleRender(STATUS, session);
-      if (retry && current() === session && session.pending === pending && !pageSuspended) allocationTimer = setTimeout(() => {
-        allocationTimer = null; allocateSubmissions();
-      }, 1000);
+    if (generation === allocationSchedule.generation) {
+      allocationSchedule.controller = null; scheduleRender(STATUS, session);
+      if (retry && current() === session && session.pending === pending && !pageSuspended) {
+        allocationSchedule.schedule(allocateSubmissions, 1000);
+      }
     }
   }
 }
@@ -435,10 +429,10 @@ function sendMessage() {
     }
   }
   if (session.replies.some(seq => {
-    const target = session.turns.get(session.creationIndex.get(seq));
-    return !target || !['completed', 'cancelled'].includes(target.state);
+    const target = session.turns.get(session.terminalIndex.get(seq));
+    return !target || target.state !== 'completed';
   })) {
-    session.error = 'Reply targets must be completed or canceled messages'; scheduleRender(STATUS, session); return;
+    session.error = 'Reply targets must be completed messages'; scheduleRender(STATUS, session); return;
   }
   session.pending = {phase: 'allocating', submissionId: null, text: session.text, replies: session.replies.slice(),
     attachments: session.files.map(file => file.objectId), uncertain: false};
@@ -500,7 +494,7 @@ async function cancelTurn(session, turn) {
   if (session.turns.get(turn.key)?.state !== 'open' || (status && status !== 'unknown')) return;
   const generation = epoch; session.canceling.set(turn.key, 'sending'); session.notice = ''; scheduleRender(MESSAGES | STATUS, session);
   try {
-    const {data} = await request(endpoint(session, '/cancellations'), {method: 'POST', body: {target_turn_id: turn.id}});
+    const {data} = await request(endpoint(session, '/cancellations'), {method: 'POST', body: {target_turn_id: turn.id, start_seq: turn.startSeq}});
     if (!valid(session, generation)) return;
     if (data.status !== 'committed') throw new Error('Cancellation could not be confirmed');
     const latest = session.turns.get(turn.key);
@@ -520,16 +514,20 @@ async function cancelTurn(session, turn) {
 
 export function textPrefix(parts, limit) {
   let prefix = '';
+  let count = 0;
+  if (limit <= 0) return prefix;
   for (const part of parts) {
-    prefix += part.text.slice(0, limit - prefix.length);
-    if (prefix.length === limit) break;
+    for (const character of part.text) {
+      prefix += character;
+      if (++count === limit) return prefix;
+    }
   }
   return prefix;
 }
 
 function snippet(turn) {
   if (!turn) return 'Quoted message';
-  return `${turn.role === 'user' ? 'You' : 'Agent'}: ${textPrefix(turn.parts, 80) || 'Attachment message'}`;
+  return `${turn.role === 'user' ? 'You' : 'Agent'}: ${(turn.error ? 'Message is too long to display.' : textPrefix(turn.parts, 80)) || 'Attachment message'}`;
 }
 
 function formatSize(size) { return size >= 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(1)} MiB` : size >= 1024 ? `${Math.ceil(size / 1024)} KiB` : `${size} B`; }
@@ -577,15 +575,15 @@ function removeReference(index, id, key) {
 }
 
 function createTurnView(session, turn) {
-  const article = node('article', `turn ${turn.role}`); article.id = `message-${turn.creationSeq}`;
+  const article = node('article', `turn ${turn.role}`); article.id = `message-${turn.startSeq}`;
   const header = node('div', 'turn-heading');
   const state = node('span', 'turn-state');
   header.append(node('span', `avatar ${turn.role}`, turn.role === 'user' ? 'You' : '↗'), node('strong', '', turn.role === 'user' ? 'You' : 'Agent'), state);
   const reply = button('Reply', () => {
     const target = session.turns.get(turn.key);
-    if (session.pending || !target || !['completed', 'cancelled'].includes(target.state)) return;
-    if (session.replies.includes(turn.creationSeq)) session.replies = session.replies.filter(seq => seq !== turn.creationSeq);
-    else session.replies.push(turn.creationSeq);
+    if (session.pending || !target || target.state !== 'completed') return;
+    if (session.replies.includes(target.terminalSeq)) session.replies = session.replies.filter(seq => seq !== target.terminalSeq);
+    else session.replies.push(target.terminalSeq);
     scheduleRender(DRAFT | MESSAGES, session); $('message-input').focus();
   });
   header.append(reply);
@@ -595,8 +593,8 @@ function createTurnView(session, turn) {
   if (turn.replies.length) {
     const replies = node('div', 'turn-replies');
     for (const seq of turn.replies) {
-      const target = session.turns.get(session.creationIndex.get(seq));
-      replies.append(button(snippet(target), () => document.getElementById(`message-${seq}`)?.scrollIntoView({block: 'center', behavior: 'smooth'}), 'quoted-reply'));
+      const target = session.turns.get(session.terminalIndex.get(seq));
+      replies.append(button(snippet(target), () => document.getElementById(`message-${target.startSeq}`)?.scrollIntoView({block: 'center', behavior: 'smooth'}), 'quoted-reply'));
     }
     article.append(replies);
   }
@@ -617,7 +615,8 @@ function updateTurnView(session, view, turn, selected) {
       view.attachments = [];
     }
     // Appends grow existing nodes; reset starts a new content generation in place.
-    if (view.partCount < turn.parts.length) {
+    if (turn.error) view.text.data = 'Message is too long to display.';
+    else if (view.partCount < turn.parts.length) {
       view.text.appendData(turn.parts.slice(view.partCount).map(part => part.text).join(''));
       view.partCount = turn.parts.length;
     }
@@ -634,7 +633,7 @@ function updateTurnView(session, view, turn, selected) {
   const pending = !!session.pending;
   setText(view.reply, selected ? 'Reply selected' : 'Reply');
   view.reply.className = `quiet reply-action${selected ? ' selected' : ''}`;
-  view.reply.disabled = pending || turn.state === 'open'; view.reply.setAttribute('aria-pressed', String(selected));
+  view.reply.disabled = pending || turn.state !== 'completed'; view.reply.setAttribute('aria-pressed', String(selected));
   if (view.cancel) {
     const status = session.canceling.get(turn.key);
     view.cancel.hidden = turn.state !== 'open';
@@ -660,7 +659,7 @@ function renderTurns(session) {
       for (const key of viewState.views.keys()) viewState.dirty.add(key);
     }
     for (const seq of new Set([...viewState.selected, ...selected])) {
-      if (viewState.selected.has(seq) !== selected.has(seq)) viewState.dirty.add(session.creationIndex.get(seq));
+      if (viewState.selected.has(seq) !== selected.has(seq)) viewState.dirty.add(session.terminalIndex.get(seq));
     }
     for (const key of new Set([...viewState.canceling.keys(), ...session.canceling.keys()])) {
       if (viewState.canceling.get(key) !== session.canceling.get(key)) viewState.dirty.add(key);
@@ -693,7 +692,7 @@ function renderTurns(session) {
       if (!view) {
         view = createTurnView(session, turn); renderedMessages.views.set(key, view); container.append(view.article);
       }
-      updateTurnView(session, view, turn, selected.has(turn.creationSeq));
+      updateTurnView(session, view, turn, selected.has(turn.terminalSeq));
     }
   }
   for (const attachment of viewState.dirtyAttachments) updateAttachment(session, attachment);
@@ -714,7 +713,7 @@ function renderComposer(session) {
   const previous = renderedComposer?.session === session ? renderedComposer : null;
   renderedComposer = {session, replies: new Map(), files: new Map()};
   for (const seq of session?.replies || []) {
-    const target = session.turns.get(session.creationIndex.get(seq));
+    const target = session.turns.get(session.terminalIndex.get(seq));
     const chip = previous?.replies.get(seq) || button('', () => {
       if (session.pending) return;
       session.replies = session.replies.filter(value => value !== seq); scheduleRender(DRAFT | MESSAGES, session);
@@ -852,7 +851,7 @@ $('file-input').addEventListener('change', event => {
   event.target.value = ''; scheduleRender(DRAFT, session);
 });
 window.addEventListener('pagehide', () => {
-  pageSuspended = true; historyLoop.stop(); stopQuery(); stopAllocation();
+  pageSuspended = true; historyLoop.stop(); stopQuery(); allocationSchedule.stop();
   for (const controller of requests) controller.abort();
 });
 window.addEventListener('pageshow', event => {

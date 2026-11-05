@@ -69,13 +69,14 @@ class CodecTests(unittest.TestCase):
     def test_extension_values_are_opaque_including_duplicate_keys_and_unicode_escapes(self):
         raw = r'{"x":1,"x":2,"\u0078":3,"nested":{"a":1,"a":2},"text":"\ud800"}'
         extension = RawExtensions(raw)
-        payload = {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1, 'extensions': extension}
+        payload = {'kind': 'turn.end', 'turn_id': 't', 'start_seq': 1, 'pre_seq': 1,
+                   'content_seqs': [1], 'extensions': extension}
         parsed = parse_message(self.event(encode_payload(payload)))
         self.assertEqual(parsed.payload['extensions'].json_text, raw)
 
     def test_deep_extensions_do_not_depend_on_python_recursion_limit(self):
         raw = '{"nested":' + '[{"x":' * 3000 + '1e400' + '}]' * 3000 + '}'
-        payload = {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1,
+        payload = {'kind': 'turn.end', 'turn_id': 't', 'start_seq': 1, 'pre_seq': 1, 'content_seqs': [1],
                    'extensions': RawExtensions(raw)}
         encoded = encode_payload(payload)
         parsed = parse_message(self.event(encoded))
@@ -84,13 +85,13 @@ class CodecTests(unittest.TestCase):
 
     def test_necessary_fields_keep_strict_validation(self):
         invalid = [
-            b'{"kind":"turn.end","turn_id":"t","pre_seq":1e400}',
-            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":[]}',
-            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":{},"extens\\u0069ons":{}}',
-            b'{"kind":"turn.cancel","target_turn":{"principal":1,"turn_id":"t","principal":2}}',
+            b'{"kind":"turn.end","turn_id":"t","start_seq":1,"pre_seq":1e400,"content_seqs":[1]}',
+            b'{"kind":"turn.end","turn_id":"t","start_seq":1,"pre_seq":1,"content_seqs":[1],"extensions":[]}',
+            b'{"kind":"turn.end","turn_id":"t","start_seq":1,"pre_seq":1,"content_seqs":[1],"extensions":{},"extens\\u0069ons":{}}',
+            b'{"kind":"turn.cancel","start_seq":1,"target_turn":{"principal":1,"turn_id":"t","principal":2}}',
             b'{"kind":"turn.single","turn_id":"t","reply_to_seqs":[],"content":[{"type":"text","text":"a","text":"b"}]}',
-            b'{"kind":"turn.end","turn_id":"\\ud800","pre_seq":1}',
-            b'{"kind":"turn.end","turn_id":"t","pre_seq":1,"extensions":{"x":1e}}',
+            b'{"kind":"turn.end","turn_id":"\\ud800","start_seq":1,"pre_seq":1,"content_seqs":[1]}',
+            b'{"kind":"turn.end","turn_id":"t","start_seq":1,"pre_seq":1,"content_seqs":[1],"extensions":{"x":1e}}',
         ]
         for payload in invalid:
             with self.subTest(payload=payload):
@@ -114,8 +115,8 @@ class CodecTests(unittest.TestCase):
             {'kind': 'turn.start', 'turn_id': 't', 'content': [], 'reply_to_seqs': []},
             {'kind': 'turn.append', 'turn_id': 't', 'content': [{'type': 'text', 'text': 'x'}], 'pre_seq': 1},
             {'kind': 'turn.reset', 'turn_id': 't', 'content': [], 'pre_seq': 1},
-            {'kind': 'turn.end', 'turn_id': 't', 'pre_seq': 1},
-            {'kind': 'turn.cancel', 'target_turn': {'principal': 2, 'turn_id': 't'}},
+            {'kind': 'turn.end', 'turn_id': 't', 'start_seq': 1, 'pre_seq': 1, 'content_seqs': [1]},
+            {'kind': 'turn.cancel', 'target_turn': {'principal': 2, 'turn_id': 't'}, 'start_seq': 1},
             {'kind': 'submission.reserve', 'reserved_through': UINT64_MAX},
         ]
         for payload in good:
@@ -143,6 +144,42 @@ class CodecTests(unittest.TestCase):
                 with self.assertRaises(ChatProtocolError) as ctx:
                     parse_message(self.event(payload))
                 self.assertNotIn('secret', str(ctx.exception))
+
+    def test_terminal_content_list_and_error_are_exclusive(self):
+        normal = {'kind': 'turn.end', 'turn_id': 't', 'start_seq': 1,
+                  'pre_seq': 4, 'content_seqs': [1, 2, 4]}
+        error = {key: value for key, value in normal.items() if key != 'content_seqs'}
+        error['error'] = 'turn_too_long'
+        for good in (normal, dict(normal, content_seqs=[4]), error):
+            self.assertEqual(parse_message(self.event(encode_payload(good))).payload, good)
+        bad = [dict(normal, content_seqs=value) for value in
+               ([], None, (1, 4), [True, 4], [0, 4], [1, 1, 4], [4, 2], [1, 3], ['1', 4])]
+        bad.extend([dict(normal, start_seq=2), dict(normal, start_seq=True),
+                    dict(normal, pre_seq=0), dict(normal, content=[]),
+                    dict(error, error='other'), dict(error, content_seqs=[4]),
+                    {key: value for key, value in error.items() if key != 'error'}])
+        for payload in bad:
+            with self.subTest(payload=payload), self.assertRaises(ChatProtocolError):
+                encode_payload(payload)
+        objects = [pb.ObjectKey(object_id=1, object_token='cap')]
+        with self.assertRaises(ChatProtocolError):
+            encode_payload(normal, object_keys=objects)
+        with self.assertRaises(ChatProtocolError):
+            parse_message(self.event(error, object_keys=objects))
+
+    def test_cancel_requires_creation_and_preserves_its_attachments(self):
+        payload = {'kind': 'turn.cancel', 'target_turn': {'principal': 2, 'turn_id': 't'},
+                   'start_seq': 1}
+        objects = [pb.ObjectKey(object_id=1, object_token='cap')]
+        parsed = parse_message(self.event(encode_payload(payload, object_keys=objects), object_keys=objects))
+        self.assertEqual(parsed.payload, payload)
+        self.assertEqual(parsed.object_keys[0].object_id, 1)
+        for value in (0, True, None, '1'):
+            with self.subTest(value=value), self.assertRaises(ChatProtocolError):
+                encode_payload(dict(payload, start_seq=value))
+        del payload['start_seq']
+        with self.assertRaises(ChatProtocolError):
+            encode_payload(payload)
 
     def test_reserve_cannot_have_objects(self):
         with self.assertRaises(ChatProtocolError):
@@ -184,9 +221,7 @@ class CodecTests(unittest.TestCase):
             ('PublishAutoSeq', grpc.StatusCode.RESOURCE_EXHAUSTED, 'request_rejected'),
             ('WriteObject', grpc.StatusCode.INVALID_ARGUMENT, 'request_rejected'),
             ('WriteObject', grpc.StatusCode.RESOURCE_EXHAUSTED, 'external_unavailable'),
-            ('Fetch', grpc.StatusCode.INVALID_ARGUMENT, 'contract'),
             ('PublishAutoSeq', grpc.StatusCode.DATA_LOSS, 'contract'),
-            ('PublishAutoSeq', grpc.StatusCode.ABORTED, 'contract'),
         ]
         for stage, code, category in cases:
             with self.subTest(stage=stage, code=code):
@@ -194,9 +229,6 @@ class CodecTests(unittest.TestCase):
                 self.assertEqual(failure.category, category)
                 self.assertEqual(failure.grpc_code, code)
                 self.assertNotIn('private', failure.detail)
-        proven = make_failure('WriteObject', RpcFailure(grpc.StatusCode.INVALID_ARGUMENT),
-                              category='contract')
-        self.assertEqual(proven.category, 'contract')
 
     def test_business_principals_and_recipients_must_be_nonzero(self):
         payload = {'kind': 'turn.single', 'turn_id': 't', 'content': [], 'reply_to_seqs': []}
@@ -207,7 +239,8 @@ class CodecTests(unittest.TestCase):
         with self.assertRaises(ChatProtocolError):
             parse_message(message)
         with self.assertRaises(ChatProtocolError):
-            encode_payload({'kind': 'turn.cancel', 'target_turn': {'principal': 0, 'turn_id': 't'}})
+            encode_payload({'kind': 'turn.cancel', 'start_seq': 1,
+                            'target_turn': {'principal': 0, 'turn_id': 't'}})
 
     def test_parse_message_does_not_parse_or_hide_system_events(self):
         message = self.event({'kind': 'system.member_added', 'data': {

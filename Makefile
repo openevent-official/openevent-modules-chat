@@ -40,16 +40,18 @@ test-package: prepare
 test-frontend: prepare
 	$(NODE) --test tests/frontend/*.test.mjs
 
-build: check-sdk
+build:
 	$(PYTHON) -B scripts/package.py build
 
 install: build
 	$(PYTHON) -B scripts/package.py install $(INSTALL_ARGS)
+	$(MAKE) check-sdk PYTHON="$(PYTHON)"
 
 install-deps: build
 	$(PYTHON) -B scripts/package.py dependencies
 
 verify-wheel: build
+	$(MAKE) check-sdk PYTHON="$(PYTHON)"
 	$(PYTHON) -B scripts/package.py verify
 
 e2e: verify-wheel

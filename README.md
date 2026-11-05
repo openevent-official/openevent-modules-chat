@@ -4,9 +4,9 @@
 
 OpenEvent Chat defines `chat.v1`, a compact event protocol for permanent conversations between users and Agents. A Channel stores turn events and submission-number reservation control events in an append-only history. Text can be appended as a model generates it, and an unfinished streaming turn can be reset and streamed again. Events for different turns can safely interleave.
 
-> The Chat SDK, Chat Server, browser, and Agent must all support the current `chat.v1`, including streaming resets, empty-content starts, attachment-only appends, and replies restricted to terminal targets. Older reading rules are not supported.
+> The Chat SDK, Chat Server, browser, and Agent must adopt the current `chat.v1` end manifests, creation positions, and completed-terminal reply rules together. Older designs and history are incompatible, with no migration provided.
 
-The project includes a Python SDK for `chat.v1` writes, one-page-at-a-time Fetch reads, and stateless message parsing. Streaming messages are appended, reset, and ended through writer objects held by the caller. To continue an existing message, construct `TurnWriter` directly from known state reconstructed by the caller; see the [public write API](docs/CHAT_SDK.md#5-write-api). SDK construction does not recover history automatically. Callers that need continuous reads run their own Fetch loop and retain their read position.
+The project includes a Python SDK for `chat.v1` writes, one-page-at-a-time Fetch reads, content reads by terminal position, and stateless message parsing. Streaming messages are appended, reset, and ended through writer objects held by the caller. To continue an existing message, construct `TurnWriter` directly from known state reconstructed by the caller; see the [public write API](docs/CHAT_SDK.md#5-write-api). SDK construction does not recover history automatically. Callers that need continuous reads run their own Fetch loop and retain their read position.
 The project also provides a chat backend and browser page with sessions, files, and active message polling; it does not include an Agent runtime or model integration.
 
 ## Protocol
@@ -23,11 +23,11 @@ The protocol defines six turn event kinds and one submission-number reservation 
 - `turn.start`: create a streaming turn with a writer-generated `turn_id`, allowing the turn to exist before content is produced; the owner principal and `turn_id` jointly identify the turn.
 - `turn.append`: append text or attachments to an existing turn; see [protocol section 4](docs/CHAT_PROTOCOL.md#4-content-part) for the content constraints.
 - `turn.reset`: replace the current visible content of an open streaming turn while preserving the same reply and its references; see [protocol section 8](docs/CHAT_PROTOCOL.md#8-turnreset) for the complete rules.
-- `turn.end`: normally complete a turn.
+- `turn.end`: complete a turn with an effective-content position list or an explicit error; see [protocol section 9](docs/CHAT_PROTOCOL.md#9-turnend).
 - `turn.cancel`: independently cancel an existing turn.
 - `submission.reserve`: record the current Channel's submission-number reservation upper bound without creating a turn; see [protocol section 13](docs/CHAT_PROTOCOL.md#13-submissionreserve) for the complete rules.
 
-Replies may only reference terminal turns, including cancelled turns, using the target's creation-event seq in `reply_to_seqs`; see [protocol section 12](docs/CHAT_PROTOCOL.md#12-reply-relationships) for the semantics.
+Replies use effective single/end terminal positions in `reply_to_seqs`. Cancelled turns cannot be replied to; error ends can. See [protocol section 12](docs/CHAT_PROTOCOL.md#12-reply-relationships) for the semantics.
 
 `turn.cancel` only records a cancellation fact. Applications using the Chat SDK read effective cancellation events through `fetch_page()` and stop the corresponding model, tool, or other work themselves; the Chat protocol does not directly stop application tasks.
 
@@ -66,6 +66,6 @@ The base protocol supports only text content parts and does not allow event kind
 - An OpenEvent server supporting message UUIDs, as defined in the OpenEvent API documentation.
 - Direct SDK use requires a non-system Channel with `protocol="chat.v1"` created beforehand; the browser application creates Channels automatically.
 
-Build and installation targets use `make check-sdk` to confirm that the installed SDK is available. `make test` uses the test environment's installed dependencies without a separate SDK check or requiring the SDK source submodule; the existing SDK documentation links remain available. `make e2e` also requires `OPENEVENT_SERVER_BIN` to point to an executable OpenEvent server; it uses only the installed SDK and does not install the SDK from source.
+`make build` only builds the package. `make install` resolves the declared dependencies and replaces this project, then runs `make check-sdk` to confirm that the installed SDK is available. `make verify-wheel` also runs this check. `make test` uses the test environment's installed dependencies without a separate SDK check or requiring the SDK source submodule; the existing SDK documentation links remain available. `make e2e` also requires `OPENEVENT_SERVER_BIN` to point to an executable OpenEvent server; it uses only the installed SDK and does not install the SDK from source.
 
 OpenEvent stores events and enforces its own Channel ACLs; it does not parse or validate `chat.v1` JSON.

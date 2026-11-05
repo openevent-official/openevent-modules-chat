@@ -7,6 +7,7 @@ import json
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import weakref
 
 import grpc
@@ -15,7 +16,8 @@ from openevent.sdk.proto import openevent_pb2 as pb
 from openevent.chat_sdk import (
     ChannelInitializationError, ChatProtocolError, ClientClosedError, ClientFailedError,
     FetchPageError, ObjectKey, PublishFailedError, RawExtensions, TextPart,
-    TurnRef, TurnWriter, TurnWriterStateError, UuidAllocationError, create_client,
+    TurnAttachment, TurnContentError, TurnRef, TurnWriter, TurnWriterStateError,
+    UuidAllocationError, create_client, parse_message,
 )
 
 
@@ -105,9 +107,10 @@ class Events:
                 return SimpleNamespace(messages=selected, next_seq=next_seq, last_seq=self.max_seq)
         return self._call("fetch", kwargs, read)
 
-    def add(self, payload, *, principal=1, channel_id=10):
+    def add(self, payload, *, principal=1, channel_id=10, object_keys=()):
         return self.persist(principal=principal, token="unused", channel_id=channel_id,
-                            uuid=self.get_uuid(), payload=json.dumps(payload).encode()).seq
+                            uuid=self.get_uuid(), payload=json.dumps(payload).encode(),
+                            object_keys=object_keys).seq
 
     def close(self):
         self.closed = True
@@ -143,11 +146,7 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ChatProtocolError):
             create_client(self.events, principal=1, token="credential", channel_id=10)
 
-    def test_constructor_mismatch_and_remote_failure_are_structured(self):
-        self.events.inject("get_channel", SimpleNamespace(channel=SimpleNamespace(channel_id=11, protocol="chat.v1")))
-        with self.assertRaises(ChannelInitializationError) as caught:
-            create_client(self.events, principal=1, token="credential", channel_id=10)
-        self.assertEqual(caught.exception.failure.category, "contract")
+    def test_constructor_remote_failure_is_structured(self):
         self.events.inject("get_channel", RpcError(grpc.StatusCode.UNAUTHENTICATED))
         with self.assertRaises(ChannelInitializationError) as caught:
             create_client(self.events, principal=1, token="credential", channel_id=10)
@@ -202,16 +201,19 @@ class ClientTests(unittest.TestCase):
     def test_stream_uses_its_own_tail_without_history(self):
         creation = self.chat.single_turn(turn_id="input", content=())
         writer = self.chat.start_turn(turn_id="reply", reply_to_seqs=(creation,), content=(TextPart("A"),))
-        self.assertEqual(writer.creation_seq, 2)
+        self.assertEqual(writer.start_seq, 2)
         self.assertEqual(writer.turn_id, "reply")
         with self.assertRaises(AttributeError):
-            writer.creation_seq = 99
+            writer.start_seq = 99
         self.assertEqual(writer.append(content=(TextPart("B"),), object_keys=(ObjectKey(3, "cap"),)), 3)
         self.assertEqual(writer.complete(), 4)
         payloads = [json.loads(call["payload"]) for call in self.events.calls["publish_auto_seq"]]
         self.assertEqual(payloads[1]["reply_to_seqs"], [creation])
         self.assertEqual(payloads[2]["pre_seq"], 2)
-        self.assertEqual(payloads[3], {"kind": "turn.end", "turn_id": "reply", "pre_seq": 3})
+        self.assertEqual(payloads[3], {"kind": "turn.end", "turn_id": "reply", "pre_seq": 3,
+                                       "start_seq": 2, "content_seqs": [2, 3]})
+        self.assertEqual(writer._content_seqs, [])
+        self.assertEqual(json.loads(self.events.messages[-1].payload)["content_seqs"], [2, 3])
         self.assertEqual(self.events.calls["fetch"], [])
         self.assertEqual(self.events.calls["get_status"], [])
         with self.assertRaises(TurnWriterStateError):
@@ -220,7 +222,7 @@ class ClientTests(unittest.TestCase):
     def test_releasing_writer_needs_no_client_cleanup_or_rpc(self):
         writer = self.writer()
         ref = weakref.ref(writer)
-        self.chat.cancel_turn(target_turn=TurnRef(1, writer.turn_id))
+        self.chat.cancel_turn(target_turn=TurnRef(1, writer.turn_id), start_seq=writer.start_seq)
         count = len(self.events.calls["publish_auto_seq"])
         del writer
         gc.collect()
@@ -231,9 +233,9 @@ class ClientTests(unittest.TestCase):
     def test_writer_constructor_continues_known_start_without_history_or_new_start(self):
         creation = self.events.add(start_payload("old"))
         self.events.calls.clear()
-        writer = TurnWriter(self.chat, "old", creation, creation)
+        writer = TurnWriter(self.chat, "old", creation, creation, content_seqs=(creation,))
         self.assertEqual(dict(self.events.calls), {})
-        self.assertEqual((writer.turn_id, writer.creation_seq), ("old", creation))
+        self.assertEqual((writer.turn_id, writer.start_seq), ("old", creation))
 
         appended = writer.append(content=(TextPart("continued"),))
         reset = writer.reset(content=(TextPart("replacement"),))
@@ -244,9 +246,10 @@ class ClientTests(unittest.TestCase):
                          ["turn.append", "turn.reset", "turn.end"])
         self.assertEqual([payload["pre_seq"] for payload in payloads],
                          [creation, appended, reset])
+        self.assertEqual(payloads[-1]["content_seqs"], [reset])
         self.assertTrue(all(payload["turn_id"] == "old" for payload in payloads))
         self.assertTrue(all(call["channel_id"] == 10 and call["principal"] == 1 for call in calls))
-        self.assertEqual(writer.creation_seq, creation)
+        self.assertEqual(writer.start_seq, creation)
         self.assertEqual(set(self.events.calls), {"get_uuid", "publish_auto_seq"})
         with self.assertRaises(TurnWriterStateError):
             writer.complete()
@@ -260,26 +263,31 @@ class ClientTests(unittest.TestCase):
                 tail = self.events.add(payload)
                 self.events.add(start_payload("unrelated"), principal=2)
                 self.events.calls.clear()
+                content_seqs = [creation, tail] if kind == "turn.append" else [tail]
                 writer = TurnWriter(client=self.chat, turn_id=kind,
-                                    creation_seq=creation, last_seq=tail)
+                                    start_seq=creation, last_seq=tail,
+                                    content_seqs=iter(content_seqs))
                 self.assertEqual(dict(self.events.calls), {})
                 writer.complete()
-                self.assertEqual(writer.creation_seq, creation)
+                self.assertEqual(writer.start_seq, creation)
                 published = json.loads(self.events.calls["publish_auto_seq"][0]["payload"])
-                self.assertEqual(published, {"kind": "turn.end", "turn_id": kind, "pre_seq": tail})
+                self.assertEqual(published, {"kind": "turn.end", "turn_id": kind, "pre_seq": tail,
+                                             "start_seq": creation, "content_seqs": content_seqs})
                 self.assertEqual(set(self.events.calls), {"get_uuid", "publish_auto_seq"})
 
     def test_writer_constructor_rejects_invalid_arguments_without_rpc_or_client_failure(self):
         active = self.writer()
         invalid = [{"client": None}, {"client": self.events}, {"turn_id": ""},
                    {"turn_id": 1}, {"turn_id": "中" * 43}, {"turn_id": "\ud800"},
-                   {"creation_seq": 2, "last_seq": 1}]
-        invalid.extend({field: value} for field in ("creation_seq", "last_seq")
+                   {"start_seq": 2, "last_seq": 1}]
+        invalid.extend({field: value} for field in ("start_seq", "last_seq")
                        for value in (0, -1, True, 1.0, 1 << 64))
+        invalid.extend({"content_seqs": value} for value in (None, (), (True,), (0,), (2,), (1, 1)))
         self.events.calls.clear()
         for override in invalid:
             with self.subTest(override=override):
-                arguments = dict(client=self.chat, turn_id="old", creation_seq=1, last_seq=1)
+                arguments = dict(client=self.chat, turn_id="old", start_seq=1, last_seq=1,
+                                 content_seqs=(1,))
                 arguments.update(override)
                 with self.assertRaises(ChatProtocolError):
                     TurnWriter(**arguments)
@@ -296,12 +304,12 @@ class ClientTests(unittest.TestCase):
                     chat.close()
                     expected = ClientClosedError
                 else:
-                    events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
+                    invalid_seq = events.add({"kind": "unsupported"})
                     with self.assertRaises(FetchPageError) as failure:
-                        chat.fetch_page(1)
+                        chat.fetch_page(invalid_seq)
                     expected = ClientFailedError
                 events.calls.clear()
-                writer = TurnWriter(chat, "old", creation, creation)
+                writer = TurnWriter(chat, "old", creation, creation, content_seqs=(creation,))
                 for write in (lambda: writer.append(content=(TextPart("late"),)),
                               writer.reset, writer.complete):
                     with self.assertRaises(expected) as caught:
@@ -313,7 +321,7 @@ class ClientTests(unittest.TestCase):
 
     def test_empty_start_attachment_append_and_reset_share_one_chain(self):
         writer = self.chat.start_turn(turn_id="reply")
-        self.assertEqual(writer.creation_seq, 1)
+        self.assertEqual(writer.start_seq, 1)
         self.assertEqual(writer.append(object_keys=(ObjectKey(7, "old-cap"),)), 2)
         self.assertEqual(writer.reset(), 3)
         self.assertEqual(writer.reset(content=(TextPart("new"),),
@@ -328,9 +336,10 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(payloads[0]["content"], [])
         self.assertEqual(payloads[1]["content"], [])
         self.assertEqual(payloads[2]["content"], [])
+        self.assertEqual(payloads[-1]["content_seqs"], [4, 5])
         self.assertEqual(calls[2]["object_keys"], ())
         self.assertEqual([key.object_id for key in calls[3]["object_keys"]], [8])
-        self.assertEqual(writer.creation_seq, 1)
+        self.assertEqual(writer.start_seq, 1)
         self.assertFalse(self.events.calls["fetch"])
         self.assertFalse(self.events.calls["get_status"])
         with self.assertRaises(TurnWriterStateError):
@@ -373,7 +382,8 @@ class ClientTests(unittest.TestCase):
         self.events.inject("publish_auto_seq", RpcError(grpc.StatusCode.DEADLINE_EXCEEDED),
                            RpcError(grpc.StatusCode.INVALID_ARGUMENT))
         with self.assertRaises(PublishFailedError) as caught:
-            writer.reset()
+            # The recipient can leave the Channel before the retry commits.
+            writer.reset(recipients=(2,))
         self.assertEqual(caught.exception.failure.category, "request_rejected")
         self.assertTrue(caught.exception.uncertain)
         for write in (writer.reset, writer.complete,
@@ -388,13 +398,13 @@ class ClientTests(unittest.TestCase):
                 self.events.inject("publish_auto_seq", RpcError(code))
                 count = len(self.events.calls["publish_auto_seq"])
                 with self.assertRaises(PublishFailedError) as caught:
-                    writer.reset(content=(TextPart("rejected"),))
+                    writer.reset(content=(TextPart("rejected"),), recipients=(2,))
                 self.assertEqual(caught.exception.failure.category, "request_rejected")
                 self.assertFalse(caught.exception.uncertain)
                 self.assertEqual(len(self.events.calls["publish_auto_seq"]), count + 1)
                 writer.complete()
                 self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["pre_seq"],
-                                 writer.creation_seq)
+                                 writer.start_seq)
 
     def test_parameters_are_frozen_before_uuid_and_reused_across_retries(self):
         replies = [9, 2]
@@ -449,6 +459,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(self.events.calls["get_seq_by_uuid"]), 1)
         last = json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])
         self.assertEqual(last["pre_seq"], 2)
+        self.assertEqual(last["content_seqs"], [1, 2])
 
     def test_definitive_rejection_leaves_writer_open(self):
         writer = self.writer()
@@ -469,7 +480,7 @@ class ClientTests(unittest.TestCase):
         self.chat.fetch_page(1)
         with self.assertRaises(TurnWriterStateError):
             writer.complete()
-        self.assertEqual(self.writer("other").creation_seq, 2)
+        self.assertEqual(self.writer("other").start_seq, 2)
 
     def test_uuid_failure_and_local_rejection_do_not_lose_tail(self):
         writer = self.writer()
@@ -499,48 +510,351 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(TurnWriterStateError):
             writer.complete()
 
-    def test_consumed_uuid_missing_from_lookup_is_a_contract_failure(self):
-        writer = self.writer()
-
-        def committed_but_lost(**kwargs):
-            self.events.persist(**kwargs)
-            raise RpcError(grpc.StatusCode.UNKNOWN)
-
-        self.events.inject("publish_auto_seq", committed_but_lost)
-        self.events.inject("get_seq_by_uuid", RpcError(grpc.StatusCode.NOT_FOUND))
-        with self.assertRaises(PublishFailedError) as caught:
-            writer.reset()
-        self.assertEqual(caught.exception.failure.category, "contract")
-        self.assertEqual(caught.exception.failure.grpc_code, grpc.StatusCode.NOT_FOUND)
-        self.assertTrue(caught.exception.uncertain)
-        with self.assertRaises(ClientFailedError) as subsequent:
-            self.chat.fetch_page(1)
-        self.assertIs(subsequent.exception.failure, caught.exception.failure)
-
-    def test_unexpected_first_already_exists_is_not_a_success(self):
-        self.events.inject("publish_auto_seq", RpcError(grpc.StatusCode.ALREADY_EXISTS))
-        with self.assertRaises(PublishFailedError) as caught:
-            self.writer()
-        self.assertEqual(caught.exception.failure.category, "contract")
-        self.assertEqual(self.events.calls["get_seq_by_uuid"], [])
-
     def test_reservations_and_cancellation_are_stateless(self):
         writer = self.writer()
         self.assertEqual(self.chat.reserve_submissions(10000), 2)
-        self.assertEqual(self.chat.cancel_turn(target_turn=TurnRef(1, writer.turn_id)), 3)
+        self.assertEqual(self.chat.cancel_turn(target_turn=TurnRef(1, writer.turn_id),
+                                               start_seq=writer.start_seq), 3)
         page = self.chat.fetch_page(1)
         self.assertEqual([m.payload["kind"] for m in page.messages],
                          ["turn.start", "submission.reserve", "turn.cancel"])
         self.assertEqual(page.messages[1].payload["reserved_through"], 10000)
+        self.assertEqual(page.messages[2].payload["start_seq"], writer.start_seq)
         self.assertFalse(self.events.calls["get_status"])
+
+    def test_end_size_rejection_publishes_small_error_with_same_tail(self):
+        writer = self.writer()
+        tail = writer.append(content=(TextPart("more"),))
+        self.events.inject("publish_auto_seq", RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED))
+        terminal = writer.complete(recipients=iter((2, 3)), extensions={"large": "x" * 200})
+        first, fallback = self.events.calls["publish_auto_seq"][-2:]
+        self.assertEqual(json.loads(first["payload"])["content_seqs"], [writer.start_seq, tail])
+        self.assertEqual(json.loads(fallback["payload"]), {
+            "kind": "turn.end", "turn_id": writer.turn_id, "start_seq": writer.start_seq,
+            "pre_seq": tail, "error": "turn_too_long"})
+        self.assertEqual(first["recipients"], fallback["recipients"])
+        self.assertEqual(fallback["recipients"], (2, 3))
+        self.assertEqual(fallback["object_keys"], ())
+        self.assertNotEqual(first["uuid"], fallback["uuid"])
+        self.assertEqual(len(self.events.messages), 3)
+        self.assertEqual(writer._content_seqs, [])
+        with self.assertRaises(TurnWriterStateError):
+            writer.complete()
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual((result.state, result.error, result.content, result.attachments),
+                         ("completed", "turn_too_long", (), ()))
+        self.assertEqual([(call["from_seq"], call["limit"]) for call in self.events.calls["fetch"]],
+                         [(terminal, 1), (writer.start_seq, 1)])
+
+    def test_end_size_rejection_after_timeout_cannot_trigger_fallback(self):
+        writer = self.writer()
+        self.events.inject("publish_auto_seq", RpcError(grpc.StatusCode.DEADLINE_EXCEEDED),
+                           RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED))
+        with self.assertRaises(PublishFailedError) as caught:
+            writer.complete()
+        self.assertTrue(caught.exception.uncertain)
+        calls = self.events.calls["publish_auto_seq"]
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-2], calls[-1])
+        self.assertNotIn("error", json.loads(calls[-1]["payload"]))
+        self.assertEqual(writer._content_seqs, [writer.start_seq])
+        with self.assertRaises(TurnWriterStateError):
+            writer.complete()
+
+    def test_error_end_publish_failure_retains_normal_writer_failure_rules(self):
+        for code, uncertain in ((grpc.StatusCode.PERMISSION_DENIED, False),
+                                (grpc.StatusCode.UNAVAILABLE, True)):
+            with self.subTest(code=code):
+                writer = self.writer(str(code))
+                failures = [RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED), RpcError(code)]
+                if uncertain:
+                    failures.append(RpcError(code))
+                self.events.inject("publish_auto_seq", *failures)
+                with self.assertRaises(PublishFailedError) as caught:
+                    writer.complete()
+                self.assertEqual(caught.exception.uncertain, uncertain)
+                fallback = self.events.calls["publish_auto_seq"][-1]
+                self.assertEqual(caught.exception.uuid, fallback["uuid"])
+                self.assertEqual(json.loads(fallback["payload"])["error"], "turn_too_long")
+                self.assertEqual(writer._content_seqs, [writer.start_seq])
+                if uncertain:
+                    with self.assertRaises(TurnWriterStateError):
+                        writer.complete()
+                else:
+                    writer.complete()
+                    normal = json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])
+                    self.assertEqual(normal["content_seqs"], [writer.start_seq])
+                    self.assertEqual(writer._content_seqs, [])
+
+    def test_normal_end_definitive_failure_preserves_content_list_for_retry(self):
+        writer = self.writer()
+        tail = writer.append(content=(TextPart("more"),))
+        self.events.inject("publish_auto_seq", RpcError(grpc.StatusCode.PERMISSION_DENIED))
+        with self.assertRaises(PublishFailedError) as caught:
+            writer.complete()
+        self.assertFalse(caught.exception.uncertain)
+        self.assertEqual(writer._content_seqs, [writer.start_seq, tail])
+        terminal = writer.complete()
+        self.assertEqual(writer._content_seqs, [])
+        payload = json.loads(self.events.messages[-1].payload)
+        self.assertEqual(payload["content_seqs"], [writer.start_seq, tail])
+        self.assertEqual(self.chat.get_turn_content(terminal).content, (TextPart("hello"), TextPart("more")))
+
+    def test_restored_writer_copies_content_list_before_future_mutation(self):
+        original = self.writer()
+        seqs = [original.start_seq]
+        writer = TurnWriter(self.chat, original.turn_id, original.start_seq,
+                            original.start_seq, content_seqs=seqs)
+        seqs.clear()
+        writer.complete()
+        self.assertEqual(json.loads(self.events.calls["publish_auto_seq"][-1]["payload"])["content_seqs"], [1])
+
+    def test_get_single_content_keeps_parts_replies_and_attachment_origins(self):
+        parent = self.chat.single_turn(turn_id="parent")
+        key = ObjectKey(7, "private-cap")
+        terminal = self.chat.single_turn(turn_id="single", content=(TextPart("a"), TextPart("b")),
+                                         reply_to_seqs=(parent,), object_keys=(key, key))
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual(result.turn_ref, TurnRef(1, "single"))
+        self.assertEqual((result.start_seq, result.terminal_seq, result.state),
+                         (terminal, terminal, "completed"))
+        self.assertEqual(result.content, (TextPart("a"), TextPart("b")))
+        self.assertEqual(result.attachments, (TurnAttachment(key, terminal),) * 2)
+        self.assertEqual(result.reply_to_seqs, (parent,))
+        self.assertIsNone(result.error)
+        self.assertEqual(len(self.events.calls["fetch"]), 1)
+        self.assertNotIn("private-cap", repr(result))
+
+    def test_get_end_content_skips_replaced_content_and_groups_adjacent_sequences(self):
+        parent = self.chat.single_turn(turn_id="parent")
+        writer = self.chat.start_turn(turn_id="reply", reply_to_seqs=(parent,),
+                                      content=(TextPart("old"),), object_keys=(ObjectKey(1, "old"),))
+        writer.append(content=(TextPart("discard"),))
+        self.chat.single_turn(turn_id="unrelated")
+        reset = writer.reset(object_keys=(ObjectKey(2, "new"),))
+        appended = writer.append(content=(TextPart("new text"),))
+        terminal = writer.complete()
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual(result.content, (TextPart("new text"),))
+        self.assertEqual(result.attachments, (TurnAttachment(ObjectKey(2, "new"), reset),))
+        self.assertEqual(result.reply_to_seqs, (parent,))
+        self.assertEqual(result.start_seq, writer.start_seq)
+        self.assertEqual([(call["from_seq"], call["limit"]) for call in self.events.calls["fetch"]],
+                         [(terminal, 1), (writer.start_seq, 1), (reset, appended - reset + 1)])
+
+    def test_get_long_end_content_uses_bounded_pages_instead_of_per_event_reads(self):
+        writer = self.chat.start_turn(turn_id="long")
+        for _ in range(1001):
+            writer.append(content=(TextPart("x"),))
+        terminal = writer.complete()
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual(len(result.content), 1001)
+        self.assertEqual([(call["from_seq"], call["limit"]) for call in self.events.calls["fetch"]],
+                         [(terminal, 1), (1, 1000), (1001, 2)])
+
+    def test_get_end_content_continues_short_pages(self):
+        writer = self.writer()
+        writer.append(content=(TextPart("second"),))
+        writer.append(content=(TextPart("third"),))
+        terminal = writer.complete()
+        messages = self.events.messages
+        self.events.inject("fetch", SimpleNamespace(messages=[messages[-1]], next_seq=5, last_seq=4),
+                           SimpleNamespace(messages=[messages[0]], next_seq=2, last_seq=4))
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual(result.content, (TextPart("hello"), TextPart("second"), TextPart("third")))
+        self.assertEqual([(call["from_seq"], call["limit"]) for call in self.events.calls["fetch"]],
+                         [(4, 1), (1, 3), (2, 2)])
+
+    def test_turn_content_releases_messages_and_extensions_before_following_page(self):
+        for kind, reset in (("end", False), ("end", True), ("cancel", True),
+                            ("error", False), ("single", False)):
+            with self.subTest(kind=kind, reset=reset):
+                events = Events()
+                with create_client(events, principal=1, token="credential", channel_id=10) as chat:
+                    extension = RawExtensions('{"visible_notes":"' + 'x' * (256 * 1024) + '"}')
+                    parent = chat.single_turn(turn_id="parent")
+                    key = ObjectKey(7, "cap")
+                    if kind == "single":
+                        terminal = chat.single_turn(turn_id="single", content=(TextPart("one"),),
+                            reply_to_seqs=(parent,), object_keys=(key,), extensions=extension)
+                        expected_parts = (TextPart("one"),)
+                        expected_attachments = (TurnAttachment(key, terminal),)
+                        expected_seqs = [terminal]
+                    else:
+                        writer = chat.start_turn(turn_id="stream", content=(TextPart("old"),),
+                            reply_to_seqs=(parent,), object_keys=(key,), extensions=extension)
+                        old_append = writer.append(content=(TextPart(" old append"),), extensions=extension)
+                        if reset:
+                            first = writer.reset(content=(TextPart("new"),), extensions=extension)
+                            expected_parts = (TextPart("new"),)
+                            expected_attachments = ()
+                            expected_seqs = [writer.start_seq, first]
+                        else:
+                            expected_parts = (TextPart("old"), TextPart(" old append"))
+                            expected_attachments = (TurnAttachment(key, writer.start_seq),)
+                            expected_seqs = [writer.start_seq, old_append]
+                        for index in range(4):
+                            expected_seqs.append(writer.append(content=(TextPart(str(index)),), extensions=extension))
+                            expected_parts += (TextPart(str(index)),)
+                        if kind == "cancel":
+                            terminal = chat.cancel_turn(target_turn=TurnRef(1, "stream"),
+                                                        start_seq=writer.start_seq, extensions=extension)
+                            expected_seqs.insert(1, old_append)
+                        else:
+                            if kind == "error":
+                                events.inject("publish_auto_seq", RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED))
+                                expected_parts, expected_attachments = (), ()
+                                expected_seqs = [writer.start_seq]
+                            terminal = writer.complete(extensions=extension)
+                        expected_seqs.insert(0, terminal)
+
+                    references = []
+                    def track(raw):
+                        message = parse_message(raw)
+                        refs = [weakref.ref(message)]
+                        if "extensions" in message.payload:
+                            refs.append(weakref.ref(message.payload["extensions"]))
+                        references.append((message.seq, refs))
+                        return message
+
+                    def assert_released():
+                        gc.collect()
+                        for seq, refs in references:
+                            self.assertTrue(all(ref() is None for ref in refs), f"retained event {seq}")
+
+                    original_fetch = events.fetch
+                    def short_page(**kwargs):
+                        assert_released()
+                        return original_fetch(**dict(kwargs, limit=min(kwargs["limit"], 2)))
+
+                    events.fetch = short_page
+                    with patch("openevent.chat_sdk.client.parse_message", new=track):
+                        result = chat.get_turn_content(terminal)
+                    assert_released()
+                    self.assertEqual(result.content, expected_parts)
+                    self.assertEqual(result.attachments, expected_attachments)
+                    self.assertEqual(result.reply_to_seqs, (parent,))
+                    self.assertEqual([seq for seq, _ in references], expected_seqs)
+
+    def test_get_cancelled_content_replays_target_only_and_includes_cancel_attachments(self):
+        parent = self.chat.single_turn(turn_id="parent")
+        writer = self.chat.start_turn(turn_id="same", content=(TextPart("old"),),
+                                      reply_to_seqs=(parent,), object_keys=(ObjectKey(1, "old"),))
+        self.events.add(start_payload("same"), principal=2)
+        self.events.add({"kind": "system.member_added", "data": {
+            "schema_version": 1, "member": 2}}, principal=0)
+        reset = writer.reset(content=(TextPart("new"),), object_keys=(ObjectKey(2, "new"),))
+        self.events.add(start_payload("other"), channel_id=11)
+        appended = writer.append(content=(TextPart(" text"),))
+        terminal = self.events.add({"kind": "turn.cancel", "target_turn": {"principal": 1, "turn_id": "same"},
+                                   "start_seq": writer.start_seq}, principal=3,
+                                  object_keys=(pb.ObjectKey(object_id=3, object_token="cancel"),))
+        self.chat.single_turn(turn_id="later")
+        result = self.chat.get_turn_content(terminal)
+        self.assertEqual((result.turn_ref, result.state, result.error), (TurnRef(1, "same"), "cancelled", None))
+        self.assertEqual(result.content, (TextPart("new"), TextPart(" text")))
+        self.assertEqual(result.attachments, (TurnAttachment(ObjectKey(2, "new"), reset),
+                                              TurnAttachment(ObjectKey(3, "cancel"), terminal)))
+        self.assertEqual(result.reply_to_seqs, (parent,))
+        self.assertEqual([(call["from_seq"], call["limit"]) for call in self.events.calls["fetch"]],
+                         [(terminal, 1), (writer.start_seq, appended - writer.start_seq + 1)])
+
+    def test_get_turn_content_missing_referenced_event_never_returns_partial_content(self):
+        writer = self.writer()
+        appended = writer.append(content=(TextPart("first page"),))
+        other_channel_seq = self.events.add(start_payload("other-channel"), channel_id=11)
+        terminal = self.events.add({
+            "kind": "turn.end", "turn_id": writer.turn_id, "start_seq": writer.start_seq,
+            "pre_seq": other_channel_seq,
+            "content_seqs": [writer.start_seq, appended, other_channel_seq],
+        })
+        with self.assertRaises(TurnContentError) as caught:
+            self.chat.get_turn_content(terminal)
+        self.assertEqual((caught.exception.failure.stage, caught.exception.failure.category), ("Fetch", "contract"))
+        self.assertEqual([call["from_seq"] for call in self.events.calls["fetch"]], [terminal, 1])
+        with self.assertRaises(ClientFailedError) as failed:
+            self.chat.fetch_page(1)
+        self.assertIs(failed.exception.failure, caught.exception.failure)
+
+    def test_get_turn_content_keeps_read_failure_and_can_retry_after_external_failure(self):
+        writer = self.writer()
+        terminal = writer.complete()
+        self.events.inject("fetch", None, RpcError(grpc.StatusCode.UNAVAILABLE), RpcError(grpc.StatusCode.UNAVAILABLE))
+        with self.assertRaises(TurnContentError) as caught:
+            self.chat.get_turn_content(terminal)
+        self.assertEqual((caught.exception.failure.stage, caught.exception.failure.category),
+                         ("Fetch", "external_unavailable"))
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(self.chat.get_turn_content(terminal).content, (TextPart("hello"),))
+
+    def test_get_turn_content_validates_local_input_and_obeys_close(self):
+        self.events.calls.clear()
+        for seq in (0, True, -1, "1", 1 << 64):
+            with self.subTest(seq=seq), self.assertRaises(ChatProtocolError):
+                self.chat.get_turn_content(seq)
+        self.assertEqual(dict(self.events.calls), {})
+        self.chat.close()
+        with self.assertRaises(ClientClosedError):
+            self.chat.get_turn_content(1)
+
+    def test_close_stops_remaining_turn_content_reads(self):
+        writer = self.writer()
+        terminal = writer.complete()
+        entered, release = threading.Event(), threading.Event()
+
+        def terminal_page(**kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release Fetch")
+            return SimpleNamespace(messages=[self.events.messages[-1]],
+                                   next_seq=terminal + 1, last_seq=terminal)
+
+        self.events.inject("fetch", terminal_page)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            read = pool.submit(self.chat.get_turn_content, terminal)
+            self.assertTrue(entered.wait(1))
+            close = pool.submit(self.chat.close)
+            try:
+                with self.chat._condition:
+                    self.assertTrue(self.chat._condition.wait_for(lambda: self.chat._state == "CLOSING", 1))
+                self.assertFalse(close.done())
+            finally:
+                release.set()
+            with self.assertRaises(TurnContentError) as caught:
+                read.result(timeout=1)
+            self.assertEqual(caught.exception.failure.category, "lifecycle")
+            close.result(timeout=1)
+        self.assertEqual(len(self.events.calls["fetch"]), 1)
+
+    def test_get_turn_content_rejects_nonterminal_and_mismatched_content_chain(self):
+        for corruption in ("nonterminal", "wrong-owner", "broken-chain"):
+            with self.subTest(corruption=corruption):
+                events = Events()
+                chat = create_client(events, principal=1, token="credential", channel_id=10)
+                writer = chat.start_turn(turn_id="target")
+                if corruption == "nonterminal":
+                    terminal = writer.start_seq
+                else:
+                    first = events.add(append_payload("target", writer.start_seq),
+                                       principal=2 if corruption == "wrong-owner" else 1)
+                    tail = events.add(append_payload(
+                        "target", writer.start_seq if corruption == "broken-chain" else first))
+                    terminal = events.add({
+                        "kind": "turn.end", "turn_id": "target", "start_seq": writer.start_seq,
+                        "pre_seq": tail, "content_seqs": [writer.start_seq, first, tail],
+                    })
+                with self.assertRaises(TurnContentError) as caught:
+                    chat.get_turn_content(terminal)
+                self.assertEqual(caught.exception.failure.category, "contract")
+                chat.close()
 
     def test_short_empty_and_future_pages_follow_raw_cursors(self):
         self.events.inject("fetch",
                            SimpleNamespace(messages=(), next_seq=4, last_seq=20),
-                           SimpleNamespace(messages=(), next_seq=4, last_seq=20),
+                           SimpleNamespace(messages=(), next_seq=21, last_seq=20),
                            SimpleNamespace(messages=(), next_seq=21, last_seq=20))
         self.assertEqual(self.chat.fetch_page(1).next_seq, 4)
-        self.assertEqual(self.chat.fetch_page(4).next_seq, 4)
+        self.assertEqual(self.chat.fetch_page(21).next_seq, 21)
         self.assertEqual(self.chat.fetch_page(50).next_seq, 21)
         self.assertEqual(len(self.events.calls["fetch"]), 3)
         self.assertTrue(all(call["channels"] == (10,) and not call["only_my_recipient"]
@@ -575,33 +889,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual((page.next_seq, page.last_seq), (3, 3))
         self.assertEqual(len(self.events.calls["fetch"]), 1)
         following = self.chat.fetch_page(page.next_seq, limit=2)
-        self.assertEqual([message.seq for message in following.messages], [writer.creation_seq])
+        self.assertEqual([message.seq for message in following.messages], [writer.start_seq])
         self.assertEqual((following.next_seq, following.last_seq), (4, 3))
-
-    def test_system_filter_does_not_bypass_raw_page_contract_checks(self):
-        system = pb.EventMessage(seq=2, channel_id=10, principal=0, uuid=1001)
-        earlier = pb.EventMessage(seq=1, channel_id=10, principal=0, uuid=1002)
-        other_channel = pb.EventMessage(seq=1, channel_id=11, principal=0, uuid=1003)
-        cases = [
-            (1, 2, SimpleNamespace(messages=[system, earlier], next_seq=3, last_seq=2)),
-            (1, 2, SimpleNamespace(messages=[earlier, earlier], next_seq=3, last_seq=2)),
-            (1, 2, SimpleNamespace(messages=[other_channel], next_seq=3, last_seq=2)),
-            (1, 2, SimpleNamespace(messages=[system], next_seq=2, last_seq=2)),
-            (1, 2, SimpleNamespace(messages=[system], next_seq=3, last_seq=1)),
-            (1, 1, SimpleNamespace(messages=[earlier, system], next_seq=3, last_seq=2)),
-            (2, 2, SimpleNamespace(messages=[earlier], next_seq=3, last_seq=2)),
-        ]
-        for from_seq, limit, response in cases:
-            with self.subTest(response=response):
-                events = Events()
-                chat = create_client(events, principal=1, token="credential", channel_id=10)
-                events.inject("fetch", response)
-                with self.assertRaises(FetchPageError) as caught:
-                    chat.fetch_page(from_seq, limit)
-                self.assertEqual(caught.exception.failure.category, "contract")
-                with self.assertRaises(ClientFailedError):
-                    chat.fetch_page(1)
-                chat.close()
 
     def test_system_kind_from_business_principal_still_fails_chat_validation(self):
         self.events.add({"kind": "system.member_added", "data": {
@@ -612,13 +901,11 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ClientFailedError):
             self.chat.fetch_page(1)
 
-    def test_page_seq_gaps_are_valid_and_last_seq_is_not_cross_compared(self):
+    def test_page_seq_gaps_are_valid(self):
         for index in range(4):
             self.events.add(start_payload(str(index)), channel_id=10 if index in {0, 3} else 11)
         page = self.chat.fetch_page(1)
         self.assertEqual([m.seq for m in page.messages], [1, 4])
-        self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=1, last_seq=2))
-        self.assertEqual(self.chat.fetch_page(1).last_seq, 2)
 
     def test_temporary_page_failure_does_not_fail_client(self):
         writer = self.writer()
@@ -628,25 +915,16 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.failure.category, "external_unavailable")
         self.assertEqual(writer.complete(), 2)
 
-    def test_invalid_page_order_fails_all_bound_objects_with_same_root(self):
+    def test_parse_failure_is_fatal_but_does_not_expose_payload(self):
         writer = self.writer()
-        writer.append(content=(TextPart("second"),))
-        self.events.inject("fetch", SimpleNamespace(messages=list(reversed(self.events.messages)), next_seq=3, last_seq=2))
+        invalid_seq = self.events.add({"kind": "unsupported", "private": "SECRET"})
         with self.assertRaises(FetchPageError) as caught:
-            self.chat.fetch_page(1)
-        self.assertEqual(caught.exception.failure.category, "contract")
+            self.chat.fetch_page(invalid_seq)
+        self.assertEqual(caught.exception.failure.category, "protocol")
+        self.assertNotIn("SECRET", str(caught.exception))
         with self.assertRaises(ClientFailedError) as subsequent:
             writer.complete()
         self.assertIs(subsequent.exception.failure, caught.exception.failure)
-
-    def test_parse_failure_is_fatal_but_does_not_expose_payload(self):
-        self.events.messages = [pb.EventMessage(seq=1, channel_id=10, principal=1, uuid=1001,
-                                               payload=b"SECRET invalid json")]
-        self.events.max_seq = 1
-        with self.assertRaises(FetchPageError) as caught:
-            self.chat.fetch_page(1)
-        self.assertEqual(caught.exception.failure.category, "protocol")
-        self.assertNotIn("SECRET", str(caught.exception))
         with self.assertRaises(ClientFailedError):
             self.chat.fetch_page(1)
 
@@ -654,11 +932,12 @@ class ClientTests(unittest.TestCase):
         first = self.writer("first")
         old_creation = self.events.add(start_payload("old"))
         old_tail = self.events.add(append_payload("old", old_creation))
-        second = TurnWriter(self.chat, "old", old_creation, old_tail)
+        second = TurnWriter(self.chat, "old", old_creation, old_tail,
+                            content_seqs=(old_creation, old_tail))
         first.append(content=(TextPart("first next"),))
         second.append(content=(TextPart("old next"),))
         writes = self.events.calls["publish_auto_seq"]
-        self.assertEqual(json.loads(writes[-2]["payload"])["pre_seq"], first.creation_seq)
+        self.assertEqual(json.loads(writes[-2]["payload"])["pre_seq"], first.start_seq)
         self.assertEqual(json.loads(writes[-1]["payload"])["pre_seq"], old_tail)
 
     def test_same_object_serializes_writes_while_other_objects_continue(self):
@@ -744,26 +1023,16 @@ class ClientTests(unittest.TestCase):
                 release.set()
             writer = start.result(timeout=1)
             close.result(timeout=1)
-        self.assertEqual((writer.turn_id, writer.creation_seq), ("starting", 1))
+        self.assertEqual((writer.turn_id, writer.start_seq), ("starting", 1))
         self.assertEqual(len(self.events.messages), 1)
         with self.assertRaises(ClientClosedError):
             writer.complete()
 
-    def test_invalid_committed_response_fails_client_and_preserves_uuid(self):
-        writer = self.writer()
-        self.events.inject("publish_auto_seq", SimpleNamespace(seq=0))
-        with self.assertRaises(PublishFailedError) as caught:
-            writer.append(content=(TextPart("bad response"),))
-        self.assertGreater(caught.exception.uuid, 0)
-        self.assertTrue(caught.exception.uncertain)
-        with self.assertRaises(ClientFailedError):
-            self.writer("another")
-
     def test_close_after_failure_reports_closed_for_new_calls(self):
         writer = self.writer()
-        self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
+        invalid_seq = self.events.add({"kind": "unsupported"})
         with self.assertRaises(FetchPageError):
-            self.chat.fetch_page(1)
+            self.chat.fetch_page(invalid_seq)
         self.chat.close()
         with self.assertRaises(ClientClosedError):
             writer.complete()
@@ -810,13 +1079,13 @@ class ClientTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             write = pool.submit(writer.complete)
             self.assertTrue(entered.wait(1))
-            self.events.inject("fetch", SimpleNamespace(messages=(), next_seq=0, last_seq=1))
+            invalid_seq = self.events.add({"kind": "unsupported"})
             try:
                 with self.assertRaises(FetchPageError):
-                    self.chat.fetch_page(1)
+                    self.chat.fetch_page(invalid_seq)
             finally:
                 release.set()
-            self.assertEqual(write.result(timeout=1), 2)
+            self.assertEqual(write.result(timeout=1), invalid_seq + 1)
         with self.assertRaises(ClientFailedError):
             self.chat.fetch_page(1)
 

@@ -4,7 +4,7 @@
 
 This page provides minimal examples only. See [CHAT_SDK.md](CHAT_SDK.md) for the complete public API, retry, and lifecycle rules.
 
-The examples use replies by creation event seq, independent writers, continuing turns from known state, empty-content starts, and resets.
+The examples use replies by completed terminal seq, targeted content reads, independent writers, continuing turns from known state, empty-content starts, and resets.
 
 ## Prerequisites
 
@@ -30,7 +30,7 @@ Deploy only one active writing process per `(principal, channel_id)`; different 
 ## Writing and reading
 
 ```python
-user_creation_seq = chat.single_turn(
+user_start_seq = chat.single_turn(
     turn_id="user-1",
     reply_to_seqs=(),
     content=(TextPart("Hello"),),
@@ -38,10 +38,9 @@ user_creation_seq = chat.single_turn(
 
 writer = chat.start_turn(
     turn_id="reply-1",
-    reply_to_seqs=(user_creation_seq,),
+    reply_to_seqs=(user_start_seq,),
     content=(TextPart("Hello"),),
 )
-reply_creation_seq = writer.creation_seq
 writer.append(content=(TextPart(", nice to meet you."),))
 reply_end_seq = writer.complete()
 del writer
@@ -58,19 +57,34 @@ while True:
 
 A successful write return means OpenEvent committed the message. The example application loop reads from the history start one page at a time, saves `next_seq` after processing each page, and stops after passing the reply's end event. The SDK has already excluded OpenEvent system messages; continue using the returned cursor even if the page contains no Chat messages. Applications also organize their own continuous read and processing loops. Tail waits and stopping conditions are covered by the [one-page read contract](CHAT_SDK.md#32-reading-one-page).
 
-Save the seq returned by `single_turn`, or the `creation_seq` of a writer returned by `start_turn`, and pass it in `reply_to_seqs` when replying after confirming the target is terminal. The SDK validates field shape only; it does not read history to validate targets. Select valid targets according to [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
+Save the seq returned by `single_turn` or `writer.complete()` and pass it in `reply_to_seqs` after confirming it is the target's effective completed terminal event. Start and cancel events cannot be reply targets. The SDK validates field shape only; it does not read history to validate targets. Select valid targets according to [protocol section 12](CHAT_PROTOCOL.md#12-reply-relationships).
 
-For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn` to record cancellation of an existing TurnRef. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. For files generated during output, see the [attachment append example](CHAT_SDK.md#5-write-api).
+For a streaming turn, obtain a writer with `start_turn`, call its `append()` zero or more times, then call `complete()`. The writer keeps its own tail; the client keeps no turn state. Release the writer after completion. Use `cancel_turn(target_turn=..., start_seq=...)` to record cancellation. Once normal reads observe an effective cancellation, stop writing and release the writer. Releasing it neither publishes events nor revokes in-flight requests. For files generated during output, see the [attachment append example](CHAT_SDK.md#5-write-api).
+
+## Reading content by terminal position
+
+After normal reading confirms that `reply_end_seq` is the effective end position, retrieve that turn on its own:
+
+```python
+turn = chat.get_turn_content(reply_end_seq)
+print(turn.state, turn.error, "".join(part.text for part in turn.content))
+for attachment in turn.attachments:
+    print(attachment.event_seq, attachment.object_key.object_id)
+```
+
+Single, end, and cancel events are readable. See the [targeted-read contract](CHAT_SDK.md#33-read-content-by-terminal-position) for read ranges and result fields.
+The method reads neither attachment metadata nor file contents and does not replace recovery of unfinished turns.
 
 ## Continuing an unfinished turn
 
-When an application's own reader has confirmed that a turn is unfinished and knows its creation position and current tail, it can construct a writer directly:
+When an application's own reader has confirmed that a turn is unfinished and knows its creation position, current tail, and effective-content event positions, it can construct a writer directly:
 
 ```python
 from openevent.chat_sdk import TurnWriter
 
 # The application projection confirmed this turn's state, and the old-write handoff is complete.
-writer = TurnWriter(chat, turn_id="unfinished-1", creation_seq=210, last_seq=217)
+writer = TurnWriter(chat, turn_id="unfinished-1", start_seq=210, last_seq=217,
+                    content_seqs=(210, 214, 217))
 writer.append(content=(TextPart("Continuing the previous reply."),))
 writer.complete()
 ```
@@ -85,7 +99,7 @@ The example first creates a cancellable turn with empty content, then appends mo
 ```python
 writer = chat.start_turn(
     turn_id="retryable-reply-1",
-    reply_to_seqs=(user_creation_seq,),
+    reply_to_seqs=(user_start_seq,),
     content=(),
 )
 writer.append(content=(TextPart("Partial content before the interruption"),))
