@@ -1203,14 +1203,15 @@ test('a lower refreshed text limit does not block confirmation of an uncertain s
   ui.get('logout').click();
 });
 
-test('a server text-limit rejection preserves an editable draft when no local limit was loaded', async () => {
+test('a lower server text limit rejects a draft accepted by the cached limit and preserves editing', async () => {
   let sends = 0;
   const ui = environment(call => {
     if (call.url === '/api/chat/sessions') return call.method === 'POST'
-      ? ok(description, 201) : err(503, 'temporarily_unavailable');
+      ? ok(description, 201) : ok({sessions: [], max_user_message_bytes: 32});
     if (call.url.includes('/history?')) return ok(empty());
     if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
     if (call.url.endsWith('/turns')) {
+      // The server restarted with a lower limit before the page refreshed its list.
       if (++sends === 1) return ok({error: {code: 'message_too_long', message: 'Message is too long. Shorten it and send again.'}}, 413);
       const id = JSON.parse(call.body).submission_id;
       return ok({submission_id: id, status: 'committed', turn_ref: {role: 'user', turn_id: `user:${id}`}}, 201);
@@ -1373,11 +1374,69 @@ test('creating again after a lost response reuses its stored ULID and logout dis
   assert.equal(ui.timers.size, 0); assert.equal(ui.storage.size, 0);
 });
 
+test('manual and saved tokens keep the login page visible until verification succeeds', async () => {
+  for (const saved of [false, true]) {
+    const pending = [];
+    const ui = environment(call => {
+      if (call.url === '/api/chat/sessions') return new Promise(resolve => pending.push(resolve));
+      if (call.url.includes('/history?')) return ok(empty());
+      throw new Error(`unexpected request ${call.url}`);
+    });
+    ui.document.cookie = saved ? 'web_token=wrong-token' : '';
+    await load(`login-verification-${saved}`);
+    if (!saved) {
+      assert.equal(ui.calls.length, 0);
+      ui.get('token').value = 'wrong-token'; ui.get('login-form').dispatch('submit');
+    }
+    assert.equal(ui.get('workspace').hidden, true);
+    await flush();
+    assert.equal(ui.get('login').hidden, false); assert.equal(ui.get('workspace').hidden, true);
+    assert.equal(ui.get('token').disabled, true); assert.equal(ui.get('open-chat').disabled, true);
+    assert.equal(ui.get('open-chat-label').textContent, 'Checking…');
+    ui.get('login-form').dispatch('submit');
+    assert.equal(ui.calls.length, 1);
+    pending[0](err(401, 'unauthenticated'));
+    await until(() => !ui.get('token').disabled);
+    assert.equal(ui.get('workspace').hidden, true); assert.equal(ui.get('login').hidden, false);
+    assert.equal(ui.get('open-chat').disabled, false);
+    assert.match(ui.get('login-error').textContent, /access token/);
+    assert.equal(ui.calls.length, 1); assert.equal(ui.timers.size, 0);
+    assert.match(ui.document.cookie, /^web_token=;/);
+
+    ui.get('token').value = 'valid-token'; ui.get('login-form').dispatch('submit');
+    await flush();
+    assert.equal(ui.get('workspace').hidden, true); assert.equal(ui.get('login-error').textContent, '');
+    pending[1](ok({sessions: saved ? [description] : []}));
+    await until(() => !ui.get('workspace').hidden);
+    assert.equal(ui.get('login').hidden, true); assert.equal(ui.get('token').value, '');
+    assert.equal(ui.calls.filter(call => call.url === '/api/chat/sessions').length, 2);
+    if (saved) assert.equal(ui.get('session-title').textContent, description.name);
+    else assert.equal(ui.get('send').disabled, true);
+    ui.get('logout').click();
+  }
+});
+
+test('a login service failure stays on the token page and allows a manual retry', async () => {
+  let attempts = 0;
+  const ui = environment(call => {
+    assert.equal(call.url, '/api/chat/sessions');
+    return ++attempts === 1 ? err(503, 'server_unavailable') : ok({sessions: []});
+  });
+  await load('login-service-failure');
+  assert.equal(ui.get('login').hidden, false); assert.equal(ui.get('workspace').hidden, true);
+  assert.match(ui.get('login-error').textContent, /server_unavailable/);
+  assert.equal(ui.get('token').value, 'test-token'); assert.equal(ui.get('token').disabled, false);
+  assert.equal(ui.get('open-chat').disabled, false); assert.equal(ui.timers.size, 0);
+  ui.get('login-form').dispatch('submit'); await until(() => !ui.get('workspace').hidden);
+  assert.equal(attempts, 2);
+  ui.get('logout').click();
+});
+
 test('an unauthenticated API response returns to the token page and sends no further requests', async () => {
-  const ui = environment(() => err(401, 'unauthenticated'));
+  const ui = environment(call => call.url === '/api/chat/sessions' ? ok({sessions: [description]}) : err(401, 'unauthenticated'));
   await load('auth'); await flush();
   assert.equal(ui.get('workspace').hidden, true); assert.equal(ui.get('login').hidden, false);
-  assert.equal(ui.calls.length, 1); assert.equal(ui.timers.size, 0); assert.match(ui.get('login-error').textContent, /access token/);
+  assert.equal(ui.calls.length, 2); assert.equal(ui.timers.size, 0); assert.match(ui.get('login-error').textContent, /access token/);
 });
 
 test('a proxy 503 without failure metadata retries history from the unchanged cursor', async () => {

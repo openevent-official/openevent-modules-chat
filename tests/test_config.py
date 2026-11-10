@@ -35,6 +35,33 @@ class ServerConfigTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.data), encoding="utf-8")
         return config.ServerConfig.load(self.path)
 
+    def test_http_settings_default_without_changing_positional_configuration(self):
+        loaded = self.load()
+        self.assertEqual((loaded.host, loaded.port, loaded.origin), ("127.0.0.1", 8080, None))
+        positional = config.ServerConfig("localhost:50051", self.path.parent / "channels",
+                                         "browser-secret", 10, "user-secret", 20, 500.0, 0, 8192)
+        self.assertEqual(positional.max_user_message_bytes, 8192)
+        self.assertEqual((positional.host, positional.port, positional.origin), ("127.0.0.1", 8080, None))
+
+    def test_http_settings_accept_configured_values_and_ephemeral_port(self):
+        for host, port, origin in (("0.0.0.0", 8081, None), ("localhost", 0, "https://chat.example.test"),
+                                   ("::1", 65535, "http://[::1]:65535")):
+            with self.subTest(host=host, port=port, origin=origin):
+                self.data.update(host=host, port=port, origin=origin)
+                loaded = self.load()
+                self.assertEqual((loaded.host, loaded.port, loaded.origin), (host, port, origin))
+
+    def test_http_settings_reject_invalid_types_empty_strings_and_out_of_range_ports(self):
+        for field, values in (("host", ("", None, 0, True, [], {})),
+                              ("port", (-1, 65536, True, False, 8080.0, "8080", None, [], {})),
+                              ("origin", ("", 0, True, [], {}))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.data[field] = value
+                    with self.assertRaises(config.ConfigurationError):
+                        self.load()
+            del self.data[field]
+
     def test_message_limit_defaults_to_64_kib_and_accepts_positive_integers(self):
         self.assertEqual(self.load().max_user_message_bytes, 65536)
         for limit in (1, 7, 65536, 131072):

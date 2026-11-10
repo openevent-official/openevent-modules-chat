@@ -14,9 +14,6 @@ from .service import ChatService
 def main(argv=None):
     parser = argparse.ArgumentParser(description="OpenEvent browser chat server")
     parser.add_argument("--config", required=True, help="server JSON configuration file")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--origin", help="public origin, required for an HTTPS reverse proxy")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     service = server = None
@@ -24,13 +21,13 @@ def main(argv=None):
     try:
         config = ServerConfig.load(args.config)
         service = ChatService(config)
-        server = ChatHTTPServer((args.host, args.port), service, origin=args.origin)
+        server = ChatHTTPServer((config.host, config.port), service, origin=config.origin)
         if threading.current_thread() is threading.main_thread():
             def stop(_signum, _frame):
                 server.request_stop()
             signal.signal(signal.SIGINT, stop)
             signal.signal(signal.SIGTERM, stop)
-        logging.info("chat server listening on %s:%s", args.host, server.server_port)
+        logging.info("chat server listening on %s:%s", config.host, server.server_port)
         server.serve_forever()
         exit_code = 0
     except ConfigurationError as exc:

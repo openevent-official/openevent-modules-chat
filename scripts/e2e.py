@@ -162,10 +162,10 @@ def run():
                 'openevent_target': event_target, 'channels_dir': str(channels),
                 'web_token': web_token, 'user_principal': '9001',
                 'user_openevent_token': user_token, 'agent_principal': '9002',
-                'rpc_timeout_ms': 2000, 'max_retries': 1}), encoding='utf-8')
+                'rpc_timeout_ms': 2000, 'max_retries': 1,
+                'host': '127.0.0.1', 'port': http_port}), encoding='utf-8')
             origin = f'http://127.0.0.1:{http_port}'
-            command = [sys.executable, '-B', '-m', 'openevent.chat_app', '--config', str(app_config),
-                       '--host', '127.0.0.1', '--port', str(http_port)]
+            command = [sys.executable, '-B', '-m', 'openevent.chat_app', '--config', str(app_config)]
 
             def request(method, path, body=None, *, auth=True, raw=None, content_type=None, request_origin=origin,
                         decode_json=True):

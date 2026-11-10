@@ -37,6 +37,9 @@ Create `chat.json` and protect its credentials through deployment access control
 
 ```json
 {
+  "host": "127.0.0.1",
+  "port": 8080,
+  "origin": null,
   "openevent_target": "127.0.0.1:9527",
   "channels_dir": "./channels",
   "web_token": "replace-with-browser-access-token",
@@ -51,22 +54,22 @@ Create `chat.json` and protect its credentials through deployment access control
 
 A relative `channels_dir` is resolved from the configuration file's directory and is created automatically if absent. The deployment must ensure that only the backend's operating identity can read and write the configuration file and directory, with one process per directory. Restart after changing configuration; neither the configuration file nor the target directory may be a symbolic link.
 
+`host`, `port`, and `origin` are read from this configuration and are optional, defaulting to `127.0.0.1`, `8080`, and `null` respectively.
+`port` is an integer in `0..65535`; `0` asks the system to assign an available port.
+
 `max_user_message_bytes` is optional, defaults to 65536 (64 KiB), and must be a positive integer. It limits each newly sent user message's text by its UTF-8 byte count, including spaces and line breaks; Chinese characters and emoji usually occupy multiple bytes.
 Attachments and reply-target content do not count toward this limit. Existing history and Agent output remain readable; the Agent checks its own budget for the complete model input.
 
 ```sh
-openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080
+openevent-chat --config ./chat.json
 ```
 
 After startup, the log prints the actual listening address and port.
 
 Open `http://127.0.0.1:8080/api/chat/`, enter `web_token`, and create a session. Each session automatically creates its private Channel; no manual session file is needed. The browser access token, OpenEvent user credentials, and Agent credentials serve three distinct purposes and must not be substituted for one another.
+The page validates the entered or saved token before showing the chat area; if validation fails, it stays on the token page, explains the error, and lets you retry.
 
-In production, access the application through an HTTPS reverse proxy and explicitly configure the external origin, for example:
-
-```sh
-openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080 --origin https://chat.example.com
-```
+In production, access the application through an HTTPS reverse proxy, set `origin` in `chat.json` to the external address, such as `"https://chat.example.com"`, and use the same startup command.
 
 The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Cookie over HTTPS; local HTTP is for development only. The token does not appear in URLs. “Sign out” clears the chat records, drafts, and Cookie saved by the current page.
 

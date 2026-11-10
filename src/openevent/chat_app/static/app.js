@@ -124,6 +124,13 @@ function logout(reason = '') {
   render(); $('token').focus();
 }
 
+function login(token) {
+  if (!token || loggedIn || listing) return;
+  writeToken(token); epoch++;
+  $('token').value = token; $('login-error').textContent = '';
+  loadSessions({authenticate: true});
+}
+
 function readCreateId() {
   try {
     const value = sessionStorage.getItem('openevent.pending-create');
@@ -161,26 +168,31 @@ function register(candidate, updateName = true) {
   return session;
 }
 
-async function loadSessions() {
-  if (listing || !loggedIn) return;
+async function loadSessions({authenticate = false} = {}) {
+  if (listing || (!loggedIn && !authenticate)) return;
   const version = nameVersion;
   listing = true; const generation = epoch; $('directory-error').textContent = ''; scheduleRender(DIRECTORY);
   try {
     const {data} = await request(`${API}/sessions`);
-    if (!loggedIn || epoch !== generation) return;
+    if (epoch !== generation) return;
     if (!Array.isArray(data.sessions)) throw new Error('Invalid session list');
     // Validate the full list before registering any of it.
     const candidates = data.sessions.map(createSession);
-    // The backend remains authoritative before a limit is available, too.
+    // Use the limit supplied by the session list.
     maxUserMessageBytes = Number.isInteger(data.max_user_message_bytes) && data.max_user_message_bytes > 0
       ? data.max_user_message_bytes : null;
     // Protect only names saved after this request; other sessions still refresh.
     for (const candidate of candidates) {
       register(candidate, (sessions.get(candidate.id)?.nameVersion ?? 0) <= version);
     }
+    if (authenticate) {
+      loggedIn = true; $('token').value = ''; scheduleRender(ALL_REGIONS);
+    }
     if (!activeId && sessions.size) activate([...sessions.keys()].sort().at(-1));
   } catch (error) {
-    if (loggedIn && epoch === generation) $('directory-error').textContent = message(error);
+    if (epoch !== generation) return;
+    if (authenticate && error.status === 401) logout(message(error));
+    else $(authenticate ? 'login-error' : 'directory-error').textContent = message(error);
   } finally {
     if (epoch === generation) { listing = false; scheduleRender(DIRECTORY); }
   }
@@ -801,6 +813,8 @@ function render(regions = ALL_REGIONS) {
   if (!regions) return;
   $('login').hidden = loggedIn; $('workspace').hidden = !loggedIn;
   if (!loggedIn) {
+    $('token').disabled = listing; $('open-chat').disabled = listing;
+    $('open-chat-label').textContent = listing ? 'Checking…' : 'Open chat';
     renderedMessages = null; renderedComposer = null; renderedStatus = null; sessionEntries.clear();
     for (const id of ['messages', 'sessions', 'reply-selection', 'draft-files', 'submission-status', 'message-error']) $(id).replaceChildren();
     $('message-input').value = ''; $('file-input').value = ''; $('session-title').textContent = 'Select a session';
@@ -823,9 +837,7 @@ function scheduleRender(regions, session) {
 }
 
 $('login-form').addEventListener('submit', event => {
-  event.preventDefault(); const token = $('token').value; if (!token) return;
-  writeToken(token); $('token').value = ''; $('login-error').textContent = '';
-  loggedIn = true; epoch++; render(); loadSessions();
+  event.preventDefault(); login($('token').value);
 });
 $('logout').addEventListener('click', () => logout());
 $('new-session').addEventListener('click', createConversation);
@@ -860,5 +872,5 @@ window.addEventListener('pageshow', event => {
 });
 
 const token = cookieToken();
-if (token) { writeToken(token); loggedIn = true; render(); loadSessions(); }
-else render();
+render();
+if (token) login(token);

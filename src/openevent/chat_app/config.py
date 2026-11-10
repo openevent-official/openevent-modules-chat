@@ -99,6 +99,9 @@ class ServerConfig:
     rpc_timeout_ms: float
     max_retries: int
     max_user_message_bytes: int = 65536
+    host: str = "127.0.0.1"
+    port: int = 8080
+    origin: str | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "ServerConfig":
@@ -106,13 +109,20 @@ class ServerConfig:
         try:
             regular_file(path)
             data = strict_json(path.read_bytes().decode("utf-8", errors="strict"))
-            data.setdefault("max_user_message_bytes", cls.max_user_message_bytes)
+            for name in ("max_user_message_bytes", "host", "port", "origin"):
+                data.setdefault(name, getattr(cls, name))
             if set(data) != set(cls.__dataclass_fields__):
                 raise ValueError("invalid server configuration fields")
-            for name in ("openevent_target", "channels_dir", "web_token", "user_openevent_token"):
+            for name in ("openevent_target", "channels_dir", "web_token", "user_openevent_token", "host"):
                 if not isinstance(data[name], str) or not data[name]:
                     raise ValueError("non-empty configuration string required")
                 data[name].encode("utf-8", errors="strict")
+            if type(data["port"]) is not int or not 0 <= data["port"] <= 65535:
+                raise ValueError("integer port in 0..65535 required")
+            if data["origin"] is not None:
+                if not isinstance(data["origin"], str) or not data["origin"]:
+                    raise ValueError("origin must be null or a non-empty string")
+                data["origin"].encode("utf-8", errors="strict")
             for name in ("user_principal", "agent_principal"):
                 data[name] = uint64_string(data[name])
             if data["user_principal"] == data["agent_principal"]:

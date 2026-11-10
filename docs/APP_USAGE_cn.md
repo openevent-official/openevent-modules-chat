@@ -37,6 +37,9 @@ Agent token 只交给 Agent 服务。为浏览器另设一个独立访问口令�
 
 ```json
 {
+  "host": "127.0.0.1",
+  "port": 8080,
+  "origin": null,
   "openevent_target": "127.0.0.1:9527",
   "channels_dir": "./channels",
   "web_token": "replace-with-browser-access-token",
@@ -51,22 +54,22 @@ Agent token 只交给 Agent 服务。为浏览器另设一个独立访问口令�
 
 相对 `channels_dir` 以配置文件所在目录为起点；目录不存在时自动创建。部署方应确保配置文件和目录只能由运行后端的身份读写，每个目录只能运行一个进程。修改配置后需要重启；配置文件和目标目录不能是符号链接。
 
+`host`、`port` 和 `origin` 均从这份配置读取，可省略，默认分别为 `127.0.0.1`、`8080` 和 `null`。
+`port` 使用 `0..65535` 的整数，`0` 表示由系统分配可用端口。
+
 `max_user_message_bytes` 可省略，默认 65536（64 KiB），必须是正整数。它按 UTF-8 字节数限制新发送的单条用户正文，保留空格和换行；中文和 emoji 通常占多个字节。
 附件和回复目标内容不计入此限额。已有历史和 Agent 输出仍可正常读取；Agent 自己判断完整模型输入是否超出其预算。
 
 ```sh
-openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080
+openevent-chat --config ./chat.json
 ```
 
 启动完成后，日志会打印实际监听地址和端口。
 
 打开 `http://127.0.0.1:8080/api/chat/`，输入 `web_token`，然后新建会话。会话会自动创建对应的 private Channel，不需要手工写会话文件。浏览器访问口令、OpenEvent 用户凭据和 Agent 凭据是三种不同用途的秘密，不要互相替代。
+页面会先验证输入或已保存的口令，成功后才显示聊天区；失败时留在口令页提示原因，允许重试。
 
-生产环境通过 HTTPS 反向代理访问，并明确配置对外 origin，例如：
-
-```sh
-openevent-chat --config ./chat.json --host 127.0.0.1 --port 8080 --origin https://chat.example.com
-```
+生产环境通过 HTTPS 反向代理访问，在 `chat.json` 中将 `origin` 设为对外地址，例如 `"https://chat.example.com"`，然后使用同一个启动命令。
 
 代理需要转发 `/api/chat/` 和 `/static/`。浏览器在 HTTPS 下使用 Secure Cookie；本地 HTTP 仅用于开发。口令不会出现在 URL 中。“Sign out”会清除当前页面保存的聊天记录、草稿和 Cookie。
 

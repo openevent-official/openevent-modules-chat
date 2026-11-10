@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import http.client
+import io
 import json
 from pathlib import Path
 import runpy
@@ -1284,15 +1285,30 @@ class AppTests(unittest.TestCase):
         fatal = threading.Event()
         service = NS(fatal=fatal, close=Mock(side_effect=fatal.set))
         server = NS(server_port=8080, serve_forever=Mock(), server_close=Mock())
-        with patch.object(entrypoint.ServerConfig, "load", return_value=self.config), \
+        config = replace(self.config, host="0.0.0.0", port=0, origin="https://chat.example.test")
+        with patch.object(entrypoint.ServerConfig, "load", return_value=config), \
                 patch.object(entrypoint, "ChatService", return_value=service), \
-                patch.object(entrypoint, "ChatHTTPServer", return_value=server), \
+                patch.object(entrypoint, "ChatHTTPServer", return_value=server) as create_server, \
                 patch.object(entrypoint.signal, "signal"), \
-                patch.object(entrypoint.logging, "basicConfig"):
+                patch.object(entrypoint.logging, "basicConfig"), \
+                patch.object(entrypoint.logging, "info") as log:
             self.assertEqual(entrypoint.main(["--config", "unused.json"]), 1)
+        create_server.assert_called_once_with(("0.0.0.0", 0), service, origin="https://chat.example.test")
+        log.assert_called_once_with("chat server listening on %s:%s", "0.0.0.0", 8080)
         server.serve_forever.assert_called_once_with()
         server.server_close.assert_called_once_with()
         service.close.assert_called_once_with()
+
+    def test_main_rejects_http_settings_as_command_line_arguments(self):
+        for flag, value in (("--host", "127.0.0.1"), ("--port", "8080"),
+                            ("--origin", "https://chat.example.test")):
+            with self.subTest(flag=flag), patch.object(entrypoint.ServerConfig, "load") as load, \
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    entrypoint.main(["--config", "unused.json", flag, value])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("unrecognized arguments", stderr.getvalue())
+                load.assert_not_called()
 
     def test_uncertain_create_keeps_pending_and_blocks_restart(self):
         self.events.fail_create = True
