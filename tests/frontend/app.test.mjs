@@ -1032,6 +1032,143 @@ test('streaming and reply selection with page file information preserve message 
   ui.get('logout').click();
 });
 
+test('a committed POST immediately reads its message without waiting for the idle poll timer', async () => {
+  for (const status of [200, 201]) {
+    let sent; const historyRequests = [];
+    const ui = environment(call => {
+      if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+      if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+      if (call.url.includes('/history?')) {
+        historyRequests.push(call);
+        if (historyRequests.length === 1) return ok(empty());
+        assert.ok(sent, 'only a committed send should wake the idle history loop');
+        return ok(historyPage([historyEvent(1, {
+          kind: 'turn.single', turn_id: `user:${sent.submission_id}`,
+          content: [{type: 'text', text: sent.text}], reply_to_seqs: [],
+        }, 'user')], 2));
+      }
+      if (call.url.endsWith('/turns')) {
+        sent = JSON.parse(call.body);
+        return ok({submission_id: sent.submission_id, status: 'committed',
+          turn_ref: {role: 'user', turn_id: `user:${sent.submission_id}`}}, status);
+      }
+      throw new Error(`unexpected request ${call.url}`);
+    });
+    await load(`committed-immediate-history-${status}`);
+    await until(() => ui.get('sync-status').textContent === 'Connected');
+    typeAndSend(ui, '确认后立即显示');
+    // Do not advance the fake clock: the pending 1000ms poll must be bypassed.
+    await until(() => ui.get('messages').textContent.includes('确认后立即显示'));
+    assert.equal(historyRequests.length, 2);
+    assert.equal(historyRequests[0].url, historyRequests[1].url, 'send confirmation must not change the cursor');
+    assert.equal(ui.calls.filter(call => call.url.endsWith('/turns')).length, 1);
+    assert.equal(ui.get('messages').children.filter(child => child.tagName === 'ARTICLE').length, 1);
+    assert.equal([...ui.timers.values()].filter(timer => timer.delay === 1000).length, 1);
+    ui.get('logout').click();
+  }
+});
+
+test('committed sends during an in-flight history read queue only one immediate follow-up', async () => {
+  let finishHistory; const historyRequests = []; const sent = [];
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.includes('/history?')) {
+      historyRequests.push(call);
+      if (historyRequests.length === 1) return new Promise(resolve => { finishHistory = resolve; });
+      if (historyRequests.length === 2) return ok(historyPage(sent.map((body, index) => historyEvent(index + 1, {
+        kind: 'turn.single', turn_id: `user:${body.submission_id}`,
+        content: [{type: 'text', text: body.text}], reply_to_seqs: [],
+      }, 'user')), 3));
+      return ok(empty('3', '2'));
+    }
+    if (call.url.endsWith('/turns')) {
+      const body = JSON.parse(call.body); sent.push(body);
+      return ok({submission_id: body.submission_id, status: 'committed',
+        turn_ref: {role: 'user', turn_id: `user:${body.submission_id}`}}, 201);
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('committed-while-history-in-flight'); await until(() => !!finishHistory);
+  for (let index = 1; index <= 2; index++) {
+    typeAndSend(ui, `消息${index}`);
+    await until(() => sent.length === index && ui.get('message-input').value === '');
+  }
+  assert.equal(historyRequests.length, 1, 'do not start a parallel history read');
+  assert.equal(historyRequests[0].signal.aborted, false, 'do not discard the in-flight page');
+  assert.equal(ui.get('messages').children.some(child => child.tagName === 'ARTICLE'), false);
+  finishHistory(ok(empty())); await flush();
+  await ui.advance(0);
+  await until(() => ui.get('messages').children.filter(child => child.tagName === 'ARTICLE').length === 2);
+  assert.equal(historyRequests.length, 2);
+  assert.equal(historyRequests[0].url, historyRequests[1].url);
+  await ui.advance(0); assert.equal(historyRequests.length, 2);
+  assert.equal([...ui.timers.values()].filter(timer => timer.delay === 1000).length, 1);
+  await ui.advance(1000);
+  assert.equal(historyRequests.length, 3);
+  assert.ok(historyRequests[2].url.includes('fetch_seq=3'));
+  ui.get('logout').click();
+});
+
+test('history confirmation and a late successful POST do not trigger another immediate read', async () => {
+  let finishSend; let sent; let sendSignal; let histories = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.includes('/history?')) {
+      if (++histories === 1) return ok(empty());
+      if (histories === 2) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.single', turn_id: `user:${sent.submission_id}`,
+        content: [{type: 'text', text: sent.text}], reply_to_seqs: [],
+      }, 'user')], 2));
+      return ok(empty('2', '1'));
+    }
+    if (call.url.endsWith('/turns')) {
+      sent = JSON.parse(call.body); sendSignal = call.signal;
+      return new Promise(resolve => { finishSend = resolve; });
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('history-before-post-confirmation'); typeAndSend(ui, '历史先确认');
+  await until(() => !!finishSend);
+  ui.runTimer(1000); await until(() => ui.get('submission-status').textContent === 'Message sent');
+  assert.equal(sendSignal.aborted, true);
+  await ui.advance(0); assert.equal(histories, 2, 'history confirmation must not kick its own loop');
+  finishSend(ok({submission_id: sent.submission_id, status: 'committed',
+    turn_ref: {role: 'user', turn_id: `user:${sent.submission_id}`}}, 201));
+  await flush(); await ui.advance(0);
+  assert.equal(histories, 2, 'a stale POST callback must not wake history');
+  assert.equal(ui.get('messages').children.filter(child => child.tagName === 'ARTICLE').length, 1);
+  assert.equal([...ui.timers.values()].filter(timer => timer.delay === 1000).length, 1);
+  await ui.advance(1000); assert.equal(histories, 3);
+  ui.get('logout').click();
+});
+
+test('a successful POST does not resume history stopped by an explicit error', async () => {
+  let histories = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) { histories++; return err(400, 'invalid_history'); }
+    if (call.url.endsWith('/submissions')) return ok({start: '1', end: '100'}, 201);
+    if (call.url.endsWith('/turns')) {
+      const id = JSON.parse(call.body).submission_id;
+      return ok({submission_id: id, status: 'committed', turn_ref: {role: 'user', turn_id: `user:${id}`}}, 201);
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('committed-preserves-stopped-history');
+  await until(() => ui.get('sync-status').textContent === 'Updates paused');
+  typeAndSend(ui, '保留同步错误');
+  await until(() => ui.get('submission-status').textContent === 'Message sent');
+  await ui.advance(5000);
+  assert.equal(histories, 1);
+  assert.equal(ui.get('sync-status').textContent, 'Updates paused');
+  assert.match(ui.get('message-error').textContent, /invalid_history/);
+  assert.equal(ui.get('messages').children.some(child => child.tagName === 'ARTICLE'), false);
+  assert.equal(ui.timers.size, 0);
+  ui.get('logout').click();
+});
+
 test('uncertain sends retry the same POST, then require a fresh history boundary before a new id', async () => {
   let sends = 0; let histories = 0; let allocations = 0;
   const ui = environment(call => {
@@ -1451,6 +1588,8 @@ test('a proxy 503 without failure metadata retries history from the unchanged cu
     throw new Error(`unexpected request ${call.url}`);
   });
   await load('proxy'); await until(() => ui.get('sync-status').textContent === 'Reconnecting');
+  assert.equal(ui.get('message-error').textContent, '');
+  assert.equal(ui.get('message-error').hidden, true);
   ui.runTimer(1000); await until(() => histories === 2); await flush();
   const historyRequests = ui.calls.filter(call => call.url.includes('/history?'));
   assert.equal(historyRequests[0].url, historyRequests[1].url);
@@ -1458,8 +1597,8 @@ test('a proxy 503 without failure metadata retries history from the unchanged cu
   ui.get('logout').click();
 });
 
-test('temporary service, network and timeout failures retry history without changing its cursor', async () => {
-  for (const failure of ['external_unavailable', 'network', 'timeout']) {
+test('temporary history failures only show reconnecting and retry from the unchanged cursor', async () => {
+  for (const failure of ['external_unavailable', 'network', 'timeout', 502, 504]) {
     let histories = 0;
     const ui = environment(call => {
       if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
@@ -1469,6 +1608,7 @@ test('temporary service, network and timeout failures retry history without chan
         if (failure === 'timeout') return new Promise((resolve, reject) => {
           call.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
         });
+        if (typeof failure === 'number') return new Response('temporarily unavailable', {status: failure});
         return ok({error: {code: 'server_unavailable', message: 'external service temporarily unavailable',
           failure: {category: failure, detail: 'Fetch is temporarily unavailable'}}}, 503);
       }
@@ -1478,13 +1618,52 @@ test('temporary service, network and timeout failures retry history without chan
     await load(`transient-${failure}`);
     if (failure === 'timeout') ui.runTimer(30000);
     await until(() => ui.get('sync-status').textContent === 'Reconnecting');
-    if (failure === 'external_unavailable') assert.match(ui.get('message-error').textContent, /Fetch is temporarily unavailable/);
+    assert.equal(ui.get('message-error').textContent, '');
+    assert.equal(ui.get('message-error').hidden, true);
     ui.runTimer(1000); await until(() => histories === 2); await flush();
     const historyRequests = ui.calls.filter(call => call.url.includes('/history?'));
     assert.equal(historyRequests[0].url, historyRequests[1].url);
     assert.equal(ui.get('sync-status').textContent, 'Connected');
+    assert.equal(ui.get('message-error').textContent, '');
+    assert.equal(ui.get('message-error').hidden, true);
     ui.get('logout').click();
   }
+});
+
+test('consecutive and alternating history failures preserve messages without flashing an error banner', async () => {
+  let histories = 0;
+  const ui = environment(call => {
+    if (call.url === '/api/chat/sessions') return ok({sessions: [description]});
+    if (call.url.includes('/history?')) {
+      histories++;
+      if (histories === 1) return ok(historyPage([historyEvent(1, {
+        kind: 'turn.single', turn_id: 'saved', content: [{type: 'text', text: 'Keep this message'}], reply_to_seqs: [],
+      })], 2));
+      if (histories === 2) throw new TypeError('Failed to fetch');
+      if (histories === 3 || histories === 5) return err(503, 'temporarily_unavailable');
+      return ok(empty('2', '1'));
+    }
+    throw new Error(`unexpected request ${call.url}`);
+  });
+  await load('history-reconnecting-banner');
+  const article = ui.get('messages').children[0];
+  const accessed = recordElementAccess(ui);
+  for (const [expected, rendered] of [['Reconnecting', true], ['Reconnecting', false],
+    ['Connected', true], ['Reconnecting', true], ['Connected', true]]) {
+    accessed.clear();
+    ui.runTimer(1000); await flush();
+    assert.equal(accessed.has('sync-status'), rendered, 'unchanged reconnecting state must not redraw');
+    assert.equal(accessed.has('messages'), false);
+    assert.equal(ui.get('sync-status').textContent, expected);
+    assert.equal(ui.get('message-error').textContent, '');
+    assert.equal(ui.get('message-error').hidden, true);
+    assert.equal(ui.get('messages').children[0], article);
+    assert.match(article.textContent, /Keep this message/);
+  }
+  assert.equal(histories, 6);
+  const historyRequests = ui.calls.filter(call => call.url.includes('/history?'));
+  assert.ok(historyRequests.slice(1).every(call => call.url.includes('fetch_seq=2')));
+  ui.get('logout').click();
 });
 
 test('explicit failure categories stop history retries, preserve records and display the failure detail', async () => {
@@ -1511,6 +1690,7 @@ test('explicit failure categories stop history retries, preserve records and dis
     assert.equal(ui.get('messages').children[0], article); assert.match(article.textContent, /已经读取的内容/);
     assert.ok(ui.calls.filter(call => call.url.includes('/history?'))[1].url.includes('fetch_seq=2'));
     assert.ok(ui.get('message-error').textContent.startsWith(`chat server is stopping: ${detail}`));
+    assert.equal(ui.get('message-error').hidden, false);
     assert.ok(findElement(ui.get('message-error'), element => element.textContent === 'Reload'));
     ui.get('logout').click();
   }

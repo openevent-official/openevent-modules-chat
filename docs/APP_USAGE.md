@@ -72,6 +72,7 @@ The page validates the entered or saved token before showing the chat area; if v
 In production, access the application through an HTTPS reverse proxy, set `origin` in `chat.json` to the external address, such as `"https://chat.example.com"`, and use the same startup command.
 
 The proxy must forward `/api/chat/` and `/static/`. The browser uses a Secure Cookie over HTTPS; local HTTP is for development only. The token does not appear in URLs. “Sign out” clears the chat records, drafts, and Cookie saved by the current page.
+Normal HTTP/1.1 requests can reuse connections to avoid repeated connection setup. A browser stopping its wait or disconnecting still does not cancel backend work that has already started.
 
 ## Using the page
 
@@ -95,11 +96,13 @@ History uses pale blue cards for user messages and pale green cards for Agent re
 - If a streaming message ends with an error because its end manifest is too large, the page shows “Message is too long to display.” and clears its previous body and attachments. It remains replyable. See [protocol section 9](CHAT_PROTOCOL.md#9-turnend).
 - Select Stop generating while the Agent is producing output. If cancellation is unconfirmed, retry manually; the page does not resend automatically. Stopping the actual work requires support from the Agent service.
 - Each page loads its messages and attachment information together. Temporary failures or timeouts retry the current page while preserving pages already loaded. Files open through downloads and are neither executed nor previewed in the chat page.
+  While message synchronization retries, the header shows “Reconnecting”, then returns to “Connected” after recovery without shifting the message area. A red synchronization error banner appears only when automatic updates stop and require your attention.
 - Ordinary requests wait at most 30 seconds; requesting submission numbers, uploads, and downloads wait at most 120 seconds. Message synchronization and requests for submission numbers retry temporary network failures and timeouts automatically.
   Session lists, session creation, renaming, uploads, downloads, and cancellation require manual retries. If session creation fails, use the page's retry action to continue. A download is handed to the browser for saving only after it finishes completely; failures do not save a partial file.
 - Select the circular up-arrow button at the bottom right of the composer (labelled “Send message”) to send. Once the text passes the length check, this locks the session's text, attachments, and reply selections. Until the outcome is confirmed, they cannot be edited and another message cannot be sent.
   If a send times out or is still processing, the page automatically checks the original message's outcome. A timeout does not mean the message was not sent. The content stays locked while the outcome is unknown; follow any prompt to confirm it manually.
   Confirmed success clears the submitted content and restores editing. Confirmation that nothing was sent preserves the content and restores editing; use the same send button to send it again.
+  When the backend confirms a successful send, the current session, if still synchronizing, promptly fetches new records without waiting for the next scheduled poll.
   If the backend explicitly returns the error code `attachment_unavailable`, the page ends that send, preserves the content, and restores editing even if an earlier request timed out. Upload the attachment again before sending again.
   An explicit rejection with the error code `message_too_long` also ends the wait and restores editing; shorten the text before sending again.
   Switching away pauses automatic confirmation; switching back resumes it. If the page has reported an error and stopped automatic confirmation, follow its instructions.

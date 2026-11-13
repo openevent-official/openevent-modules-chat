@@ -290,8 +290,13 @@ const historyLoop = new ActiveLoop({
     scheduleRender(regions, session);
   },
   error: (session, error) => {
-    session.error = message(error); session.sync = temporary(error) ? 'retrying' : 'stopped'; scheduleRender(STATUS, session);
-    return temporary(error);
+    const retry = temporary(error);
+    const detail = retry ? '' : message(error);
+    const sync = retry ? 'retrying' : 'stopped';
+    if (session.error !== detail || session.sync !== sync) {
+      session.error = detail; session.sync = sync; scheduleRender(STATUS, session);
+    }
+    return retry;
   },
 });
 
@@ -349,6 +354,7 @@ async function querySubmission(session, pending, generation) {
     } else if ([200, 201].includes(status) && data.status === 'committed' &&
         data.turn_ref?.role === 'user' && data.turn_ref.turn_id === `user:${pending.submissionId}`) {
       confirmSend(session, pending); again = false;
+      if (!pageSuspended && session.sync !== 'stopped') historyLoop.kick();
     } else throw new Error('Invalid send response');
   } catch (error) {
     if (current() !== session || generation !== querySchedule.generation || session.pending !== pending) return;

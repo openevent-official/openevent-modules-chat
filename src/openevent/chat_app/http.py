@@ -64,6 +64,9 @@ class ChatHTTPServer(ThreadingHTTPServer):
 class ChatRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "OpenEventChat"
+    # Headers and body are separate unbuffered writes. Send small responses
+    # promptly on reused connections instead of waiting for a TCP ACK.
+    disable_nagle_algorithm = True
 
     def log_message(self, format, *args):
         # HTTP request targets and headers are not part of the diagnostic log.
@@ -79,26 +82,39 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         self._handle()
 
     def send_error(self, code, message=None, explain=None):
+        self.close_connection = True
         self._json(code, {"error": {"code": "invalid_request", "message": "HTTP request is invalid"}})
 
     def _handle(self):
+        if any(token.strip().lower() == "close"
+               for value in self.headers.get_all("Connection", []) for token in value.split(",")):
+            self.close_connection = True
+        if self.command in ("GET", "HEAD") and (
+                self.headers.get("Transfer-Encoding") is not None
+                or self.headers.get_all("Content-Length", []) not in ([], ["0"])):
+            # These routes do not consume a body. Preserve their response but
+            # never interpret leftover body bytes as the next request.
+            self.close_connection = True
         try:
             self._dispatch()
         except AppError as exc:
             self.close_connection = True
             self._json(exc.status, exc.as_json())
         except (ConnectionError, BrokenPipeError, TimeoutError):
+            self.close_connection = True
             return
         except (ValueError, UnicodeError):
             self.close_connection = True
             self._json(400, bad_request().as_json())
         except Exception as exc:
+            self.close_connection = True
             from openevent.chat_sdk.errors import make_failure
             error = self.server.service._fail(make_failure("HTTP", exc, detail="unexpected HTTP processing failure"))
             self._json(error.status, error.as_json())
 
     def _bytes(self, status, content, content_type, *, headers=None):
-        self.close_connection = True
+        if self.server._stop_requested or self.server.service.fatal.is_set():
+            self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))

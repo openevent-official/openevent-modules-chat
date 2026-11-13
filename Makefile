@@ -33,6 +33,7 @@ test-sdk: prepare
 test-app: prepare
 	PYTHONPATH=src $(PYTHON) -B -m unittest discover -s tests -p 'test_config.py'
 	PYTHONPATH=src $(PYTHON) -B -m unittest discover -s tests -p 'test_app.py'
+	PYTHONPATH=src $(PYTHON) -B -m unittest discover -s tests -p 'test_http*.py'
 
 test-package: prepare
 	$(PYTHON) -B -m unittest discover -s tests -p 'test_package.py'
